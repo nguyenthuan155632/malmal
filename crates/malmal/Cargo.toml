@@ -1,0 +1,30 @@
+[package]
+name = "malmal"
+description = "Upload scanner for images, SVG, PDF and PostScript files"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+memchr = "2.8.3"
+miniz_oxide = "0.9.1"
+quick-xml = { version = "0.42.0", default-features = false }
+serde.workspace = true
+sha2.workspace = true
+yara-x = { version = "1.23.0", default-features = false, optional = true, features = [
+    "constant-folding",
+    "exact-atoms",
+    "fast-regexp",
+    "hash-module",
+    "math-module",
+    "string-module",
+] }
+
+[features]
+# YARA rule matching. Off by default: it adds a WebAssembly runtime and
+# several megabytes to the binary.
+yara = ["dep:yara-x"]
+
+[lints.rust]
+# Set by cargo-fuzz.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

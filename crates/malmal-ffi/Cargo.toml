@@ -1,0 +1,16 @@
+[package]
+name = "malmal-ffi"
+description = "C ABI for the malmal upload scanner"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+# The Rust API is documented and tested in the `malmal` crate.
+doc = false
+test = true
+
+[dependencies]
+malmal = { path = "../malmal" }
+serde_json.workspace = true

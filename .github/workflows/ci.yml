@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: Build static binaries
+        run: cargo build --release --workspace --target x86_64-unknown-linux-musl
+      - name: Binaries must not link dynamically
+        run: |
+          for binary in malmal malmald; do
+            file target/x86_64-unknown-linux-musl/release/$binary | grep -E 'static(ally|-pie) linked'
+          done
+      - name: Run on bare Debian
+        run: |
+          docker run --rm -v "$PWD/target/x86_64-unknown-linux-musl/release:/w:ro" \
+            debian:stable-slim /w/malmal --version
+
+  yara:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p malmal -p malmal-cli --features malmal/yara,malmal-cli/yara
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz every target briefly
+        working-directory: fuzz
+        run: |
+          for target in $(cargo fuzz list); do
+            mkdir -p corpus/$target
+            cargo fuzz run $target corpus/$target seeds/$target -- \
+              -max_total_time=60 -max_len=16384 -timeout=10
+          done
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/malmal", "crates/malmal-cli", "crates/malmal-ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# No license has been chosen yet, so the crates are not publishable.
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

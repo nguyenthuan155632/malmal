@@ -1,0 +1,987 @@
+//! PDF analysis. The cross-reference table is deliberately ignored: it is the
+//! first thing a malicious file lies about. Instead every `N G obj` in the
+//! file is parsed where it stands, object streams are unpacked, and every
+//! dictionary found either way is inspected for active content.
+
+pub(crate) mod filters;
+pub(crate) mod parser;
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+use memchr::memmem;
+
+use crate::limits::{Budget, LimitExceeded};
+use crate::report::{Finding, Severity};
+use filters::{DecodeError, Params};
+use parser::{Dict, Name, Parser, Value, is_regular, is_whitespace};
+
+/// Callback that scans a file extracted from the PDF.
+pub(crate) type NestedScan<'a> = dyn FnMut(&[u8], &mut Budget, &mut Vec<Finding>) + 'a;
+
+/// Parsed values kept in memory for one document.
+const MAX_NODES: usize = 2_000_000;
+const MAX_FILTERS: usize = 8;
+/// How far past an unparsable object's start to look for names.
+const FALLBACK_WINDOW: usize = 64 << 10;
+
+/// Names whose `#xx`-escaped spelling is reported as obfuscation.
+const SENSITIVE_NAMES: &[&[u8]] = &[
+    b"JS",
+    b"JavaScript",
+    b"OpenAction",
+    b"AA",
+    b"Launch",
+    b"EmbeddedFile",
+    b"EmbeddedFiles",
+    b"EF",
+    b"RichMedia",
+    b"XFA",
+    b"Encrypt",
+    b"ObjStm",
+    b"SubmitForm",
+    b"ImportData",
+    b"GoToR",
+    b"GoToE",
+    b"URI",
+    b"S",
+    b"Type",
+    b"Subtype",
+    b"Filter",
+    b"Length",
+    b"Names",
+    b"AcroForm",
+    b"FlateDecode",
+    b"ASCIIHexDecode",
+    b"ASCII85Decode",
+    b"LZWDecode",
+    b"RunLengthDecode",
+];
+
+static NULL: Value = Value::Null;
+
+struct Object {
+    number: u32,
+    /// Where the object (or the object stream holding it) starts in the file.
+    offset: usize,
+    value: Value,
+    /// First byte of stream data, for stream objects.
+    stream_start: Option<usize>,
+}
+
+struct Document<'a> {
+    data: &'a [u8],
+    objects: Vec<Object>,
+    /// Latest definition of each object number, as incremental updates intend.
+    by_number: HashMap<u32, usize>,
+}
+
+impl<'a> Document<'a> {
+    fn add(&mut self, object: Object) {
+        self.by_number.insert(object.number, self.objects.len());
+        self.objects.push(object);
+    }
+
+    /// Follow indirect references; missing values and targets resolve to null.
+    fn resolve<'v>(&'v self, value: Option<&'v Value>) -> &'v Value {
+        let mut value = value.unwrap_or(&NULL);
+        for _ in 0..16 {
+            match value {
+                Value::Ref(number) => match self.by_number.get(number) {
+                    Some(&index) => value = &self.objects[index].value,
+                    None => return &NULL,
+                },
+                _ => return value,
+            }
+        }
+        &NULL
+    }
+
+    fn name_is(&self, value: Option<&Value>, name: &[u8]) -> bool {
+        self.resolve(value).as_name() == Some(name)
+    }
+
+    /// Raw bytes of a stream object: `/Length` when it checks out, otherwise
+    /// everything up to the `endstream` keyword.
+    fn stream_data(&self, object: &Object) -> Option<&'a [u8]> {
+        let dict = object.value.as_dict()?;
+        let rest = self.data.get(object.stream_start?..)?;
+        if let Some(length) = self.resolve(dict.get(b"Length")).as_usize()
+            && let Some(after) = rest.get(length..)
+            && after.trim_ascii_start().starts_with(b"endstream")
+        {
+            return Some(&rest[..length]);
+        }
+        let body = &rest[..memmem::find(rest, b"endstream").unwrap_or(rest.len())];
+        Some(
+            body.strip_suffix(b"\r\n")
+                .or_else(|| body.strip_suffix(b"\n"))
+                .or_else(|| body.strip_suffix(b"\r"))
+                .unwrap_or(body),
+        )
+    }
+
+    /// Stream contents with the whole filter chain undone.
+    fn decode(&self, object: &Object, budget: &mut Budget) -> Result<Vec<u8>, DecodeError> {
+        let dict = object.value.as_dict().ok_or(DecodeError::Corrupt)?;
+        let raw = self.stream_data(object).ok_or(DecodeError::Corrupt)?;
+        let filters: Vec<&[u8]> = match self.resolve(dict.get(b"Filter")) {
+            Value::Null => Vec::new(),
+            Value::Name(name) => vec![name.text.as_slice()],
+            Value::Array(items) => items
+                .iter()
+                .map(|item| {
+                    self.resolve(Some(item))
+                        .as_name()
+                        .ok_or(DecodeError::Corrupt)
+                })
+                .collect::<Result<_, _>>()?,
+            _ => return Err(DecodeError::Corrupt),
+        };
+        if filters.len() > MAX_FILTERS {
+            return Err(DecodeError::Unsupported);
+        }
+        let parms = self.resolve(dict.get(b"DecodeParms"));
+
+        let mut data = Cow::Borrowed(raw);
+        for (index, filter) in filters.iter().enumerate() {
+            let parm_dict = match parms {
+                Value::Dict(dict) if index == 0 => Some(dict),
+                Value::Array(items) => self.resolve(items.get(index)).as_dict(),
+                _ => None,
+            };
+            let limit = usize::try_from(budget.remaining()).unwrap_or(usize::MAX);
+            let decoded = filters::apply(filter, &data, &self.params(parm_dict), limit)?;
+            budget
+                .consume(decoded.len() as u64)
+                .map_err(|_| DecodeError::Limit)?;
+            data = Cow::Owned(decoded);
+        }
+        Ok(data.into_owned())
+    }
+
+    fn params(&self, dict: Option<&Dict>) -> Params {
+        let defaults = Params::default();
+        let Some(dict) = dict else {
+            return defaults;
+        };
+        let get = |key: &[u8], default| self.resolve(dict.get(key)).as_usize().unwrap_or(default);
+        Params {
+            predictor: get(b"Predictor", defaults.predictor),
+            columns: get(b"Columns", defaults.columns),
+            colors: get(b"Colors", defaults.colors),
+            bits_per_component: get(b"BitsPerComponent", defaults.bits_per_component),
+            early_change: get(b"EarlyChange", 1) != 0,
+        }
+    }
+}
+
+struct Output<'a> {
+    findings: &'a mut Vec<Finding>,
+    /// Object numbers that file specifications name as embedded files.
+    embedded: Vec<u32>,
+    encrypted: bool,
+}
+
+impl Output<'_> {
+    /// Record a finding once per code and severity.
+    fn report(&mut self, code: &'static str, severity: Severity, message: &str, offset: usize) {
+        let seen = |f: &Finding| f.code == code && f.severity == severity;
+        if !self.findings.iter().any(seen) {
+            self.findings
+                .push(Finding::new(code, severity, message).at(offset));
+        }
+    }
+
+    fn malformed(&mut self, message: &str, offset: usize) {
+        self.report("pdf.malformed", Severity::Medium, message, offset);
+    }
+
+    fn limit(&mut self, limit: LimitExceeded) {
+        if !self.findings.iter().any(|f| f.code == limit.code()) {
+            self.findings.push(limit.finding());
+        }
+    }
+
+    fn encrypted(&mut self, offset: usize) {
+        self.encrypted = true;
+        self.report(
+            "pdf.encrypted",
+            Severity::Medium,
+            "document is encrypted; strings, streams and object streams cannot be inspected",
+            offset,
+        );
+    }
+}
+
+pub(crate) fn analyze(
+    data: &[u8],
+    budget: &mut Budget,
+    findings: &mut Vec<Finding>,
+    nested: &mut NestedScan<'_>,
+) {
+    let mut out = Output {
+        findings,
+        embedded: Vec::new(),
+        encrypted: false,
+    };
+    let mut doc = Document {
+        data,
+        objects: Vec::new(),
+        by_number: HashMap::new(),
+    };
+    let mut nodes_left = MAX_NODES;
+
+    check_header(data, &mut out);
+    discover_objects(&mut doc, &mut nodes_left, budget, &mut out);
+    for at in memmem::find_iter(data, b"trailer") {
+        let mut parser = Parser::new(data, at + b"trailer".len(), nodes_left);
+        if let Some(trailer) = parser.parse_value() {
+            walk(&doc, &trailer, at, &mut out);
+        }
+        nodes_left = parser.nodes_left;
+    }
+    for object in &doc.objects {
+        walk(&doc, &object.value, object.offset, &mut out);
+    }
+
+    // In an encrypted file, object streams and embedded files are ciphertext.
+    if !out.encrypted {
+        let top_level = doc.objects.len();
+        expand_object_streams(&mut doc, &mut nodes_left, budget, &mut out);
+        for object in &doc.objects[top_level..] {
+            walk(&doc, &object.value, object.offset, &mut out);
+        }
+        scan_embedded_files(&doc, budget, &mut out, nested);
+    }
+
+    if doc.objects.is_empty() {
+        out.malformed("PDF contains no objects", 0);
+    }
+    check_end(data, &mut out);
+}
+
+fn check_header(data: &[u8], out: &mut Output<'_>) {
+    let head = &data[..data.len().min(1024)];
+    let Some(at) = memmem::find(head, b"%PDF-") else {
+        return out.malformed("PDF header not found", 0);
+    };
+    let before = head[..at]
+        .strip_prefix(b"\xEF\xBB\xBF")
+        .unwrap_or(&head[..at]);
+    if !before.iter().all(|&b| is_whitespace(b)) {
+        out.malformed("data before the PDF header", 0);
+    }
+}
+
+fn check_end(data: &[u8], out: &mut Output<'_>) {
+    let mut markers = memmem::find_iter(data, b"%%EOF");
+    let Some(first) = markers.next() else {
+        return out.malformed("PDF has no %%EOF marker", data.len());
+    };
+    if markers.next().is_some() {
+        out.report(
+            "pdf.incremental_update",
+            Severity::Info,
+            "several %%EOF markers: the file was updated incrementally or is linearized",
+            first,
+        );
+    }
+}
+
+/// Parse every `N G obj` in the file, wherever it is.
+fn discover_objects(
+    doc: &mut Document<'_>,
+    nodes_left: &mut usize,
+    budget: &Budget,
+    out: &mut Output<'_>,
+) {
+    let data = doc.data;
+    // Objects cannot legitimately overlap, so total parsing work is bounded
+    // by a small multiple of the file size.
+    let work_limit = data.len() as u64 * 8 + (1 << 20);
+    let mut work = 0u64;
+    for (count, at) in memmem::find_iter(data, b"obj").enumerate() {
+        if count % 256 == 0
+            && let Err(limit) = budget.check_time()
+        {
+            return out.limit(limit);
+        }
+        let body = at + b"obj".len();
+        if data.get(body).is_some_and(|&b| is_regular(b)) {
+            continue;
+        }
+        let Some((number, offset)) = object_header(data, at) else {
+            continue;
+        };
+
+        let mut parser = Parser::new(data, body, *nodes_left);
+        parser.skip_whitespace();
+        let value = if parser.rest().starts_with(b"endobj") {
+            Some(Value::Null)
+        } else {
+            parser.parse_value()
+        };
+        *nodes_left = parser.nodes_left;
+        work += (parser.pos - at) as u64;
+        if work > work_limit || *nodes_left == 0 {
+            return out.limit(LimitExceeded::Complexity);
+        }
+
+        let Some(value) = value else {
+            out.malformed("object could not be parsed", offset);
+            fallback_names(&data[body..], offset, out);
+            continue;
+        };
+        parser.skip_whitespace();
+        let is_stream = value.as_dict().is_some() && parser.rest().starts_with(b"stream");
+        let stream_start = is_stream.then(|| {
+            let start = parser.pos + b"stream".len();
+            match data.get(start..) {
+                Some([b'\r', b'\n', ..]) => start + 2,
+                Some([b'\r' | b'\n', ..]) => start + 1,
+                _ => start,
+            }
+        });
+        doc.add(Object {
+            number,
+            offset,
+            value,
+            stream_start,
+        });
+    }
+}
+
+/// Read `N G` backwards from the `obj` keyword at `obj_at`; returns the
+/// object number and where the header starts.
+fn object_header(data: &[u8], obj_at: usize) -> Option<(u32, usize)> {
+    let field = |pos: &mut usize| -> Option<u64> {
+        let after_space = *pos;
+        while *pos > 0 && is_whitespace(data[*pos - 1]) {
+            *pos -= 1;
+        }
+        if *pos == after_space {
+            return None;
+        }
+        let end = *pos;
+        while *pos > 0 && data[*pos - 1].is_ascii_digit() && end - *pos < 10 {
+            *pos -= 1;
+        }
+        std::str::from_utf8(&data[*pos..end]).ok()?.parse().ok()
+    };
+    let mut pos = obj_at;
+    let _generation = field(&mut pos)?;
+    let number = field(&mut pos)?;
+    Some((u32::try_from(number).ok()?, pos))
+}
+
+/// Unpack `/Type /ObjStm` streams and add the objects stored inside them.
+fn expand_object_streams(
+    doc: &mut Document<'_>,
+    nodes_left: &mut usize,
+    budget: &mut Budget,
+    out: &mut Output<'_>,
+) {
+    let mut unpacked = Vec::new();
+    for object in &doc.objects {
+        let Some(dict) = object.value.as_dict() else {
+            continue;
+        };
+        if object.stream_start.is_none() || !doc.name_is(dict.get(b"Type"), b"ObjStm") {
+            continue;
+        }
+        let offset = object.offset;
+        let decoded = match doc.decode(object, budget) {
+            Ok(decoded) => decoded,
+            Err(DecodeError::Limit) => {
+                out.limit(LimitExceeded::Decompression);
+                continue;
+            }
+            // Whatever is inside stays unseen, so the file cannot be cleared.
+            Err(_) => {
+                out.malformed("object stream cannot be decoded", offset);
+                continue;
+            }
+        };
+        let count = doc.resolve(dict.get(b"N")).as_usize();
+        let first = doc.resolve(dict.get(b"First")).as_usize();
+        let (Some(count), Some(first)) = (count, first) else {
+            out.malformed("object stream has no index", offset);
+            continue;
+        };
+
+        // The index is `count` pairs of object number and relative offset.
+        let mut index = Parser::new(&decoded, 0, usize::MAX);
+        let mut entries = Vec::new();
+        for _ in 0..count.min(decoded.len()) {
+            let (Some(number), Some(relative)) = (index.integer(), index.integer()) else {
+                break;
+            };
+            entries.push((number, first.saturating_add(relative)));
+        }
+        for (number, start) in entries {
+            let mut parser = Parser::new(&decoded, start, *nodes_left);
+            let value = parser.parse_value();
+            *nodes_left = parser.nodes_left;
+            if *nodes_left == 0 {
+                return out.limit(LimitExceeded::Complexity);
+            }
+            match (value, u32::try_from(number)) {
+                (Some(value), Ok(number)) => unpacked.push(Object {
+                    number,
+                    offset,
+                    value,
+                    stream_start: None,
+                }),
+                _ => {
+                    out.malformed("object inside an object stream could not be parsed", offset);
+                    fallback_names(decoded.get(start..).unwrap_or(&[]), offset, out);
+                }
+            }
+        }
+    }
+    for object in unpacked {
+        doc.add(object);
+    }
+}
+
+/// Inspect every dictionary reachable inside one object.
+fn walk(doc: &Document<'_>, value: &Value, offset: usize, out: &mut Output<'_>) {
+    match value {
+        Value::Dict(dict) => {
+            for (key, item) in &dict.0 {
+                check_name(key, offset, out);
+                check_entry(doc, key, item, offset, out);
+                walk(doc, item, offset, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                walk(doc, item, offset, out);
+            }
+        }
+        Value::Name(name) => check_name(name, offset, out),
+        _ => {}
+    }
+}
+
+fn check_name(name: &Name, offset: usize, out: &mut Output<'_>) {
+    if name.obfuscated && SENSITIVE_NAMES.contains(&name.text.as_slice()) {
+        out.report(
+            "pdf.obfuscated_name",
+            Severity::High,
+            "keyword disguised with hex escapes",
+            offset,
+        );
+    }
+}
+
+fn check_entry(doc: &Document<'_>, key: &Name, value: &Value, offset: usize, out: &mut Output<'_>) {
+    match key.text.as_slice() {
+        b"JS" | b"JavaScript" => javascript(offset, out),
+        b"OpenAction" => match classify_action(doc, value) {
+            Action::Harmless => {}
+            Action::Other => out.report(
+                "pdf.open_action",
+                Severity::Medium,
+                "performs an action when opened",
+                offset,
+            ),
+            Action::Code => out.report(
+                "pdf.open_action",
+                Severity::High,
+                "runs a script or program when opened",
+                offset,
+            ),
+        },
+        b"AA" => {
+            let worst = match doc.resolve(Some(value)) {
+                Value::Dict(actions) => actions
+                    .0
+                    .iter()
+                    .map(|(_, action)| classify_action(doc, action))
+                    .max()
+                    .unwrap_or(Action::Harmless),
+                _ => Action::Other,
+            };
+            match worst {
+                Action::Harmless => {}
+                Action::Other => out.report(
+                    "pdf.additional_action",
+                    Severity::Medium,
+                    "performs an action on a document or page event",
+                    offset,
+                ),
+                Action::Code => out.report(
+                    "pdf.additional_action",
+                    Severity::High,
+                    "runs a script or program on a document or page event",
+                    offset,
+                ),
+            }
+        }
+        b"EF" => {
+            embedded_file(offset, out);
+            if let Value::Dict(files) = doc.resolve(Some(value)) {
+                out.embedded
+                    .extend(files.0.iter().filter_map(|(_, file)| match file {
+                        Value::Ref(number) => Some(*number),
+                        _ => None,
+                    }));
+            }
+        }
+        b"EmbeddedFiles" => embedded_file(offset, out),
+        b"XFA" => xfa(offset, out),
+        b"Encrypt" => out.encrypted(offset),
+        b"URI" => uri(offset, out),
+        b"S" => match doc.resolve(Some(value)).as_name() {
+            Some(b"JavaScript") => javascript(offset, out),
+            Some(b"Launch") => launch(offset, out),
+            Some(b"SubmitForm" | b"ImportData") => out.report(
+                "pdf.submit_form",
+                Severity::Low,
+                "form action exchanges data with a remote server",
+                offset,
+            ),
+            Some(b"GoToR" | b"GoToE") => out.report(
+                "pdf.remote_goto",
+                Severity::Low,
+                "action opens another document",
+                offset,
+            ),
+            Some(b"URI") => uri(offset, out),
+            _ => {}
+        },
+        b"Type" if doc.name_is(Some(value), b"EmbeddedFile") => embedded_file(offset, out),
+        b"Subtype" => {
+            if let Some(b"RichMedia" | b"3D") = doc.resolve(Some(value)).as_name() {
+                rich_media(offset, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn javascript(offset: usize, out: &mut Output<'_>) {
+    out.report(
+        "pdf.javascript",
+        Severity::High,
+        "document contains JavaScript",
+        offset,
+    );
+}
+
+fn launch(offset: usize, out: &mut Output<'_>) {
+    out.report(
+        "pdf.launch",
+        Severity::High,
+        "action launches an external program or file",
+        offset,
+    );
+}
+
+fn embedded_file(offset: usize, out: &mut Output<'_>) {
+    out.report(
+        "pdf.embedded_file",
+        Severity::Medium,
+        "document carries embedded files",
+        offset,
+    );
+}
+
+fn rich_media(offset: usize, out: &mut Output<'_>) {
+    out.report(
+        "pdf.rich_media",
+        Severity::Medium,
+        "document embeds Flash, video or 3D content",
+        offset,
+    );
+}
+
+fn xfa(offset: usize, out: &mut Output<'_>) {
+    out.report(
+        "pdf.xfa",
+        Severity::Medium,
+        "document contains an XFA form",
+        offset,
+    );
+}
+
+fn uri(offset: usize, out: &mut Output<'_>) {
+    out.report(
+        "pdf.uri",
+        Severity::Info,
+        "document links to external URIs",
+        offset,
+    );
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Action {
+    /// A destination or a jump within the document.
+    Harmless,
+    Other,
+    /// JavaScript or a program launch.
+    Code,
+}
+
+fn classify_action(doc: &Document<'_>, value: &Value) -> Action {
+    match doc.resolve(Some(value)) {
+        // Explicit and named destinations.
+        Value::Array(_) | Value::Name(_) | Value::String => Action::Harmless,
+        Value::Dict(action) => match doc.resolve(action.get(b"S")).as_name() {
+            Some(b"JavaScript" | b"Launch") => Action::Code,
+            Some(b"GoTo") => Action::Harmless,
+            None if action.get(b"D").is_some() => Action::Harmless,
+            _ => Action::Other,
+        },
+        // Unresolvable: it may live in a stream that could not be read.
+        _ => Action::Other,
+    }
+}
+
+/// For an object the parser rejected: readers are more forgiving than this
+/// parser, so every name token in the object is still checked by itself.
+fn fallback_names(region: &[u8], offset: usize, out: &mut Output<'_>) {
+    let end = [b"endobj".as_slice(), b"stream"]
+        .iter()
+        .filter_map(|keyword| memmem::find(region, keyword))
+        .min()
+        .unwrap_or(region.len())
+        .min(FALLBACK_WINDOW);
+    let mut parser = Parser::new(&region[..end], 0, usize::MAX);
+    while let Some(slash) = memchr::memchr(b'/', parser.rest()) {
+        parser.pos += slash;
+        let Some(name) = parser.name() else {
+            break;
+        };
+        check_name(&name, offset, out);
+        match name.text.as_slice() {
+            b"JS" | b"JavaScript" => javascript(offset, out),
+            b"Launch" => launch(offset, out),
+            b"OpenAction" => out.report(
+                "pdf.open_action",
+                Severity::Medium,
+                "performs an action when opened",
+                offset,
+            ),
+            b"AA" => out.report(
+                "pdf.additional_action",
+                Severity::Medium,
+                "performs an action on a document or page event",
+                offset,
+            ),
+            b"EmbeddedFile" | b"EmbeddedFiles" | b"EF" => embedded_file(offset, out),
+            b"RichMedia" => rich_media(offset, out),
+            b"XFA" => xfa(offset, out),
+            b"Encrypt" => out.encrypted(offset),
+            _ => {}
+        }
+    }
+}
+
+/// Decode each embedded file and hand it back to the scanner.
+fn scan_embedded_files(
+    doc: &Document<'_>,
+    budget: &mut Budget,
+    out: &mut Output<'_>,
+    nested: &mut NestedScan<'_>,
+) {
+    let typed = doc
+        .objects
+        .iter()
+        .enumerate()
+        .filter_map(|(index, object)| {
+            let dict = object.value.as_dict()?;
+            doc.name_is(dict.get(b"Type"), b"EmbeddedFile")
+                .then_some(index)
+        });
+    let referenced = out
+        .embedded
+        .iter()
+        .filter_map(|number| doc.by_number.get(number).copied());
+    let mut targets: Vec<usize> = typed.chain(referenced).collect();
+    targets.sort_unstable();
+    targets.dedup();
+
+    for index in targets {
+        let object = &doc.objects[index];
+        if object.stream_start.is_none() {
+            continue;
+        }
+        if let Err(limit) = budget.enter() {
+            return out.limit(limit);
+        }
+        match doc.decode(object, budget) {
+            Ok(content) => {
+                let mut inner = Vec::new();
+                nested(&content, budget, &mut inner);
+                for finding in inner {
+                    if finding.code.starts_with("limit.") {
+                        out.findings.push(finding);
+                    } else {
+                        let message = format!("embedded file: {}", finding.message);
+                        out.report(finding.code, finding.severity, &message, object.offset);
+                    }
+                }
+            }
+            Err(DecodeError::Limit) => out.limit(LimitExceeded::Decompression),
+            Err(_) => out.malformed("embedded file cannot be decoded", object.offset),
+        }
+        budget.leave();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use miniz_oxide::deflate::compress_to_vec_zlib;
+
+    use super::*;
+    use crate::limits::Limits;
+
+    fn pdf(objects: &[&[u8]]) -> Vec<u8> {
+        let mut out = b"%PDF-1.7\n".to_vec();
+        for (index, body) in objects.iter().enumerate() {
+            out.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        out.extend_from_slice(b"trailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n");
+        out
+    }
+
+    fn stream(entries: &str, data: &[u8]) -> Vec<u8> {
+        let mut out = format!("<< {entries} /Length {} >>\nstream\n", data.len()).into_bytes();
+        out.extend_from_slice(data);
+        out.extend_from_slice(b"\nendstream");
+        out
+    }
+
+    fn run(data: &[u8]) -> Vec<(&'static str, Severity)> {
+        let mut budget = Budget::new(&Limits::default());
+        let mut findings = Vec::new();
+        let mut nested = |inner: &[u8], _: &mut Budget, findings: &mut Vec<Finding>| {
+            if inner.starts_with(b"\x7fELF") {
+                findings.push(Finding::new("type.executable", Severity::Critical, "elf"));
+            }
+        };
+        analyze(data, &mut budget, &mut findings, &mut nested);
+        findings.iter().map(|f| (f.code, f.severity)).collect()
+    }
+
+    fn codes(data: &[u8]) -> Vec<&'static str> {
+        run(data).into_iter().map(|(code, _)| code).collect()
+    }
+
+    const CATALOG: &[u8] = b"<< /Type /Catalog /Pages 2 0 R /OpenAction [3 0 R /Fit] >>";
+    const PAGES: &[u8] = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
+    const PAGE: &[u8] = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>";
+
+    #[test]
+    fn ordinary_document_is_clean() {
+        let content = stream("", b"BT /F1 12 Tf (Hello) Tj ET");
+        assert_eq!(
+            codes(&pdf(&[CATALOG, PAGES, PAGE, &content])),
+            [] as [&str; 0]
+        );
+    }
+
+    #[test]
+    fn javascript_action() {
+        let action = b"<< /S /JavaScript /JS (app.alert(1)) >>";
+        assert_eq!(
+            codes(&pdf(&[CATALOG, PAGES, PAGE, action])),
+            ["pdf.javascript"]
+        );
+
+        let names = b"<< /Names << /JavaScript 9 0 R >> >>";
+        assert_eq!(
+            codes(&pdf(&[CATALOG, PAGES, PAGE, names])),
+            ["pdf.javascript"]
+        );
+    }
+
+    #[test]
+    fn open_action_severity_follows_its_target() {
+        let scripted = b"<< /Type /Catalog /Pages 2 0 R /OpenAction 4 0 R >>";
+        let action = b"<< /S /JavaScript /JS 5 0 R >>";
+        assert_eq!(
+            run(&pdf(&[scripted, PAGES, PAGE, action])),
+            [
+                ("pdf.open_action", Severity::High),
+                ("pdf.javascript", Severity::High),
+            ]
+        );
+
+        let link = b"<< /Type /Catalog /OpenAction << /S /URI /URI (http://example.com) >> >>";
+        assert_eq!(
+            run(&pdf(&[link])),
+            [
+                ("pdf.open_action", Severity::Medium),
+                ("pdf.uri", Severity::Info),
+            ]
+        );
+
+        let dangling = b"<< /Type /Catalog /OpenAction 99 0 R >>";
+        assert_eq!(
+            run(&pdf(&[dangling])),
+            [("pdf.open_action", Severity::Medium)]
+        );
+    }
+
+    #[test]
+    fn additional_actions_and_launch() {
+        let page = b"<< /Type /Page /AA << /O << /S /Launch /F (cmd.exe) >> >> >>";
+        assert_eq!(
+            run(&pdf(&[CATALOG, PAGES, page])),
+            [
+                ("pdf.additional_action", Severity::High),
+                ("pdf.launch", Severity::High),
+            ]
+        );
+        let harmless = b"<< /Type /Page /AA << /O << /S /GoTo /D [3 0 R /Fit] >> >> >>";
+        assert_eq!(codes(&pdf(&[CATALOG, PAGES, harmless])), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn hex_escaped_keywords() {
+        let action = b"<< /S /J#61vaScript /J#53 (app.alert(1)) >>";
+        assert_eq!(
+            codes(&pdf(&[CATALOG, PAGES, PAGE, action])),
+            ["pdf.javascript", "pdf.obfuscated_name"]
+        );
+        let font = b"<< /Type /Font /BaseFont /ABCDEF+Arial#20Bold >>";
+        assert_eq!(codes(&pdf(&[CATALOG, PAGES, PAGE, font])), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn javascript_inside_object_streams() {
+        let inner = b"10 0 11 16 << /Foo /Bar >> << /S /JavaScript /JS (x) >>";
+        let packed = stream(
+            "/Type /ObjStm /N 2 /First 11 /Filter /FlateDecode",
+            &compress_to_vec_zlib(inner, 6),
+        );
+        assert_eq!(
+            codes(&pdf(&[CATALOG, PAGES, PAGE, &packed])),
+            ["pdf.javascript"]
+        );
+
+        // A filter chain, with the stream length stored in another object.
+        let hex: String = compress_to_vec_zlib(inner, 6)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let mut chained =
+            b"<< /Type /ObjStm /N 2 /First 11 /Filter [/ASCIIHexDecode /FlateDecode] /Length 5 0 R >>\nstream\n"
+                .to_vec();
+        chained.extend_from_slice(hex.as_bytes());
+        chained.extend_from_slice(b">\nendstream");
+        let length = format!("{}", hex.len() + 1);
+        assert_eq!(
+            codes(&pdf(&[CATALOG, PAGES, PAGE, &chained, length.as_bytes()])),
+            ["pdf.javascript"]
+        );
+    }
+
+    #[test]
+    fn unreadable_object_streams_are_never_clean() {
+        let garbage = stream(
+            "/Type /ObjStm /N 1 /First 4 /Filter /FlateDecode",
+            b"\xFF\xFF\xFF",
+        );
+        assert_eq!(codes(&pdf(&[CATALOG, &garbage])), ["pdf.malformed"]);
+        let exotic = stream("/Type /ObjStm /N 1 /First 4 /Filter /JBIG2Decode", b"xx");
+        assert_eq!(codes(&pdf(&[CATALOG, &exotic])), ["pdf.malformed"]);
+    }
+
+    #[test]
+    fn embedded_files_are_scanned() {
+        let filespec = b"<< /Type /Filespec /F (tool.bin) /EF << /F 3 0 R >> >>";
+        let payload = stream(
+            "/Filter /FlateDecode",
+            &compress_to_vec_zlib(b"\x7fELF\x02\x01", 6),
+        );
+        assert_eq!(
+            run(&pdf(&[CATALOG, filespec, &payload])),
+            [
+                ("pdf.embedded_file", Severity::Medium),
+                ("type.executable", Severity::Critical),
+            ]
+        );
+        let text = stream("/Type /EmbeddedFile", b"plain notes");
+        assert_eq!(codes(&pdf(&[CATALOG, &text])), ["pdf.embedded_file"]);
+    }
+
+    #[test]
+    fn encryption_and_other_features() {
+        let mut encrypted = pdf(&[CATALOG]);
+        encrypted.extend_from_slice(b"trailer\n<< /Root 1 0 R /Encrypt 7 0 R >>\n%%EOF\n");
+        assert_eq!(
+            codes(&encrypted),
+            ["pdf.encrypted", "pdf.incremental_update"]
+        );
+
+        let form = b"<< /AcroForm << /XFA 8 0 R >> >>";
+        let media = b"<< /Type /Annot /Subtype /RichMedia >>";
+        let submit = b"<< /S /SubmitForm /F (http://example.com) >>";
+        let remote = b"<< /S /GoToR /F (other.pdf) >>";
+        assert_eq!(
+            codes(&pdf(&[form, media, submit, remote])),
+            [
+                "pdf.xfa",
+                "pdf.rich_media",
+                "pdf.submit_form",
+                "pdf.remote_goto"
+            ]
+        );
+    }
+
+    #[test]
+    fn unparsable_objects_are_still_searched() {
+        let broken = b"<< /S /JavaScript /JS (app.alert(1)) /Oops >";
+        assert_eq!(
+            codes(&pdf(&[CATALOG, broken])),
+            ["pdf.malformed", "pdf.javascript"]
+        );
+    }
+
+    #[test]
+    fn structural_problems() {
+        let mut prefixed = b"GIF89a junk ".to_vec();
+        prefixed.extend(pdf(&[CATALOG]));
+        assert_eq!(codes(&prefixed), ["pdf.malformed"]);
+
+        assert_eq!(codes(b"%PDF-1.7\n%%EOF\n"), ["pdf.malformed"]);
+
+        let complete = pdf(&[CATALOG]);
+        let cut = &complete[..complete.len() - 7];
+        assert_eq!(codes(cut), ["pdf.malformed"]);
+    }
+
+    #[test]
+    fn objects_hidden_inside_stream_data_are_found() {
+        let hidden = stream("", b"1 0 obj\n<< /S /JavaScript /JS (x) >>\nendobj");
+        assert_eq!(codes(&pdf(&[CATALOG, &hidden])), ["pdf.javascript"]);
+    }
+
+    #[test]
+    fn decompression_is_budgeted() {
+        let limits = Limits {
+            max_decompressed: 1000,
+            ..Limits::default()
+        };
+        let bomb = stream(
+            "/Type /ObjStm /N 1 /First 4 /Filter /FlateDecode",
+            &compress_to_vec_zlib(&vec![b' '; 1_000_000], 6),
+        );
+        let mut budget = Budget::new(&limits);
+        let mut findings = Vec::new();
+        analyze(
+            &pdf(&[CATALOG, &bomb]),
+            &mut budget,
+            &mut findings,
+            &mut |_, _, _| {},
+        );
+        assert_eq!(findings[0].code, "limit.decompression");
+    }
+}

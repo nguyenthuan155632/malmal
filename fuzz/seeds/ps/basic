@@ -1,0 +1,12 @@
+%%BoundingBox: 0 0 10 10
+/box { newpath moveto } bind def
+(a \(b\) \101 c) show <48656c6c6f> show <~87cURD]i,~> show
+(%stdout) (w) file ((x) run) cvx exec systemdict /file get
+%%BeginData: 6 Binary Bytes
+((((((
+%%EndData
+currentfile eexec
+D9D66F633B846A989B9974B0179FC6CC445BC2C03103C68570A7B354A4A280AE
+cleartomark
+<< /OutputFile (%pipe%id) >> setpagedevice .forceput //superexec (run) cvn
+showpage
