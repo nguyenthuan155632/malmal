@@ -1,18 +1,18 @@
 # malmal
 
-Thư viện Rust quét file upload trước khi backend xử lý chúng: ảnh raster, SVG, PDF,
-PostScript/EPS và file Illustrator. Nó không cạnh tranh với antivirus về số lượng
-signature; nó kiểm tra ba thứ antivirus thường bỏ qua:
+A Rust library that scans uploaded files before a backend processes them: raster images,
+SVG, PDF, PostScript/EPS and Illustrator files. It does not compete with antivirus on
+signature count; it checks three things antivirus usually skips:
 
-1. **File có đúng là loại nó khai báo không** (nội dung so với extension và `Content-Type`).
-2. **File có chứa nội dung chủ động không** (script, action, lệnh hệ thống, file nhúng).
-3. **File có đúng cấu trúc không** (dữ liệu thừa, polyglot, bom giải nén, file cắt cụt).
+1. **Is the file the type it claims to be** (content against extension and `Content-Type`).
+2. **Does the file carry active content** (scripts, actions, system commands, embedded files).
+3. **Is the file structurally sound** (trailing data, polyglots, decompression bombs, truncation).
 
-Nguyên tắc xuyên suốt là fail-closed: file không phân tích hết được thì không bao giờ
-được báo là sạch.
+The rule throughout is fail-closed: a file that cannot be fully analyzed is never reported
+clean.
 
-Đây là một lớp phòng thủ, không phải lớp duy nhất. Với ảnh raster, decode rồi encode lại
-vẫn là cách chắc chắn nhất; malmal quyết định file nào được đi tới bước đó.
+This is one layer of defense, not the only one. For raster images, decoding and re-encoding
+is still the most reliable measure; malmal decides which files get that far.
 
 ## Build
 
@@ -20,17 +20,20 @@ vẫn là cách chắc chắn nhất; malmal quyết định file nào được 
 cargo build --release --workspace --target x86_64-unknown-linux-musl
 ```
 
-Kết quả nằm trong `target/x86_64-unknown-linux-musl/release/`:
+The output is in `target/x86_64-unknown-linux-musl/release/`:
 
-| File | Là gì |
+| File | What it is |
 |---|---|
-| `malmal` | CLI, liên kết tĩnh hoàn toàn |
-| `malmald` | Daemon trên Unix socket, liên kết tĩnh hoàn toàn |
-| `libmalmal_ffi.a` | Thư viện tĩnh cho C, header ở `crates/malmal-ffi/include/malmal.h` |
+| `malmal` | CLI, fully statically linked |
+| `malmald` | Daemon on a Unix socket, fully statically linked |
+| `libmalmal_ffi.a` | Static library for C; the header is `crates/malmal-ffi/include/malmal.h` |
 
-Hai binary chạy được trên Debian trần, không cần cài thêm gói nào.
+Both binaries run on a bare Debian install with no extra packages.
 
-## Dùng từ Rust
+On macOS, `cargo build --release --workspace` builds the same binaries without the sandbox;
+this has only been type-checked, not run.
+
+## Using it from Rust
 
 ```rust
 use malmal::{Policy, ScanHints, Scanner, Verdict};
@@ -44,21 +47,21 @@ if report.verdict != Verdict::Clean {
     for finding in &report.findings {
         log::warn!("{} [{:?}] {}", finding.code, finding.severity, finding.message);
     }
-    // từ chối upload
+    // reject the upload
 }
 ```
 
-`Scanner` dùng chung được giữa các thread. `scan_reader` đọc từ `impl Read` và tự dừng ở
-giới hạn kích thước.
+A `Scanner` can be shared between threads. `scan_reader` reads from an `impl Read` and
+stops by itself at the size limit.
 
-- **`Policy`** quyết định verdict: `default` coi High trở lên là `Malicious`, `strict` coi
-  Medium trở lên là `Malicious`. `with_override("svg.foreign_object", Severity::Info)`
-  đổi mức của một mã; `with_allowed_types` thu hẹp loại file được nhận.
-- **`Limits`** giới hạn kích thước file (64 MB), dữ liệu giải nén (256 MB), độ sâu file
-  nhúng (4), thời gian (10 giây) và số pixel (2^28).
-- **`HashList`** là blocklist SHA-256, đọc được thẳng output của `sha256sum`.
+- **`Policy`** decides the verdict: `default` treats High and above as `Malicious`, `strict`
+  treats Medium and above as `Malicious`. `with_override("svg.foreign_object", Severity::Info)`
+  changes the severity of one code; `with_allowed_types` narrows the accepted file types.
+- **`Limits`** caps file size (64 MB), decompressed data (256 MB), embedded-file depth (4),
+  time (10 seconds) and pixel count (2^28).
+- **`HashList`** is a SHA-256 blocklist that reads `sha256sum` output directly.
 
-Bảng đầy đủ các mã finding nằm trong [PLAN.md](PLAN.md).
+The full table of finding codes is in [PLAN.md](PLAN.md).
 
 ## CLI
 
@@ -66,11 +69,12 @@ Bảng đầy đủ các mã finding nằm trong [PLAN.md](PLAN.md).
 malmal scan --json --policy strict upload.pdf
 ```
 
-`-` đọc từ stdin. Exit code: 0 sạch, 1 nghi ngờ, 2 độc hại, 3 lỗi.
+`-` reads from stdin. Exit codes: 0 clean, 1 suspicious, 2 malicious, 3 error.
 
-Trước khi mở file đầu tiên, tiến trình tự giam mình: Landlock chỉ cho đọc đúng các file
-được truyền vào, seccomp chặn `execve`, socket và các syscall nguy hiểm khác, rlimit giới
-hạn bộ nhớ. `--require-sandbox` biến việc không giam được thành lỗi; `--no-sandbox` tắt hẳn.
+Before it opens the first file, the process confines itself: Landlock allows reading only
+the files passed on the command line, seccomp blocks `execve`, sockets and other dangerous
+syscalls, and an rlimit caps memory. `--require-sandbox` turns a failure to confine into an
+error; `--no-sandbox` disables confinement. The sandbox exists on Linux only.
 
 ## Daemon
 
@@ -78,17 +82,17 @@ hạn bộ nhớ. `--require-sandbox` biến việc không giam được thành 
 malmald --socket /run/malmal.sock --workers 8 --require-sandbox
 ```
 
-Mỗi request là một dòng JSON rồi đúng `size` byte nội dung file:
+Each request is one JSON line followed by exactly `size` bytes of file content:
 
 ```
-{"size": 1234, "filename": "a.png", "content_type": "image/png"}\n<1234 byte>
+{"size": 1234, "filename": "a.png", "content_type": "image/png"}\n<1234 bytes>
 ```
 
-Trả lời là một dòng JSON: `{"ok": true, "report": {...}}` hoặc
-`{"ok": false, "error": "..."}`. Một kết nối gửi được nhiều request. Bất cứ thứ gì khác
-`"ok": true` nghĩa là file chưa được quét.
+The reply is one JSON line: `{"ok": true, "report": {...}}` or
+`{"ok": false, "error": "..."}`. A connection can carry many requests. Anything other than
+`"ok": true` means the file was not scanned.
 
-## Dùng từ C
+## Using it from C
 
 ```c
 malmal_scanner *scanner = malmal_scanner_new(0, NULL, 0);
@@ -98,21 +102,21 @@ malmal_string_free(report);
 malmal_scanner_free(scanner);
 ```
 
-Ví dụ đầy đủ: `crates/malmal-ffi/examples/scan.c`.
+Full example: `crates/malmal-ffi/examples/scan.c`.
 
-## YARA (tuỳ chọn)
+## YARA (optional)
 
 ```bash
 cargo build --release -p malmal-cli --features yara
 malmal scan --yara rules/ upload.jpg
 ```
 
-Tính năng này tắt mặc định vì nó kéo theo một runtime WebAssembly và đưa binary từ
-0,8 MB lên 16 MB. Bản có YARA **không build được cho musl**; nó liên kết động với glibc,
-nên hãy build trên chính bản Debian sẽ chạy nó. Các module `pe` và `elf` của YARA không
-được bật.
+This feature is off by default because it pulls in a WebAssembly runtime and takes the
+binary from 0.8 MB to 16 MB. The YARA build **does not build for musl**; it links
+dynamically against glibc, so build it on the Debian release that will run it. YARA's `pe`
+and `elf` modules are not enabled.
 
-## Kiểm thử
+## Testing
 
 ```bash
 cargo test --workspace
@@ -122,19 +126,21 @@ cargo test --workspace
 cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
 ```
 
-- `tests/corpus/clean` và `tests/corpus/malicious` được quét trong `cargo test`; thả file
-  thật vào là có thêm ca kiểm thử.
-- `fuzz/` có một target cho mỗi định dạng (`cargo fuzz list`).
-- `cargo run --release --example throughput -- FILE...` đo thông lượng.
+- `tests/corpus/clean` and `tests/corpus/malicious` are scanned by `cargo test`; drop real
+  files in to add test cases.
+- `fuzz/` has one target per format (`cargo fuzz list`).
+- `cargo run --release --example throughput -- FILE...` measures throughput.
 
-## Giới hạn đã biết
+## Known limits
 
-- **PostScript là ngôn ngữ lập trình đầy đủ**, nên phân tích tĩnh không thể trọn vẹn. Tên
-  toán tử ghép lúc chạy sẽ không bị thấy; code giải mã lúc chạy bị báo `ps.exec_dynamic`
-  chứ không được đọc. Hãy luôn chạy Ghostscript với `-dSAFER` và trong sandbox riêng.
-- **PDF mã hoá không được giải mã**, kể cả loại mật khẩu rỗng; chúng ra `pdf.encrypted`.
-- **Nội dung XFA và dữ liệu sau `%%EOF` của PDF chưa được phân tích.**
-- **BigTIFF chưa hỗ trợ** và bị báo `image.malformed`.
-- **File nhúng trong PDF không đi qua YARA.**
-- Office, archive và video nằm ngoài phạm vi; chúng bị từ chối với `type.not_allowed`
-  hoặc `type.unknown`.
+- **PostScript is a full programming language**, so static analysis cannot be complete.
+  Operator names assembled at run time are not seen; code decoded at run time is reported as
+  `ps.exec_dynamic` rather than read. Always run Ghostscript with `-dSAFER` and in its own
+  sandbox.
+- **Encrypted PDFs are not decrypted**, including those with an empty password; they yield
+  `pdf.encrypted`.
+- **XFA content and data after a PDF's `%%EOF` are not analyzed.**
+- **BigTIFF is not supported** and is reported as `image.malformed`.
+- **Files embedded in a PDF do not go through YARA.**
+- Office documents, archives and video are out of scope; they are rejected with
+  `type.not_allowed` or `type.unknown`.
