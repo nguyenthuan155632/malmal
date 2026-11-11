@@ -84,13 +84,14 @@ override severity per code.
 | | `type.unknown`, `type.not_allowed` | Medium |
 | | `type.executable` (PE/ELF/Mach-O/script with a shebang) | Critical |
 | | `name.dangerous_extension` (`shell.php.jpg`, `.htaccess`) | High |
-| | `payload.php` (`<?php` in any file type; also `<?=` in raster images) | High |
+| | `payload.php` (`<?php` in any file type; also a complete `<?= ... ?>` tag in raster images) | High |
 | | `payload.script` (`<script`, `<iframe`, `javascript:` in raster images) | High |
-| | `payload.template` (`<%=`, `<%@` in raster images) | High |
+| | `payload.template` (a complete `<%= ... %>` or `<%@ ... %>` tag in raster images) | High |
 | | `limit.size`, `limit.decompression`, `limit.depth`, `limit.time`, `limit.complexity` | Medium |
 | | `hash.blocklisted`, `yara.match` | Critical |
 | Images | `image.malformed` | Medium |
 | | `image.trailing_data` (ignores zero padding and JPEG MPF frames) | Low |
+| | `image.vendor_trailer` (a complete Samsung metadata trailer or motion photo video after the image) | Info |
 | | `image.polyglot` (the excess is ZIP/PDF/PE/ELF/HTML; a PDF header in the first 1024 bytes; a ZIP record ending the file) | High |
 | | `image.metadata.payload` (code in compressed PNG chunks `zTXt`/`iTXt`/`iCCP`) | High |
 | | `image.pixel_bomb` | Medium |
@@ -235,6 +236,14 @@ A milestone is done when `cargo test` is green, `cargo clippy -- -D warnings` is
 - A malicious corpus: hand-made samples for each finding code + Ange Albertini's polyglots (Mitra) + Didier Stevens' PDF samples.
 - Benchmark: the goal is over 100 MB/s for images and a 10 MB PDF in under 200 ms.
 - CI: tests, clippy, `cargo deny`, musl build, a short 60-second fuzz run per target.
+
+### M8 — Fixes from a real submission set
+
+> **Status: done.** A scan of 3,045 real submissions (PSD, JPEG, PDF, PNG, EPS) found no
+> malicious file and these scanner faults, all fixed: `<?=` matched by chance in pixel data;
+> Illustrator's standard procsets reported for `superexec`, `file` and `cvx exec`; inline
+> ASCII85 image data tokenized as code; PSD not supported; phone camera trailers reported as
+> unexplained trailing data. See the known limits in the README for the exemptions this added.
 
 ## Order and dependencies
 

@@ -19,6 +19,7 @@ const DEFAULT_ALLOWED: &[FileType] = &[
     FileType::Webp,
     FileType::Bmp,
     FileType::Tiff,
+    FileType::Psd,
     FileType::Svg,
     FileType::Pdf,
     FileType::PostScript,

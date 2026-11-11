@@ -84,3 +84,10 @@ path = "fuzz_targets/ps.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "psd"
+path = "fuzz_targets/psd.rs"
+test = false
+doc = false
+bench = false

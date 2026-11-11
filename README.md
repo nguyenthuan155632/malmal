@@ -1,7 +1,7 @@
 # malmal
 
-A Rust library that scans uploaded files before a backend processes them: raster images,
-SVG, PDF, PostScript/EPS and Illustrator files. It does not compete with antivirus on
+A Rust library that scans uploaded files before a backend processes them: raster images
+(JPEG, PNG, GIF, WebP, BMP, TIFF, PSD), SVG, PDF, PostScript/EPS and Illustrator files. It does not compete with antivirus on
 signature count; it checks three things antivirus usually skips:
 
 1. **Is the file the type it claims to be** (content against extension and `Content-Type`).
@@ -137,6 +137,19 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
   Operator names assembled at run time are not seen; code decoded at run time is reported as
   `ps.exec_dynamic` rather than read. Always run Ghostscript with `-dSAFER` and in its own
   sandbox.
+- **Two PostScript exemptions are deliberate.** Four procsets that Illustrator writes into
+  every EPS are skipped when their SHA-256 matches exactly, because they open a scratch file
+  and use `superexec`. Names starting with a dot are not reported inside a run of ASCII85
+  image data, because megabytes of it spell such names by chance; operators behind published
+  Ghostscript escapes are still found there.
+- **Short tags (`<?=`, `<%=`, `<%@`) in images are reported only as complete tags**: text that
+  is closed, balanced and reaches a call or variable. Uncompressed pixels otherwise match
+  them by chance.
+- **PSD layers are not parsed.** The header, the image resource blocks and the end of the
+  merged image are checked, and the whole file is searched for payloads.
+- **Phone camera trailers** (Samsung metadata, motion photo video) are reported as
+  `image.vendor_trailer` at Info when their structure accounts for every byte; raise it with
+  `with_override` to reject them. Other trailing data stays `image.trailing_data`.
 - **Encrypted PDFs are not decrypted**, including those with an empty password; they yield
   `pdf.encrypted`.
 - **XFA content and data after a PDF's `%%EOF` are not analyzed.**

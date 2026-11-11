@@ -14,6 +14,8 @@ pub enum FileType {
     Webp,
     Bmp,
     Tiff,
+    /// Photoshop PSD or PSB.
+    Psd,
     Svg,
     Pdf,
     PostScript,
@@ -37,6 +39,7 @@ impl FileType {
             Self::Webp => "webp",
             Self::Bmp => "bmp",
             Self::Tiff => "tiff",
+            Self::Psd => "psd",
             Self::Svg => "svg",
             Self::Pdf => "pdf",
             Self::PostScript => "postscript",
@@ -58,7 +61,7 @@ impl FileType {
     pub fn is_raster_image(self) -> bool {
         matches!(
             self,
-            Self::Jpeg | Self::Png | Self::Gif | Self::Webp | Self::Bmp | Self::Tiff
+            Self::Jpeg | Self::Png | Self::Gif | Self::Webp | Self::Bmp | Self::Tiff | Self::Psd
         )
     }
 }
@@ -91,6 +94,9 @@ pub fn detect(data: &[u8]) -> FileType {
         || data.starts_with(b"MM\0+")
     {
         return FileType::Tiff;
+    }
+    if data.starts_with(b"8BPS\0\x01") || data.starts_with(b"8BPS\0\x02") {
+        return FileType::Psd;
     }
     if data.starts_with(b"\x7fELF") {
         return FileType::Elf;
@@ -177,6 +183,7 @@ pub fn types_for_extension(ext: &str) -> Option<&'static [FileType]> {
         "webp" => &[FileType::Webp],
         "bmp" | "dib" => &[FileType::Bmp],
         "tif" | "tiff" => &[FileType::Tiff],
+        "psd" | "psb" => &[FileType::Psd],
         // A gzip-wrapped SVG is reported as the SVG it contains.
         "svg" | "svgz" => &[FileType::Svg],
         "pdf" => &[FileType::Pdf],
@@ -195,6 +202,12 @@ pub fn types_for_mime(content_type: &str) -> Option<&'static [FileType]> {
         "image/webp" => &[FileType::Webp],
         "image/bmp" | "image/x-ms-bmp" => &[FileType::Bmp],
         "image/tiff" => &[FileType::Tiff],
+        "image/vnd.adobe.photoshop"
+        | "image/x-photoshop"
+        | "image/psd"
+        | "application/photoshop"
+        | "application/x-photoshop"
+        | "application/psd" => &[FileType::Psd],
         "image/svg+xml" => &[FileType::Svg],
         "application/pdf" => &[FileType::Pdf],
         "application/eps" | "application/x-eps" | "image/x-eps" => &[FileType::PostScript],

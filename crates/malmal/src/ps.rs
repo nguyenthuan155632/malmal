@@ -10,6 +10,7 @@
 //! run time is reported as such instead of being called clean.
 
 use memchr::memmem;
+use sha2::{Digest, Sha256};
 
 use crate::detect::FileType;
 use crate::image;
@@ -98,6 +99,23 @@ const LOOKUP_OPERATORS: &[&[u8]] = &[b"load", b"get", b"cvx", b"exec"];
 /// Tokens after which `cvx` cannot be hiding code: operators that leave a
 /// number, and the end of an array whose elements were all just tokenized.
 const TRANSPARENT_CVX_OPERANDS: &[&[u8]] = &[b"cvr", b"cvi", b"]"];
+
+/// SHA-256 of procsets that Adobe Illustrator writes into every EPS, taken
+/// over the resource body with every line end written as a line feed. They open a scratch file, use
+/// `superexec` to patch fonts and run `cvx exec` on fill patterns, so each
+/// would be reported; a body that differs by one byte still is.
+const KNOWN_PROCSETS: &[&str] = &[
+    // Adobe_AGM_Utils 1.0 0
+    "4ace816a9065299b038ff77e9cab6c64b1b215a56b2701cf8850585379c831c1",
+    // Adobe_CoolType_Core 2.31 0
+    "6197d7260fdeb15e82d40e66702dd7b3097a7ab2c03648233589b9bf52f9ed38",
+    // Adobe_CoolType_Utility_MAKEOCF 1.23 0
+    "9edc806ae83e9731a91acd2e354b113c67d11e13153030a354363b30b6c69950",
+    // Adobe_pattern_AI5 1.1 0
+    "5da6ea2f6bdb4a90e68d802f6cad38a89dc6551ed9b9978761a951d92feba46d",
+];
+/// How much ASCII85 text must precede a name for it to count as image data.
+const A85_DATA_LEAD: usize = 200;
 
 pub(crate) fn analyze(
     data: &[u8],
@@ -239,6 +257,7 @@ impl Scanner<'_> {
         let mut since_cvx = usize::MAX;
         let mut previous_name: &[u8] = b"";
         let mut no_a85_terminator = false;
+        let mut inline_data = InlineData::default();
         let mut pos = 0;
         while let Some(&byte) = data.get(pos) {
             self.tokens += 1;
@@ -260,6 +279,13 @@ impl Scanner<'_> {
                 b'%' => {
                     let line_end = pos + line_len(&data[pos..]);
                     let after_line = line_end + eol_len(&data[line_end..]);
+                    if let Some(length) =
+                        known_procset_len(&data[pos..line_end], &data[after_line..])
+                    {
+                        recent = [None, None];
+                        pos = after_line + length;
+                        continue;
+                    }
                     let region = data_section_len(&data[pos..line_end], &data[after_line..]);
                     pos = match region {
                         // Interpreters ignore the comment, so the section may
@@ -362,6 +388,7 @@ impl Scanner<'_> {
                             offset,
                         ),
                         b"eexec" => pos += self.eexec(&data[pos..], base + pos),
+                        [b'.', ..] if inline_data.contains(data, pos - name.len()) => {}
                         _ => self.operator(name, &recent, offset),
                     }
                     current = name;
@@ -467,6 +494,104 @@ impl Scanner<'_> {
             self.findings.push(limit.finding());
         }
     }
+}
+
+/// Image data that the program reads from its own text through an
+/// ASCII85 filter. The tokenizer cannot tell where such data starts, and in
+/// megabytes of it some run of characters will look like a `.name`.
+#[derive(Default)]
+struct InlineData {
+    /// End of the data run most recently recognized.
+    until: usize,
+    /// No data run can contain a position before this one.
+    not_before: usize,
+}
+
+impl InlineData {
+    /// Whether the name at `at` sits in a run of ASCII85 text: solid encoded
+    /// lines before it, and nothing but encoded text from it to a `~>`.
+    /// Only names that are reported for their spelling alone rely on this;
+    /// the raw search for known internals does not.
+    fn contains(&mut self, data: &[u8], at: usize) -> bool {
+        if at < self.until {
+            return true;
+        }
+        if at < self.not_before || !follows_a85_lines(&data[..at]) {
+            return false;
+        }
+        for (index, &byte) in data.iter().enumerate().skip(at) {
+            let next = data.get(index + 1);
+            match byte {
+                b'~' if next == Some(&b'>') => {
+                    self.until = index;
+                    return true;
+                }
+                b'<' if next == Some(&b'~') => {}
+                _ if is_a85_digit(byte) || is_whitespace(byte) => continue,
+                _ => {}
+            }
+            self.not_before = index + 1;
+            return false;
+        }
+        self.not_before = data.len();
+        false
+    }
+}
+
+fn is_a85_digit(byte: u8) -> bool {
+    matches!(byte, b'!'..=b'u' | b'z')
+}
+
+/// Whether `before` ends in [`A85_DATA_LEAD`] bytes of ASCII85 text with no
+/// blanks inside a line; a blank may open a line, which is how encoders
+/// keep a `%` out of the first column.
+fn follows_a85_lines(before: &[u8]) -> bool {
+    let mut digits = 0;
+    for (index, &byte) in before.iter().enumerate().rev() {
+        let opens_line = index
+            .checked_sub(1)
+            .is_none_or(|i| matches!(before[i], b'\r' | b'\n'));
+        match byte {
+            _ if is_a85_digit(byte) => digits += 1,
+            b'\r' | b'\n' => {}
+            b' ' | b'\t' if opens_line => {}
+            _ => return false,
+        }
+        if digits == A85_DATA_LEAD {
+            return true;
+        }
+    }
+    false
+}
+
+/// Length of the resource that a `%%BeginResource:` or `%%BeginProcSet:`
+/// comment opens, when it is one of [`KNOWN_PROCSETS`].
+fn known_procset_len(comment: &[u8], following: &[u8]) -> Option<usize> {
+    if !(comment.starts_with(b"%%BeginResource:") || comment.starts_with(b"%%BeginProcSet:")) {
+        return None;
+    }
+    let ends = [b"%%EndResource".as_slice(), b"%%EndProcSet"];
+    let length = ends
+        .iter()
+        .filter_map(|end| memmem::find(following, end))
+        .min()?;
+    let mut hasher = Sha256::new();
+    let mut body = &following[..length];
+    while !body.is_empty() {
+        let (line, rest) = body.split_at(line_len(body));
+        hasher.update(line);
+        let eol = eol_len(rest);
+        if eol > 0 {
+            hasher.update(b"\n");
+        }
+        body = &rest[eol..];
+    }
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    KNOWN_PROCSETS.contains(&digest.as_str()).then_some(length)
 }
 
 fn name_len(data: &[u8]) -> usize {
@@ -603,6 +728,60 @@ mod tests {
     }
 
     const NONE: [&str; 0] = [];
+
+    /// Encoded lines that happen to contain `.kPkh`, as real image data does.
+    fn a85_lines(count: usize) -> String {
+        let plain = "s4IA>!\"M;*Ddm8XA,lT0!!*&R!(-_f!WiH*!sAZ,9eo1eu5U,&6#R:S>#6tMBpAY+,#hhD6\n";
+        let dotted = "kA04Lrc7q^moO57>,goU`Fa;WBdJbWRY]3Q&[*q).kPkhXHHbbGCJm:4o#,=-[PL<PFt:lR\n";
+        plain.repeat(4) + &dotted.repeat(count)
+    }
+
+    #[test]
+    fn names_inside_inline_image_data_are_not_operators() {
+        let data = a85_lines(8);
+        let body = format!("/src currentfile /ASCII85Decode filter def\nsrc image\n{data}~>\n");
+        assert_eq!(codes(&body), NONE);
+        // A blank may open a line, never sit inside one.
+        let body = format!("src image\n {data} {data}~>\n");
+        assert_eq!(codes(&body), NONE);
+    }
+
+    #[test]
+    fn inline_image_data_does_not_hide_operators() {
+        let internal = ["ps.ghostscript_internal"];
+        let data = a85_lines(8);
+        // No encoded text before the name.
+        assert_eq!(codes(".kPkh (~>) pop"), internal);
+        // Encoded text before it, but code after it.
+        assert_eq!(
+            codes(&format!("({data}) pop .kPkh {{ }} pop (~>)")),
+            internal
+        );
+        assert_eq!(codes(&format!("({data}) pop\n.kPkh <~~> pop")), internal);
+        // No terminator at all.
+        assert_eq!(codes(&format!("src image\n{data}")), internal);
+        // Known internals are found whatever surrounds them.
+        assert_eq!(
+            codes(&format!("src image\n{data}\n.forceput\n{data}~>")),
+            internal
+        );
+        // Only names starting with a dot are affected.
+        assert_eq!(
+            codes(&format!("src image\n{data}(/etc/hosts)(r)file\n~>")),
+            ["ps.file_access"]
+        );
+    }
+
+    #[test]
+    fn unknown_procsets_are_analyzed() {
+        let body = "%%BeginResource: procset Adobe_AGM_Utils 1.0 0\n\
+                    {(AGMUTIL_imagefile)(w+)file}stopped pop\n%%EndResource";
+        assert_eq!(codes(body), ["ps.file_access"]);
+        assert_eq!(
+            known_procset_len(b"%%BeginResource: procset x", b"a\r\nb\n%%EndResource"),
+            None
+        );
+    }
 
     #[test]
     fn ordinary_drawing_is_clean() {

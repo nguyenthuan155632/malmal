@@ -6,7 +6,9 @@ mod bmp;
 mod gif;
 mod jpeg;
 mod png;
+mod psd;
 mod tiff;
+mod trailer;
 mod webp;
 
 use crate::detect::{self, FileType};
@@ -69,6 +71,7 @@ pub(crate) fn analyze(
         FileType::Webp => webp::parse(data),
         FileType::Bmp => bmp::parse(data),
         FileType::Tiff => tiff::parse(data),
+        FileType::Psd => psd::parse(data),
         _ => return,
     };
     match parsed {
@@ -118,6 +121,20 @@ fn check_trailing(data: &[u8], end: usize, findings: &mut Vec<Finding>) {
         .take_while(|b| **b == 0 || b.is_ascii_whitespace())
         .count();
     if padding == trailing.len() {
+        return;
+    }
+    // Both known trailers begin with zero bytes, so try before the padding too.
+    let recognized =
+        trailer::recognize(trailing).or_else(|| trailer::recognize(&trailing[padding..]));
+    if let Some(content) = recognized {
+        findings.push(
+            Finding::new(
+                "image.vendor_trailer",
+                Severity::Info,
+                format!("{} bytes of {content} after the image", trailing.len()),
+            )
+            .at(end),
+        );
         return;
     }
     findings.push(

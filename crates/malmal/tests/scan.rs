@@ -234,8 +234,13 @@ fn corrupted_images_never_panic() {
     tiff.extend_from_slice(b"\x17\x01\x04\0\x01\0\0\0\x04\0\0\0");
     tiff.extend_from_slice(b"\0\0\0\0\x01\x02\x03\x04");
 
+    // 2x2, one channel, one image resource block, raw pixels.
+    let mut psd = b"8BPS\0\x01\0\0\0\0\0\0\0\x01\0\0\0\x02\0\0\0\x02\0\x08\0\x01".to_vec();
+    psd.extend_from_slice(b"\0\0\0\0\0\0\0\x10\x38BIM\x04\x04\0\0\0\0\0\x03abc\0");
+    psd.extend_from_slice(b"\0\0\0\0\0\0\x01\x02\x03\x04");
+
     let scanner = Scanner::builder().build();
-    for sample in [jpeg(b""), png(4, 3, b""), gif(), webp, bmp, tiff] {
+    for sample in [jpeg(b""), png(4, 3, b""), gif(), webp, bmp, tiff, psd] {
         assert_eq!(scan(&sample).verdict, Verdict::Clean, "{sample:?}");
         for len in 0..sample.len() {
             scanner.scan_bytes(&sample[..len], ScanHints::default());
