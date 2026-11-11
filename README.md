@@ -176,6 +176,8 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
 - **Phone camera trailers** (Samsung metadata, motion photo video) are reported as
   `image.vendor_trailer` at Info when their structure accounts for every byte; raise it with
   `with_override` to reject them. Other trailing data stays `image.trailing_data`.
+- **Changes to `errordict` and `systemdict` are not reported.** Exploits use them to keep
+  running after an error, and so does the prolog of every Illustrator EPS.
 - **Encrypted PDFs are not decrypted**, including those with an empty password; they yield
   `pdf.encrypted`.
 - **XFA content and data after a PDF's `%%EOF` are not analyzed.**

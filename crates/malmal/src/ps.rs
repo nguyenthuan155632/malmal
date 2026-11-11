@@ -44,6 +44,30 @@ const STANDARD_FILES: &[&[u8]] = &[
     b"%lineedit",
     b"%statementedit",
 ];
+/// Operators that pick an output device or change its parameters. A device
+/// writes where it is told to, and several load code or parse format
+/// strings taken from their parameters.
+const DEVICE_OPERATORS: &[&[u8]] = &[
+    b"putdeviceprops",
+    b"getdeviceprops",
+    b"selectdevice",
+    b"finddevice",
+    b"setdevice",
+    b"copydevice",
+    b"getdevice",
+];
+/// Page device keys that pick the device or the library it loads.
+const DEVICE_KEYS: &[&[u8]] = &[b"OutputDevice", b"Driver"];
+/// Keys that widen what the interpreter may read, write or load.
+const PERMISSION_KEYS: &[&[u8]] = &[
+    b"PermitFileReading",
+    b"PermitFileWriting",
+    b"PermitFileControl",
+    b"LockFilePermissions",
+    b"LIBPATH",
+];
+/// Filters for printer control protocols; no artwork is encoded with them.
+const PROTOCOL_FILTERS: &[&[u8]] = &[b"BCPEncode", b"BCPDecode", b"TBCPEncode", b"TBCPDecode"];
 const SYSTEM_OPERATORS: &[&[u8]] = &[b"superexec", b"getenv", b"setsystemparams", b"setdevparams"];
 /// Ghostscript extensions that only affect rendering. Every other name
 /// starting with a dot is an interpreter internal.
@@ -219,6 +243,15 @@ impl Scanner<'_> {
         self.report("ps.file_access", Severity::High, message, offset);
     }
 
+    fn device(&mut self, offset: usize) {
+        self.report(
+            "ps.device_access",
+            Severity::High,
+            "selects or reconfigures an output device",
+            offset,
+        );
+    }
+
     fn internal(&mut self, offset: usize) {
         self.report(
             "ps.ghostscript_internal",
@@ -375,10 +408,20 @@ impl Scanner<'_> {
                                 self.program(code, offset, depth + 1);
                             }
                         }
-                        // The string names an operator.
+                        // The string names an operator or a key.
                         b"cvn" => {
                             if let Some(name) = recent[1].take() {
                                 self.operator(&name, &[None, None], offset);
+                                self.key(&name, offset);
+                            }
+                        }
+                        // The string is read as code, one token at a time.
+                        b"token" => {
+                            if let Some(code) = &recent[1]
+                                && depth < MAX_DEPTH
+                            {
+                                self.raw_scan(code, offset);
+                                self.program(code, offset, depth + 1);
                             }
                         }
                         b"exec" if since_cvx <= 3 => self.report(
@@ -427,6 +470,12 @@ impl Scanner<'_> {
             _ if FILE_OPERATORS.contains(&name) => {
                 self.file_access("runs, deletes, renames or enumerates files", offset)
             }
+            // On a file object it reports whether the file is open; on a
+            // name it reports whether that file exists.
+            b"status" if recent[1].is_some() => {
+                self.file_access("checks whether a file exists", offset)
+            }
+            _ if DEVICE_OPERATORS.contains(&name) => self.device(offset),
             _ if SYSTEM_OPERATORS.contains(&name) => self.internal(offset),
             [b'.', letter, ..]
                 if letter.is_ascii_alphabetic() && !HARMLESS_DOT_NAMES.contains(&name) =>
@@ -440,13 +489,30 @@ impl Scanner<'_> {
     /// A literal `/name` is harmless as a definition, but naming a dangerous
     /// operator and then looking it up is the same as calling it.
     fn literal_name(&mut self, name: &[u8], rest: &[u8], offset: usize) {
-        if name == b"OutputFile" {
-            return self.file_access("redirects page output to a file or command", offset);
-        }
+        self.key(name, offset);
         let rest = rest.trim_ascii_start();
         let next = &rest[..name_len(rest)];
         if LOOKUP_OPERATORS.contains(&next) {
             self.operator(name, &[None, None], offset);
+        }
+    }
+
+    /// Check a name used as a dictionary key or filter name, however it was
+    /// spelled.
+    fn key(&mut self, name: &[u8], offset: usize) {
+        if name == b"OutputFile" {
+            self.file_access("redirects page output to a file or command", offset);
+        } else if DEVICE_KEYS.contains(&name) {
+            self.device(offset);
+        } else if PERMISSION_KEYS.contains(&name) {
+            self.internal(offset);
+        } else if PROTOCOL_FILTERS.contains(&name) {
+            self.report(
+                "ps.unusual_filter",
+                Severity::Medium,
+                "uses a printer control protocol filter",
+                offset,
+            );
         }
     }
 
@@ -770,6 +836,52 @@ mod tests {
             codes(&format!("src image\n{data}(/etc/hosts)(r)file\n~>")),
             ["ps.file_access"]
         );
+    }
+
+    #[test]
+    fn output_devices_and_their_parameters() {
+        let device = ["ps.device_access"];
+        assert_eq!(codes("mark currentdevice putdeviceprops"), device);
+        assert_eq!(codes("(name) selectdevice"), device);
+        assert_eq!(codes("(name) finddevice setdevice"), device);
+        assert_eq!(codes("<< /OutputDevice /name >> setpagedevice"), device);
+        assert_eq!(codes("<< /Driver (x) >> setpagedevice"), device);
+        assert_eq!(
+            codes("<< (OutputDevice) cvn /name >> setpagedevice"),
+            device
+        );
+        // Separation and DeviceN colour operators only share the letters.
+        assert_eq!(codes("/devn /setdevicencolor load def nulldevice"), NONE);
+
+        let file = ["ps.file_access"];
+        assert_eq!(codes("<< (OutputFile) cvn (x) >> setpagedevice"), file);
+        assert_eq!(
+            codes("<< <4f757470757446696c65> cvn (x) >> setpagedevice"),
+            file
+        );
+    }
+
+    #[test]
+    fn permissions_probes_and_protocol_filters() {
+        let internal = ["ps.ghostscript_internal"];
+        assert_eq!(
+            codes("<< /PermitFileReading [(*)] >> setuserparams"),
+            internal
+        );
+        assert_eq!(codes("/LIBPATH where { pop } if"), internal);
+        // Adobe's prolog sets cache parameters this way.
+        assert_eq!(codes("<< /MaxFormItem 1000 >> setuserparams"), NONE);
+
+        assert_eq!(codes("(/etc/hostname) status"), ["ps.file_access"]);
+        assert_eq!(codes("currentfile status pop"), NONE);
+        assert_eq!(codes("src /BCPEncode filter"), ["ps.unusual_filter"]);
+    }
+
+    #[test]
+    fn strings_read_with_token_are_code() {
+        assert_eq!(codes("(run) token pop exch pop exec"), ["ps.file_access"]);
+        assert_eq!(codes("currentfile token pop pop 1"), NONE);
+        assert_eq!(codes("(12 34) token pop pop pop"), NONE);
     }
 
     #[test]

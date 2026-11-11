@@ -109,9 +109,11 @@ override severity per code.
 | | `pdf.submit_form`, `pdf.remote_goto`, `pdf.uri` | Low (`uri` is Info) |
 | | `pdf.obfuscated_name` (`#xx` in a sensitive key name) | High |
 | | `pdf.encrypted`, `pdf.malformed`, `pdf.incremental_update` | Medium / Medium / Info |
-| PostScript | `ps.file_access` (`file` other than `%stdin`/`%stdout`, `run`, `deletefile`, `renamefile`, `/OutputFile`) | High |
+| PostScript | `ps.file_access` (`file` other than `%stdin`/`%stdout`, `run`, `deletefile`, `renamefile`, `status` on a file name, `/OutputFile` however the key is spelled) | High |
+| | `ps.device_access` (`putdeviceprops`, `selectdevice`, `finddevice`, `setdevice`, the `/OutputDevice` and `/Driver` keys) | High |
 | | `ps.pipe` (`%pipe%` anywhere, including written with escapes or hex) | Critical |
-| | `ps.ghostscript_internal` (every operator starting with a dot except a harmless set; `superexec`, `getenv`...) | High |
+| | `ps.ghostscript_internal` (every operator starting with a dot except a harmless set; `superexec`, `getenv`...; the `/PermitFile*`, `/LockFilePermissions` and `/LIBPATH` keys) | High |
+| | `ps.unusual_filter` (`BCPEncode`, `TBCPEncode` and their decoders) | Medium |
 | | `ps.exec_dynamic` (`cvx exec` on code decoded at run time) | Medium |
 | | `ps.malformed` (missing `%!`, bad binary EPS header) | Medium |
 | | `ps.wmf_preview` (EPS with a WMF preview, which is not analyzed) | Info |
@@ -250,6 +252,12 @@ A milestone is done when `cargo test` is green, `cargo clippy -- -D warnings` is
 > covers PostScript XObjects and the `PS` content operator, the XObject's program goes through
 > the PostScript analyzer, and `--types` lets the CLI and daemon refuse PostScript files
 > outright.
+>
+> Trigger-only fixtures built from the operators, devices and parameters that public
+> Ghostscript advisories name showed 13 of 30 passing as clean. Added: device selection and
+> reconfiguration, permission keys, file probing with `status`, keys spelled through `cvn`,
+> strings read with `token`, and protocol filters. Changes to `errordict` and `systemdict` are
+> still not reported, because Adobe's own prologs make them.
 
 ## Order and dependencies
 
