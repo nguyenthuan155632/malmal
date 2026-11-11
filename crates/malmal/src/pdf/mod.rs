@@ -180,6 +180,8 @@ struct Output<'a> {
     findings: &'a mut Vec<Finding>,
     /// Object numbers that file specifications name as embedded files.
     embedded: Vec<u32>,
+    /// Object numbers that pages, fonts and patterns name as content streams.
+    contents: Vec<u32>,
     encrypted: bool,
 }
 
@@ -223,6 +225,7 @@ pub(crate) fn analyze(
     let mut out = Output {
         findings,
         embedded: Vec::new(),
+        contents: Vec::new(),
         encrypted: false,
     };
     let mut doc = Document {
@@ -253,6 +256,7 @@ pub(crate) fn analyze(
             walk(&doc, &object.value, object.offset, &mut out);
         }
         scan_embedded_files(&doc, budget, &mut out, nested);
+        scan_content_streams(&doc, budget, &mut out);
     }
 
     if doc.objects.is_empty() {
@@ -449,6 +453,7 @@ fn expand_object_streams(
 fn walk(doc: &Document<'_>, value: &Value, offset: usize, out: &mut Output<'_>) {
     match value {
         Value::Dict(dict) => {
+            check_postscript(doc, dict, offset, out);
             for (key, item) in &dict.0 {
                 check_name(key, offset, out);
                 check_entry(doc, key, item, offset, out);
@@ -531,6 +536,19 @@ fn check_entry(doc: &Document<'_>, key: &Name, value: &Value, offset: usize, out
             }
         }
         b"EmbeddedFiles" => embedded_file(offset, out),
+        // A page's content, or the glyph procedures of a Type 3 font. An
+        // annotation's /Contents is a string and names nothing.
+        b"Contents" => match (value, doc.resolve(Some(value))) {
+            (_, Value::Array(items)) => out.contents.extend(items.iter().filter_map(as_ref)),
+            (Value::Ref(number), _) => out.contents.push(*number),
+            _ => {}
+        },
+        b"CharProcs" => {
+            if let Value::Dict(procedures) = doc.resolve(Some(value)) {
+                let streams = procedures.0.iter().filter_map(|(_, item)| as_ref(item));
+                out.contents.extend(streams);
+            }
+        }
         b"XFA" => xfa(offset, out),
         b"Encrypt" => out.encrypted(offset),
         b"URI" => uri(offset, out),
@@ -560,6 +578,31 @@ fn check_entry(doc: &Document<'_>, key: &Name, value: &Value, offset: usize, out
         }
         _ => {}
     }
+}
+
+fn as_ref(value: &Value) -> Option<u32> {
+    match value {
+        Value::Ref(number) => Some(*number),
+        _ => None,
+    }
+}
+
+/// PostScript XObjects are passed to the interpreter of a PostScript
+/// printer or converter as they are. They come as `/Subtype /PS`, or as a
+/// form XObject marked with `/Subtype2 /PS` or carrying a `/PS` stream.
+fn check_postscript(doc: &Document<'_>, dict: &Dict, offset: usize, out: &mut Output<'_>) {
+    let is = |key: &[u8], name: &[u8]| doc.name_is(dict.get(key), name);
+    let form_with_alternative =
+        dict.get(b"PS").is_some() && (is(b"Subtype", b"Form") || is(b"Type", b"XObject"));
+    if is(b"Subtype", b"PS") || is(b"Subtype2", b"PS") || form_with_alternative {
+        // The stream is scanned with the embedded files.
+        out.embedded.extend(dict.get(b"PS").and_then(as_ref));
+        postscript("embeds a PostScript XObject", offset, out);
+    }
+}
+
+fn postscript(message: &str, offset: usize, out: &mut Output<'_>) {
+    out.report("pdf.postscript", Severity::High, message, offset);
 }
 
 fn javascript(offset: usize, out: &mut Output<'_>) {
@@ -675,6 +718,7 @@ fn fallback_names(region: &[u8], offset: usize, out: &mut Output<'_>) {
             b"RichMedia" => rich_media(offset, out),
             b"XFA" => xfa(offset, out),
             b"Encrypt" => out.encrypted(offset),
+            b"Subtype2" => postscript("embeds a PostScript XObject", offset, out),
             _ => {}
         }
     }
@@ -693,7 +737,8 @@ fn scan_embedded_files(
         .enumerate()
         .filter_map(|(index, object)| {
             let dict = object.value.as_dict()?;
-            doc.name_is(dict.get(b"Type"), b"EmbeddedFile")
+            let is = |key: &[u8], name: &[u8]| doc.name_is(dict.get(key), name);
+            (is(b"Type", b"EmbeddedFile") || is(b"Subtype", b"PS") || is(b"Subtype2", b"PS"))
                 .then_some(index)
         });
     let referenced = out
@@ -730,6 +775,113 @@ fn scan_embedded_files(
         }
         budget.leave();
     }
+}
+
+/// Search page content, form XObjects, patterns and glyph procedures for the
+/// `PS` operator, which hands its string operand to a PostScript interpreter.
+fn scan_content_streams(doc: &Document<'_>, budget: &mut Budget, out: &mut Output<'_>) {
+    let named = out
+        .contents
+        .iter()
+        .filter_map(|number| doc.by_number.get(number).copied());
+    let typed = doc
+        .objects
+        .iter()
+        .enumerate()
+        .filter_map(|(index, object)| {
+            let dict = object.value.as_dict()?;
+            (doc.name_is(dict.get(b"Subtype"), b"Form") || dict.get(b"PatternType").is_some())
+                .then_some(index)
+        });
+    let mut targets: Vec<usize> = named.chain(typed).collect();
+    targets.sort_unstable();
+    targets.dedup();
+
+    for index in targets {
+        let object = &doc.objects[index];
+        if object.stream_start.is_none() {
+            continue;
+        }
+        match doc.decode(object, budget) {
+            Ok(content) if uses_operator(&content, b"PS") => {
+                return postscript(
+                    "content stream uses the PostScript operator",
+                    object.offset,
+                    out,
+                );
+            }
+            Err(DecodeError::Limit) => return out.limit(LimitExceeded::Decompression),
+            // A stream no reader can decode draws nothing.
+            _ => {}
+        }
+    }
+}
+
+/// Whether a content stream has `operator` as a token of its own, outside
+/// strings, names and comments.
+fn uses_operator(content: &[u8], operator: &[u8]) -> bool {
+    let mut unclosed_string = false;
+    let mut pos = 0;
+    while let Some(&byte) = content.get(pos) {
+        match byte {
+            b'%' => pos += memchr::memchr2(b'\n', b'\r', &content[pos..]).unwrap_or(content.len()),
+            // Once a string runs to the end, so does every later one: step
+            // over the parenthesis so that it cannot hide what follows.
+            b'(' if unclosed_string => pos += 1,
+            b'(' => {
+                let start = pos;
+                let mut depth = 0usize;
+                while let Some(&inner) = content.get(pos) {
+                    pos += 1;
+                    match inner {
+                        b'\\' => pos += 1,
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                if depth > 0 {
+                    unclosed_string = true;
+                    pos = start + 1;
+                }
+            }
+            b'<' if content.get(pos + 1) != Some(&b'<') => {
+                pos += memchr::memchr(b'>', &content[pos..]).unwrap_or(content.len());
+            }
+            _ if is_regular(byte) => {
+                let length = content[pos..]
+                    .iter()
+                    .take_while(|&&b| is_regular(b))
+                    .count();
+                let token = &content[pos..pos + length];
+                if token == operator {
+                    return true;
+                }
+                pos += length;
+                // Inline image data is binary up to the `EI` that closes it.
+                if token == b"ID" {
+                    let end = memmem::find_iter(&content[pos..], b"EI").find(|&at| {
+                        let before = content[pos + at - 1];
+                        let after = content.get(pos + at + 2);
+                        is_whitespace(before) && after.is_none_or(|&b| !is_regular(b))
+                    });
+                    pos += end.unwrap_or(0);
+                }
+            }
+            b'/' => {
+                pos += 1;
+                pos += content[pos..]
+                    .iter()
+                    .take_while(|&&b| is_regular(b))
+                    .count();
+            }
+            _ => pos += 1,
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -782,6 +934,83 @@ mod tests {
         let content = stream("", b"BT /F1 12 Tf (Hello) Tj ET");
         assert_eq!(
             codes(&pdf(&[CATALOG, PAGES, PAGE, &content])),
+            [] as [&str; 0]
+        );
+    }
+
+    #[test]
+    fn postscript_xobjects() {
+        let program = b"%!PS\n(PAYLOAD) show";
+        for entries in [
+            "/Type /XObject /Subtype /PS",
+            "/Type /XObject /Subtype /Form /Subtype2 /PS",
+            "/Type /XObject /Subtype /Form /PS 9 0 R",
+        ] {
+            let xobject = stream(entries, program);
+            assert_eq!(
+                codes(&pdf(&[CATALOG, PAGES, PAGE, &xobject])),
+                ["pdf.postscript"],
+                "{entries}"
+            );
+        }
+        // /PS is only an XObject entry; elsewhere it is a resource name.
+        let resources = b"<< /Font << /PS 9 0 R >> >>";
+        assert_eq!(
+            codes(&pdf(&[CATALOG, PAGES, PAGE, resources])),
+            [] as [&str; 0]
+        );
+        // What the program does is reported too.
+        let xobject = stream("/Subtype /PS", b"\x7fELF");
+        assert_eq!(
+            codes(&pdf(&[CATALOG, PAGES, PAGE, &xobject])),
+            ["pdf.postscript", "type.executable"]
+        );
+    }
+
+    #[test]
+    fn postscript_operator_in_content() {
+        let page = b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>";
+        let content = stream("", b"BT (text) Tj ET\n(1 2 moveto) PS\n");
+        assert_eq!(
+            codes(&pdf(&[CATALOG, PAGES, page, &content])),
+            ["pdf.postscript"]
+        );
+        let packed = stream(
+            "/Filter /FlateDecode",
+            &compress_to_vec_zlib(b"q (x) PS Q", 6),
+        );
+        assert_eq!(
+            codes(&pdf(&[CATALOG, PAGES, page, &packed])),
+            ["pdf.postscript"]
+        );
+        let form = stream("/Type /XObject /Subtype /Form", b"(x)PS");
+        assert_eq!(
+            codes(&pdf(&[CATALOG, PAGES, PAGE, &form])),
+            ["pdf.postscript"]
+        );
+        // The same letters as a string, a name, a comment or part of a word.
+        let harmless = stream("", b"(PS) Tj <5053> Tj /PS gs % PS\nPSx EPS BT ET");
+        assert_eq!(
+            codes(&pdf(&[CATALOG, PAGES, page, &harmless])),
+            [] as [&str; 0]
+        );
+        // Neither inline image data nor a stray parenthesis hides it.
+        for hidden in [
+            &b"BI /W 1 /H 1 ID (\x00 EI (x) PS"[..],
+            b"BI /W 1 /H 1 ID \x00) EI (x) PS",
+            b"( (x) PS",
+        ] {
+            let content = stream("", hidden);
+            assert_eq!(
+                codes(&pdf(&[CATALOG, PAGES, page, &content])),
+                ["pdf.postscript"],
+                "{hidden:?}"
+            );
+        }
+        // A stream nothing names as content is not searched.
+        let other = stream("/Length1 5", b"(x) PS");
+        assert_eq!(
+            codes(&pdf(&[CATALOG, PAGES, PAGE, &other])),
             [] as [&str; 0]
         );
     }

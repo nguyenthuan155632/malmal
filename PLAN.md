@@ -103,6 +103,7 @@ override severity per code.
 | | `svg.entity` (external entities, parameter entities, nested entities, `ATTLIST`) | High |
 | | `svg.malformed` (broken XML, unusual encoding, root is not `<svg>`) | Medium |
 | PDF | `pdf.javascript`, `pdf.launch` | High |
+| | `pdf.postscript` (PostScript XObject, form XObject with `/Subtype2 /PS` or a `/PS` stream, `PS` operator in page content) | High |
 | | `pdf.open_action`, `pdf.additional_action` | Medium; High when it leads to JS/Launch; not reported for a plain page jump |
 | | `pdf.embedded_file` (embedded files are also scanned recursively), `pdf.rich_media`, `pdf.xfa` | Medium |
 | | `pdf.submit_form`, `pdf.remote_goto`, `pdf.uri` | Low (`uri` is Info) |
@@ -244,6 +245,11 @@ A milestone is done when `cargo test` is green, `cargo clippy -- -D warnings` is
 > Illustrator's standard procsets reported for `superexec`, `file` and `cvx exec`; inline
 > ASCII85 image data tokenized as code; PSD not supported; phone camera trailers reported as
 > unexplained trailing data. See the known limits in the README for the exemptions this added.
+>
+> A second fixture set showed PDFs carrying PostScript passing as clean. `pdf.postscript` now
+> covers PostScript XObjects and the `PS` content operator, the XObject's program goes through
+> the PostScript analyzer, and `--types` lets the CLI and daemon refuse PostScript files
+> outright.
 
 ## Order and dependencies
 

@@ -54,6 +54,31 @@ impl FileType {
         }
     }
 
+    /// The type that [`Self::as_str`] spells as `name`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        const ALL: [FileType; 18] = [
+            FileType::Jpeg,
+            FileType::Png,
+            FileType::Gif,
+            FileType::Webp,
+            FileType::Bmp,
+            FileType::Tiff,
+            FileType::Psd,
+            FileType::Svg,
+            FileType::Pdf,
+            FileType::PostScript,
+            FileType::Zip,
+            FileType::Gzip,
+            FileType::Html,
+            FileType::Pe,
+            FileType::Elf,
+            FileType::MachO,
+            FileType::Script,
+            FileType::Unknown,
+        ];
+        ALL.into_iter().find(|file_type| file_type.as_str() == name)
+    }
+
     pub fn is_executable(self) -> bool {
         matches!(self, Self::Pe | Self::Elf | Self::MachO | Self::Script)
     }

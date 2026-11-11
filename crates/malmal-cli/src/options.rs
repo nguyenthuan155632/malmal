@@ -2,13 +2,15 @@
 
 use std::fs;
 
-use malmal::{HashList, Policy, Scanner};
+use malmal::{FileType, HashList, Policy, Scanner};
 
 use crate::sandbox::Mode;
 
 #[cfg(not(feature = "yara"))]
 pub const HELP: &str = "\
   --policy <NAME>      default or strict [default: default]
+  --types <LIST>       Accepted file types, comma-separated
+                       [default: jpeg,png,gif,webp,bmp,tiff,psd,svg,pdf,postscript]
   --hashlist <FILE>    SHA-256 blocklist, one hex digest per line
   --no-sandbox         Do not restrict the process
   --require-sandbox    Exit with an error if the sandbox cannot be applied";
@@ -16,6 +18,8 @@ pub const HELP: &str = "\
 #[cfg(feature = "yara")]
 pub const HELP: &str = "\
   --policy <NAME>      default or strict [default: default]
+  --types <LIST>       Accepted file types, comma-separated
+                       [default: jpeg,png,gif,webp,bmp,tiff,psd,svg,pdf,postscript]
   --hashlist <FILE>    SHA-256 blocklist, one hex digest per line
   --yara <PATH>        YARA rule file, or directory of .yar/.yara files (repeatable)
   --no-sandbox         Do not restrict the process
@@ -32,6 +36,8 @@ pub const MEMORY_LIMIT: Option<u64> = if cfg!(feature = "yara") {
 
 pub struct Common {
     pub policy: Policy,
+    /// Replaces the policy's accepted types when given.
+    pub types: Option<Vec<FileType>>,
     pub hashlist: HashList,
     pub sandbox: Mode,
     #[cfg(feature = "yara")]
@@ -42,6 +48,7 @@ impl Default for Common {
     fn default() -> Self {
         Self {
             policy: Policy::default(),
+            types: None,
             hashlist: HashList::default(),
             sandbox: Mode::BestEffort,
             #[cfg(feature = "yara")]
@@ -67,6 +74,17 @@ impl Common {
                     None => return Err("--policy needs a value".into()),
                 }
             }
+            "--types" => {
+                let list = rest.next().ok_or("--types needs a value")?;
+                let types = list
+                    .split(',')
+                    .map(|name| {
+                        FileType::from_name(name.trim())
+                            .ok_or_else(|| format!("unknown file type {name:?}"))
+                    })
+                    .collect::<Result<_, _>>()?;
+                self.types = Some(types);
+            }
             "--hashlist" => {
                 let path = rest.next().ok_or("--hashlist needs a value")?;
                 let text = fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
@@ -85,8 +103,15 @@ impl Common {
     }
 
     pub fn scanner(&self) -> Result<Scanner, String> {
+        let policy = match &self.types {
+            Some(types) => self
+                .policy
+                .clone()
+                .with_allowed_types(types.iter().copied()),
+            None => self.policy.clone(),
+        };
         let builder = Scanner::builder()
-            .policy(self.policy.clone())
+            .policy(policy)
             .hashlist(self.hashlist.clone());
         #[cfg(feature = "yara")]
         let builder = if self.yara_sources.is_empty() {

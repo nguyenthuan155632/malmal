@@ -30,8 +30,24 @@ The output is in `target/x86_64-unknown-linux-musl/release/`:
 
 Both binaries run on a bare Debian install with no extra packages.
 
-On macOS, `cargo build --release --workspace` builds the same binaries without the sandbox;
-this has only been type-checked, not run.
+### macOS
+
+```bash
+cargo build --release --workspace
+```
+
+Leave out `--target`; the binaries land in `target/release/`. There is no sandbox on macOS,
+so `--require-sandbox` exits with an error, and the memory limit is not applied. The test
+suite has not been run on macOS.
+
+### Installing the commands
+
+Building does not put anything on your `PATH`. Either run the binary by path
+(`./target/release/malmal`), or install `malmal` and `malmald` into `~/.cargo/bin`:
+
+```bash
+cargo install --path crates/malmal-cli
+```
 
 ## Using it from Rust
 
@@ -70,6 +86,16 @@ malmal scan --json --policy strict upload.pdf
 ```
 
 `-` reads from stdin. Exit codes: 0 clean, 1 suspicious, 2 malicious, 3 error.
+
+`--types` replaces the accepted file types; anything else gets `type.not_allowed`. PostScript
+is accepted by default, so a service that only wants PDF-based Illustrator files and images
+refuses PostScript with:
+
+```bash
+malmal scan --types jpeg,png,gif,webp,bmp,tiff,psd,svg,pdf upload.ai
+```
+
+`malmald` takes the same option. From Rust it is `Policy::with_allowed_types`.
 
 Before it opens the first file, the process confines itself: Landlock allows reading only
 the files passed on the command line, seccomp blocks `execve`, sockets and other dangerous

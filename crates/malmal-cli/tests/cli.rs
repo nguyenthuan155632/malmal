@@ -68,6 +68,36 @@ fn sandbox_available(dir: &Path) -> bool {
 }
 
 #[test]
+fn types_option_replaces_the_accepted_types() {
+    let dir = scratch("types");
+    let (png, eps) = (dir.join("ok.png"), dir.join("art.eps"));
+    fs::write(&png, valid_png()).unwrap();
+    fs::write(
+        &eps,
+        "%!PS-Adobe-3.0 EPSF-3.0\n0 0 moveto 1 1 lineto stroke\n",
+    )
+    .unwrap();
+
+    let scan = |types: &str, file: &Path| {
+        let output = Command::new(MALMAL)
+            .args(["scan", "--json", "--types", types])
+            .arg(file)
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).unwrap(),
+        )
+    };
+    assert_eq!(scan("png,postscript", &eps).0, Some(0));
+    let (code, report) = scan("png, pdf", &eps);
+    assert_eq!(code, Some(1));
+    assert!(report.contains("type.not_allowed"), "{report}");
+    assert_eq!(scan("png,pdf", &png).0, Some(0));
+    assert_eq!(scan("png,docx", &png).0, Some(3));
+}
+
+#[test]
 fn scans_files_and_reports_the_worst_verdict() {
     let dir = scratch("scan");
     let (png, elf) = (dir.join("ok.png"), dir.join("photo.jpg"));
