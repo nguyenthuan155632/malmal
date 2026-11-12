@@ -3,7 +3,11 @@ name = "malmal"
 description = "Upload scanner for images, SVG, PDF and PostScript files"
 version.workspace = true
 edition.workspace = true
-publish.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["malware", "scanner", "upload", "security", "antivirus"]
+categories = ["parsing", "command-line-utilities"]
 
 [dependencies]
 memchr = "2.8.3"
