@@ -11,12 +11,21 @@
 - PSD layer records are walked: a broken record is `image.malformed`, and a layer larger
   than the pixel limit is `image.pixel_bomb`.
 - PDFs encrypted with an empty user password are decrypted and inspected. `pdf.encrypted`
-  is then reported at Info instead of Medium.
+  is then reported at Info instead of Medium. `ScannerBuilder::pdf_passwords` and
+  `--pdf-passwords` supply passwords to try on the others, as user or owner password.
 - `pdf.trailing_data` and `pdf.polyglot` for bytes after the last `%%EOF`. A PDF with a ZIP
   archive appended used to come back clean.
 - XFA forms are searched for scripts, reported as `pdf.javascript`.
 - Files embedded in a PDF are matched against the YARA rules.
-- `image.compressed_metadata` (Info) for Brotli-compressed metadata in JPEG XL.
+- Brotli-compressed metadata boxes in JPEG XL are decompressed and searched
+  (`image.metadata.payload`).
+- The `cdr` feature: `Scanner::sanitize` and `malmal::cdr::rebuild` decode a clean raster
+  image and write a new file from its pixels. `malmal sanitize INPUT OUTPUT` and the
+  daemon's `POST /sanitize` do the same; `malmal-cli` enables the feature by default.
+- `malmald --icap`: ICAP `REQMOD` and `RESPMOD` for proxies. Multipart forms are taken
+  apart and each uploaded file is scanned.
+- Release archives with static binaries for x86-64 and ARM64, a container image, a Python
+  binding in `bindings/python`, and metadata for `cargo binstall`.
 - `malmald --http`: `POST /scan`, `GET /metrics` (Prometheus), `GET /healthz`.
 - `malmald --clamd`: the `INSTREAM` command of the ClamAV daemon protocol.
 - `--max-size` and `--scan-timeout` for both commands; `Scanner::limits()`.
@@ -27,9 +36,10 @@
 - `FileType`, `Report` and `Finding` are `#[non_exhaustive]`.
 - `malmal::payload`, `Budget` and `LimitExceeded` are no longer public. They were internals
   that no caller needs.
-- `malmald --socket` is no longer required on its own: one of `--socket`, `--http` or
-  `--clamd` is.
-- New dependencies: `md-5` and `aes`, for PDF decryption.
+- `malmald --socket` is no longer required on its own: one of `--socket`, `--http`,
+  `--clamd` or `--icap` is.
+- New dependencies: `md-5` and `aes`, for PDF decryption; `brotli-decompressor`, for JPEG XL
+  metadata; `image`, only with the `cdr` feature.
 
 ### Behaviour to check when upgrading
 

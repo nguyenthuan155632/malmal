@@ -1,0 +1,139 @@
+name: Release
+
+# Pushing the tag v<version> builds the binaries, attaches them to a GitHub
+# release, pushes the container image and, when the CARGO_REGISTRY_TOKEN
+# secret is set, publishes the crates.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: The tag must be the version of the crates
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "malmal") | .version')
+          test "v$version" = "$GITHUB_REF_NAME"
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked --workspace --target ${{ matrix.target }}
+      - name: Binaries must not link dynamically
+        run: |
+          for binary in malmal malmald; do
+            file target/${{ matrix.target }}/release/$binary | grep -E 'static(ally|-pie) linked'
+          done
+      - name: Package
+        run: |
+          name=malmal-$GITHUB_REF_NAME-${{ matrix.target }}
+          release=target/${{ matrix.target }}/release
+          mkdir -p dist/$name/bin dist/$name/lib dist/$name/include image/${{ matrix.arch }}
+          cp $release/malmal $release/malmald dist/$name/bin
+          cp $release/libmalmal_ffi.a dist/$name/lib
+          cp crates/malmal-ffi/include/malmal.h dist/$name/include
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE dist/$name
+          tar -C dist -czf $name.tar.gz $name
+          sha256sum $name.tar.gz > $name.tar.gz.sha256
+          cp $release/malmal $release/malmald image/${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.arch }}
+          path: malmal-*.tar.gz*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.arch }}
+          path: image
+
+  github:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The section of the changelog for this version.
+          awk -v version="${GITHUB_REF_NAME#v}" '
+            /^## / { printing = ($2 == version); next }
+            printing' CHANGELOG.md > notes.md
+          gh release create "$GITHUB_REF_NAME" malmal-*.tar.gz* \
+            --title "$GITHUB_REF_NAME" --notes-file notes.md
+
+  image:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-*
+          merge-multiple: true
+          path: image
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push
+        run: |
+          chmod +x image/*/malmal image/*/malmald
+          # The binaries are already built; the image only carries them.
+          cat > image/Dockerfile <<'DOCKERFILE'
+          FROM scratch
+          ARG TARGETARCH
+          COPY ${TARGETARCH}/malmal ${TARGETARCH}/malmald /usr/local/bin/
+          USER 65534:65534
+          EXPOSE 8080
+          ENTRYPOINT ["/usr/local/bin/malmald"]
+          CMD ["--http", "0.0.0.0:8080"]
+          DOCKERFILE
+          repository=ghcr.io/${GITHUB_REPOSITORY,,}
+          docker buildx build image --push \
+            --platform linux/amd64,linux/arm64 \
+            --label org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY \
+            --label org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+            --tag $repository:${GITHUB_REF_NAME#v} --tag $repository:latest
+
+  crates:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.CARGO_REGISTRY_TOKEN != ''
+      - uses: dtolnay/rust-toolchain@stable
+        if: env.CARGO_REGISTRY_TOKEN != ''
+      - name: Publish, the library first
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: |
+          cargo publish --locked -p malmal
+          cargo publish --locked -p malmal-ffi
+          cargo publish --locked -p malmal-cli

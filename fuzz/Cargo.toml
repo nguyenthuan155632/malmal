@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-malmal = { path = "../crates/malmal" }
+malmal = { path = "../crates/malmal", features = ["cdr"] }
 
 # Not a member of the main workspace: fuzzing needs a nightly toolchain.
 [workspace]
@@ -116,6 +116,13 @@ bench = false
 [[bin]]
 name = "bigtiff"
 path = "fuzz_targets/bigtiff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cdr"
+path = "fuzz_targets/cdr.rs"
 test = false
 doc = false
 bench = false

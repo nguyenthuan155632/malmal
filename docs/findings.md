@@ -49,8 +49,7 @@ JPEG, PNG, GIF, WebP, BMP, TIFF and BigTIFF, PSD and PSB, HEIC, AVIF, JPEG XL, I
 | `image.trailing_data` | Low | Bytes follow the end of the image. Zero padding is ignored. | Re-encode the image, which drops them, or reject. |
 | `image.vendor_trailer` | Info | The bytes after the image are a complete Samsung metadata trailer or motion photo video. | Nothing; raise the severity with an override to refuse them. |
 | `image.polyglot` | High | The file is also another format: the bytes after the image are a ZIP, PDF, executable or HTML file, a PDF header sits near the start, or a ZIP end record closes the file. | Reject. |
-| `image.metadata.payload` | High | Code in a compressed PNG chunk (`zTXt`, `iTXt`, `iCCP`). | Reject. |
-| `image.compressed_metadata` | Info | A JPEG XL file carries Brotli-compressed metadata, which is not decompressed. | Nothing, or strip metadata when re-encoding. |
+| `image.metadata.payload` | High | Code in a compressed PNG chunk (`zTXt`, `iTXt`, `iCCP`) or a Brotli-compressed JPEG XL metadata box. | Reject. |
 | `image.pixel_bomb` | Medium | The image, or a layer of a PSD, declares more pixels than `Limits::max_pixels`. | Reject before a decoder allocates them. |
 
 ## SVG
@@ -84,7 +83,7 @@ Also applies to Illustrator files saved since version 9, which are PDFs.
 | `pdf.embedded_file` | Medium | The document carries attachments. Each one is scanned too, and what is found in it is reported with the prefix `embedded file:`. |
 | `pdf.rich_media` | Medium | Embedded Flash, video or 3D content. |
 | `pdf.xfa` | Medium | An XFA form. Its packets are searched for scripts, which are reported as `pdf.javascript`. |
-| `pdf.encrypted` | Info / Medium | The document is encrypted. Info when the empty password opens it, as it does in any reader: the content was decrypted and inspected. Medium when it needs a password, so its streams could not be inspected. |
+| `pdf.encrypted` | Info / Medium | The document is encrypted. Info when the empty password or one given with `pdf_passwords` opens it: the content was decrypted and inspected. Medium when no password at hand opens it, so its streams could not be inspected. |
 | `pdf.polyglot` | High | The file is also another format: the bytes after the last `%%EOF` are a recognizable file, or a ZIP end record closes the file. |
 | `pdf.trailing_data` | Low | Bytes other than padding follow the last `%%EOF`. |
 | `pdf.submit_form` | Low | A form action that sends or fetches data. |

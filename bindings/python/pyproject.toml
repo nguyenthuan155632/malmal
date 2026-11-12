@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "malmal"
+version = "0.2.0"
+description = "Upload scanner for images, SVG, PDF and PostScript files"
+readme = "README.md"
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.8"
+
+[project.urls]
+Repository = "https://github.com/nguyenthuan155632/malmal"
+
+[tool.setuptools]
+packages = ["malmal"]
+
+# A copy of the library placed in the package is shipped with it.
+[tool.setuptools.package-data]
+malmal = ["libmalmal_ffi.so", "libmalmal_ffi.dylib", "malmal_ffi.dll"]

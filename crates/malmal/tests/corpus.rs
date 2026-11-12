@@ -112,3 +112,58 @@ fn findings_match_the_recorded_ones() {
         changed.join("\n")
     );
 }
+
+/// Every sample that can be rebuilt comes out as a clean image of the type
+/// the rebuild names, whatever it went in as.
+#[cfg(feature = "cdr")]
+#[test]
+fn rebuilt_images_are_clean() {
+    use malmal::cdr::{self, Error, Options};
+    use malmal::{FileType, Limits};
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests");
+    let scanner = Scanner::builder().build();
+    let mut rebuilt_types = Vec::new();
+    for dir in ["corpus/clean", "corpus/malicious", "prototypes/files"] {
+        let Ok(entries) = fs::read_dir(root.join(dir)) else {
+            continue;
+        };
+        for path in entries.map(|entry| entry.unwrap().path()) {
+            if !path.is_file() {
+                continue;
+            }
+            let name = path.display();
+            let data = fs::read(&path).unwrap();
+
+            // The scanner's gate: what is not clean is never rebuilt.
+            let sanitized = scanner.sanitize(&data, ScanHints::default(), &Options::default());
+            if scanner.scan_bytes(&data, ScanHints::default()).verdict != Verdict::Clean {
+                assert!(matches!(sanitized, Err(Error::Rejected(_))), "{name}");
+            }
+            // Without the gate, a rebuild still leaves nothing but pixels.
+            // Hand-built samples that no decoder accepts are skipped.
+            let Ok(image) = cdr::rebuild(&data, &Limits::default(), &Options::default()) else {
+                continue;
+            };
+            let report = scanner.scan_bytes(&image.data, ScanHints::default());
+            assert_eq!(
+                report.verdict,
+                Verdict::Clean,
+                "{name}: {:?}",
+                report.findings
+            );
+            assert_eq!(report.detected_type, image.file_type, "{name}");
+            assert!(
+                image.width > 0 && image.height > 0 && image.frames > 0,
+                "{name}"
+            );
+            rebuilt_types.push(image.file_type);
+        }
+    }
+    for expected in [FileType::Jpeg, FileType::Png, FileType::Gif] {
+        assert!(
+            rebuilt_types.contains(&expected),
+            "no {expected:?} was rebuilt"
+        );
+    }
+}

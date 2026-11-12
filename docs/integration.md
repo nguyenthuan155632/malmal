@@ -5,8 +5,9 @@ detached. In all of them the rule is the same: anything but a clean verdict, inc
 error or no answer at all, means the file is not accepted.
 
 - [In a Rust service](#in-a-rust-service): link the crate.
-- [As a daemon](#as-a-daemon): any language, over a Unix socket, HTTP or the ClamAV protocol.
-- [From C](#from-c): link the static library.
+- [As a daemon](#as-a-daemon): any language, over a Unix socket, HTTP, the ClamAV protocol
+  or ICAP.
+- [From C](#from-c) and [from Python](#from-python): link or load the library.
 
 ## In a Rust service
 
@@ -149,17 +150,64 @@ async fn main() -> std::io::Result<()> {
 - Store the file under a name you generate, never under the uploaded one, with the extension
   that belongs to `report.detected_type`.
 - For raster images, decode and re-encode what passed. The scanner decides which files get
-  that far; re-encoding is what removes whatever a scanner cannot see.
+  that far; re-encoding is what removes whatever a scanner cannot see. The next section
+  does both in one call.
 - The codes are listed in [findings.md](findings.md). To accept something the default policy
   flags, lower that one code with `Policy::with_override` rather than ignoring verdicts.
 
+### Rebuilding images
+
+```toml
+[dependencies]
+malmal = { version = "0.2", features = ["cdr"] }
+```
+
+`Scanner::sanitize` scans and, when the file is a clean raster image, returns a new file
+written from its pixels. Store that one; the upload itself is not kept.
+
+```rust
+use malmal::cdr::{Error, Options};
+use malmal::{ScanHints, Scanner};
+
+fn accept(scanner: &Scanner, upload: &[u8], hints: ScanHints<'_>) -> Result<Vec<u8>, String> {
+    match scanner.sanitize(upload, hints, &Options::default()) {
+        // `image.file_type` names what to store it as; it is PNG for a BMP, TIFF or ICO.
+        Ok(sanitized) => Ok(sanitized.image.data),
+        Err(Error::Rejected(report)) => {
+            let codes: Vec<&str> = report.findings.iter().map(|f| f.code).collect();
+            Err(format!("not clean: {}", codes.join(", ")))
+        }
+        // Not an image that can be rebuilt, too large, or not decodable.
+        Err(other) => Err(other.to_string()),
+    }
+}
+```
+
+A service that also takes PDF or SVG scans those with `scan_bytes` and keeps them as they
+are: only raster images can be rebuilt. Like scanning, rebuilding is CPU work for a blocking
+thread.
+
+### Encrypted PDFs
+
+A PDF encrypted with the empty password is opened as any reader opens it. For documents
+your users protect with a password you know, give the scanner the candidates:
+
+```rust
+let scanner = malmal::Scanner::builder()
+    .pdf_passwords(["first candidate", "second candidate"])
+    .build();
+```
+
+Each is tried as the user password and as the owner password. A document none of them
+opens is `pdf.encrypted` at Medium, as before.
+
 ## As a daemon
 
-`malmald` serves any combination of three endpoints. An address is `host:port`, or the path
+`malmald` serves any combination of four endpoints. An address is `host:port`, or the path
 of a Unix socket.
 
 ```bash
-malmald --socket /run/malmal.sock --http 127.0.0.1:8080 --clamd 127.0.0.1:3310 --require-sandbox
+malmald --socket /run/malmal.sock --http 127.0.0.1:8080 --clamd 127.0.0.1:3310 --icap 127.0.0.1:1344 --require-sandbox
 ```
 
 It has no authentication and no TLS. Bind it to the loopback interface or a Unix socket, and
@@ -176,6 +224,7 @@ curl --data-binary @upload.pdf -H 'Content-Type: application/pdf' 'http://127.0.
 | Request | Reply |
 |---|---|
 | `POST /scan` or `PUT /scan` | `200` and `{"ok": true, "report": {...}}`, whatever the verdict |
+| `POST /sanitize` or `PUT /sanitize` | `200` and the rebuilt image as the body; see below |
 | `GET /metrics` | Counters in the Prometheus text format |
 | `GET /healthz` | `200 ok` |
 
@@ -192,9 +241,19 @@ The report has the fields of `malmal::Report`:
   {"code": "pdf.javascript", "severity": "high", "message": "document contains JavaScript", "offset": 15}]}}
 ```
 
+`/sanitize` takes the same request and answers with the image written anew from its pixels,
+its type in `Content-Type` (a BMP, TIFF or ICO comes back as `image/png`). Anything but
+`200` means there is no file to keep: `422` with `{"ok": false, "error": ..., "report": {...}}`
+when the scan was not clean or the image could not be decoded, `415` when the file is not
+an image that can be rebuilt.
+
+```bash
+curl --fail --data-binary @upload.jpg -o stored.jpg http://127.0.0.1:8080/sanitize
+```
+
 `/metrics` exposes `malmal_scans_total{verdict=...}`, `malmal_scan_errors_total`,
-`malmal_rejected_requests_total`, `malmal_scanned_bytes_total`, `malmal_scan_seconds_total`
-and `malmal_build_info`.
+`malmal_rejected_requests_total`, `malmal_scanned_bytes_total`, `malmal_scan_seconds_total`,
+`malmal_rebuilt_images_total` and `malmal_build_info`.
 
 ### Unix socket
 
@@ -232,6 +291,39 @@ The protocol has two answers and no way to name the file, so:
   `stream: Malmal.Suspicious.pdf.encrypted FOUND`;
 - the file name and `Content-Type` are not checked against the content.
 
+### ICAP
+
+For a proxy that speaks ICAP (RFC 3507): it hands each request or response to the daemon
+and forwards it only if the daemon lets it through. With Squid:
+
+```
+icap_enable on
+icap_service malmal_req reqmod_precache icap://127.0.0.1:1344/scan bypass=off
+acl uploads urlpath_regex ^/upload
+adaptation_access malmal_req allow uploads
+```
+
+`bypass=off` is what keeps this fail-closed: with it, Squid refuses the request when the
+daemon cannot be reached.
+
+What is judged is a file, not an HTTP message:
+
+- every part of a `multipart/form-data` request that has a file name is scanned, with that
+  name and the part's `Content-Type` as the claims; the other fields are not looked at;
+- a URL-encoded form passes, as does a message without a body;
+- any other body is scanned as the file itself. A `PUT` is named by its URL, a response by
+  its `Content-Disposition`.
+
+So send it the URLs that take uploads, as the `acl` above does, not every request: a JSON
+API call is not a file the scanner knows and would be blocked as `type.unknown`.
+
+A clean message is answered `204`, or echoed when the proxy did not send `Allow: 204`.
+Anything else is replaced by a `403 Forbidden` response, with the reason in
+`X-Infection-Found: Type=0; Resolution=2; Threat=Malmal.Malicious.pdf.javascript;`, or in
+`X-Block-Reason` when the body was too large or could not be taken apart. Previews are
+supported. The endpoint follows the RFC and is tested against it; it has not yet been run
+behind a particular proxy, so try it on yours before relying on it.
+
 ### Limits and timeouts
 
 `--max-size` and `--scan-timeout` set `Limits::max_file_size` and `Limits::max_duration` for
@@ -251,3 +343,35 @@ malmal_scanner_free(scanner);
 
 The header is `crates/malmal-ffi/include/malmal.h`, the full example
 `crates/malmal-ffi/examples/scan.c`.
+
+## From Python
+
+`bindings/python` loads the same library with `ctypes`:
+
+```python
+import malmal
+
+scanner = malmal.Scanner()          # build once, share between threads
+report = scanner.scan(data, filename="a.png", content_type="image/png")
+if not report.clean:
+    reject([finding["code"] for finding in report.findings])
+```
+
+A `malmal.ScanError` means the file was not scanned. Building the library and installing
+the package are described in `bindings/python/README.md`.
+
+## In a container
+
+```bash
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/nguyenthuan155632/malmal
+```
+
+The image contains the two static binaries and runs `malmald --http 0.0.0.0:8080` as an
+unprivileged user. Arguments replace that default:
+
+```bash
+docker run --rm -p 127.0.0.1:3310:3310 ghcr.io/nguyenthuan155632/malmal --clamd 0.0.0.0:3310 --max-size 20000000
+```
+
+Publish the port to the upload service only; inside the container the daemon listens on
+every interface and has no authentication.

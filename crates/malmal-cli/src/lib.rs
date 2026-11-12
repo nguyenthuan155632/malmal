@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod icap;
 pub mod options;
 pub mod sandbox;
 pub mod serve;

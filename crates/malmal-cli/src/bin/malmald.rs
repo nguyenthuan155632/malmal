@@ -1,5 +1,6 @@
-//! Scanning daemon. It listens on any of three endpoints, each with its own
-//! protocol; see [`malmal_cli::serve`] for what they carry.
+//! Scanning daemon. It listens on any of four endpoints, each with its own
+//! protocol; see [`malmal_cli::serve`] and [`malmal_cli::icap`] for what
+//! they carry.
 
 #![forbid(unsafe_code)]
 
@@ -14,12 +15,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use malmal_cli::icap;
 use malmal_cli::options::{self, Common};
 use malmal_cli::sandbox;
 use malmal_cli::serve::{self, Service};
 
 const USAGE: &str = "\
-Usage: malmald (--socket <PATH> | --http <ADDR> | --clamd <ADDR>)... [OPTIONS]
+Usage: malmald (--socket <PATH> | --http <ADDR> | --clamd <ADDR> | --icap <ADDR>)...
+               [OPTIONS]
 
 An ADDR is host:port, or the path of a Unix socket.
 
@@ -27,6 +30,7 @@ Options:
   --socket <PATH>      Unix socket for the JSON protocol (created with mode 0660)
   --http <ADDR>        HTTP: POST /scan, GET /metrics, GET /healthz
   --clamd <ADDR>       ClamAV daemon protocol (PING, VERSION, INSTREAM)
+  --icap <ADDR>        ICAP for proxies (OPTIONS, REQMOD, RESPMOD)
   --workers <N>        Connections served at once on each endpoint [default: 4]
   --timeout <SECONDS>  Idle time before a connection is dropped [default: 30]";
 
@@ -35,6 +39,7 @@ enum Protocol {
     Json,
     Http,
     Clamd,
+    Icap,
 }
 
 impl Protocol {
@@ -43,6 +48,7 @@ impl Protocol {
             Self::Json => "json",
             Self::Http => "http",
             Self::Clamd => "clamd",
+            Self::Icap => "icap",
         }
     }
 }
@@ -72,6 +78,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--socket" => endpoints.push((Protocol::Json, value("--socket")?)),
             "--http" => endpoints.push((Protocol::Http, value("--http")?)),
             "--clamd" => endpoints.push((Protocol::Clamd, value("--clamd")?)),
+            "--icap" => endpoints.push((Protocol::Icap, value("--icap")?)),
             "--workers" => {
                 workers = value("--workers")?
                     .parse()
@@ -94,7 +101,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         }
     }
     if endpoints.is_empty() {
-        return Err("one of --socket, --http or --clamd is required".into());
+        return Err("one of --socket, --http, --clamd or --icap is required".into());
     }
     Ok(Args {
         endpoints,
@@ -205,6 +212,7 @@ fn worker(listener: Listener, protocol: Protocol, service: Arc<Service>, timeout
             Protocol::Json => serve::json(&mut reader, &stream, &service),
             Protocol::Http => serve::http(&mut reader, &stream, &service),
             Protocol::Clamd => serve::clamd(&mut reader, &stream, &service),
+            Protocol::Icap => icap::icap(&mut reader, &stream, &service),
         };
     }
 }

@@ -7,6 +7,8 @@
 //!   `/healthz`.
 //! - [`clamd`]: the `INSTREAM` command of ClamAV's daemon, for clients that
 //!   already speak it.
+//! - [`icap`](crate::icap::icap): ICAP, for proxies that hand over the
+//!   requests and responses passing through them.
 //!
 //! Whatever the protocol, a file that was not scanned is never answered as
 //! clean.
@@ -19,7 +21,7 @@ use std::time::{Duration, Instant};
 use malmal::{Report, ScanHints, Scanner, Severity, Verdict};
 use serde::Deserialize;
 
-const MAX_HEADER_LEN: u64 = 16 << 10;
+pub(crate) const MAX_HEADER_LEN: u64 = 16 << 10;
 const MAX_HTTP_HEADERS: usize = 64;
 const MAX_COMMAND_LEN: u64 = 1024;
 
@@ -35,6 +37,8 @@ pub struct Metrics {
     rejected: AtomicU64,
     bytes: AtomicU64,
     micros: AtomicU64,
+    /// Images written anew by `/sanitize`.
+    rebuilt: AtomicU64,
 }
 
 impl Metrics {
@@ -50,7 +54,7 @@ impl Metrics {
             .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
     }
 
-    fn reject(&self) {
+    pub(crate) fn reject(&self) {
         self.rejected.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -74,6 +78,9 @@ impl Metrics {
              # HELP malmal_scan_seconds_total Time spent scanning.\n\
              # TYPE malmal_scan_seconds_total counter\n\
              malmal_scan_seconds_total {:.6}\n\
+             # HELP malmal_rebuilt_images_total Images rebuilt from their pixels.\n\
+             # TYPE malmal_rebuilt_images_total counter\n\
+             malmal_rebuilt_images_total {}\n\
              # HELP malmal_build_info Version of the running daemon.\n\
              # TYPE malmal_build_info gauge\n\
              malmal_build_info{{version=\"{}\"}} 1\n",
@@ -84,6 +91,7 @@ impl Metrics {
             get(&self.rejected),
             get(&self.bytes),
             get(&self.micros) as f64 / 1e6,
+            get(&self.rebuilt),
             env!("CARGO_PKG_VERSION"),
         )
     }
@@ -109,12 +117,12 @@ impl Service {
     }
 
     /// Largest body a request may carry.
-    fn max_size(&self) -> u64 {
+    pub(crate) fn max_size(&self) -> u64 {
         self.scanner.limits().max_file_size
     }
 
     /// `None` when the scanner itself failed; the caller reports an error.
-    fn scan(&self, body: &[u8], hints: ScanHints<'_>) -> Option<Report> {
+    pub(crate) fn scan(&self, body: &[u8], hints: ScanHints<'_>) -> Option<Report> {
         let started = Instant::now();
         match catch_unwind(AssertUnwindSafe(|| self.scanner.scan_bytes(body, hints))) {
             Ok(report) => {
@@ -129,7 +137,37 @@ impl Service {
     }
 }
 
-enum Line {
+impl Service {
+    /// Scan and rebuild. `None` when the scanner itself failed.
+    #[cfg(feature = "cdr")]
+    fn sanitize(
+        &self,
+        body: &[u8],
+        hints: ScanHints<'_>,
+    ) -> Option<Result<malmal::cdr::Sanitized, malmal::cdr::Error>> {
+        use malmal::cdr::{Error, Options};
+
+        let started = Instant::now();
+        let options = Options::default();
+        let run = || self.scanner.sanitize(body, hints, &options);
+        let Ok(outcome) = catch_unwind(AssertUnwindSafe(run)) else {
+            self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        match &outcome {
+            Ok(sanitized) => {
+                self.metrics.record(&sanitized.report, started.elapsed());
+                self.metrics.rebuilt.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(Error::Rejected(report)) => self.metrics.record(report, started.elapsed()),
+            // Scanned and clean, but not rebuilt; the scan is not counted twice.
+            Err(_) => self.metrics.reject(),
+        }
+        Some(outcome)
+    }
+}
+
+pub(crate) enum Line {
     Text(String),
     /// The input ended before another line started.
     End,
@@ -138,7 +176,7 @@ enum Line {
 }
 
 /// One line of at most `limit` bytes, without its line ending.
-fn read_line(reader: &mut impl BufRead, limit: u64) -> io::Result<Line> {
+pub(crate) fn read_line(reader: &mut impl BufRead, limit: u64) -> io::Result<Line> {
     let mut line = Vec::new();
     reader.by_ref().take(limit).read_until(b'\n', &mut line)?;
     if line.is_empty() {
@@ -263,7 +301,7 @@ impl Response {
 }
 
 /// Undo `%xx` escapes; anything that is not one is kept as written.
-fn percent_decode(text: &str) -> String {
+pub(crate) fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut pos = 0;
@@ -292,11 +330,16 @@ fn percent_decode(text: &str) -> String {
 ///   required; `Content-Type` is taken as the claimed type and the
 ///   `X-Filename` header or `?filename=` parameter as the claimed name. The
 ///   reply is `200` with the same JSON as [`json`], whatever the verdict.
+/// - `POST /sanitize` (with the `cdr` feature): the same request; the reply
+///   is `200` with the image rebuilt from its pixels as the body, its type
+///   in `Content-Type`. `422` with the report means the file is not clean,
+///   `415` that it is not an image that can be rebuilt.
 /// - `GET /metrics`: counters in the Prometheus text format.
 /// - `GET /healthz`: `200 ok`.
 ///
 /// Any other status means the file was not scanned, and closes the
-/// connection.
+/// connection. From `/sanitize`, anything but `200` means there is no file
+/// to keep.
 pub fn http(
     reader: &mut impl BufRead,
     mut writer: impl Write,
@@ -351,7 +394,7 @@ pub fn http(
                 content_type: "text/plain; version=0.0.4; charset=utf-8",
                 body: service.metrics.render().into_bytes(),
             },
-            ("POST" | "PUT", "/scan") => {
+            ("POST" | "PUT", "/scan" | "/sanitize") => {
                 let refuse = |status: &'static str, message: &str| {
                     service.metrics.reject();
                     Response::error(status, message)
@@ -386,11 +429,18 @@ pub fn http(
                     filename: filename.as_deref(),
                     content_type: header("content-type"),
                 };
-                match service.scan(&body, hints) {
-                    Some(report) => Response::json(
-                        "200 OK",
-                        serde_json::json!({ "ok": true, "report": report }),
-                    ),
+                let response = if path == "/scan" {
+                    service.scan(&body, hints).map(|report| {
+                        Response::json(
+                            "200 OK",
+                            serde_json::json!({ "ok": true, "report": report }),
+                        )
+                    })
+                } else {
+                    sanitize(service, &body, hints)
+                };
+                match response {
+                    Some(response) => response,
                     None => {
                         return Response::error(
                             "500 Internal Server Error",
@@ -401,7 +451,7 @@ pub fn http(
                 }
             }
             // A body this server did not read may follow, so these close too.
-            (_, "/healthz" | "/metrics" | "/scan") => {
+            (_, "/healthz" | "/metrics" | "/scan" | "/sanitize") => {
                 return Response::error("405 Method Not Allowed", "method not allowed")
                     .write(writer, false);
             }
@@ -414,8 +464,43 @@ pub fn http(
     }
 }
 
+/// The reply to `POST /sanitize`; `None` when the scanner itself failed.
+#[cfg(feature = "cdr")]
+fn sanitize(service: &Service, body: &[u8], hints: ScanHints<'_>) -> Option<Response> {
+    use malmal::FileType;
+    use malmal::cdr::Error;
+
+    Some(match service.sanitize(body, hints)? {
+        Ok(sanitized) => Response {
+            status: "200 OK",
+            content_type: match sanitized.image.file_type {
+                FileType::Jpeg => "image/jpeg",
+                FileType::Png => "image/png",
+                FileType::Gif => "image/gif",
+                FileType::Webp => "image/webp",
+                _ => "application/octet-stream",
+            },
+            body: sanitized.image.data,
+        },
+        Err(Error::Rejected(report)) => Response::json(
+            "422 Unprocessable Content",
+            serde_json::json!({ "ok": false, "error": "file is not clean", "report": report }),
+        ),
+        Err(error @ Error::Unsupported { .. }) => {
+            Response::error("415 Unsupported Media Type", &error.to_string())
+        }
+        Err(error) => Response::error("422 Unprocessable Content", &error.to_string()),
+    })
+}
+
+#[cfg(not(feature = "cdr"))]
+fn sanitize(_: &Service, _: &[u8], _: ScanHints<'_>) -> Option<Response> {
+    let message = "this build has no image rebuilding";
+    Some(Response::error("501 Not Implemented", message))
+}
+
 /// The finding that decided the verdict, as a ClamAV-style signature name.
-fn signature(report: &Report) -> String {
+pub(crate) fn signature(report: &Report) -> String {
     let verdict = match report.verdict {
         Verdict::Clean => "Clean",
         Verdict::Suspicious => "Suspicious",

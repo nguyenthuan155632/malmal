@@ -13,7 +13,8 @@ The rule throughout is fail-closed: a file that cannot be fully analyzed is neve
 clean.
 
 This is one layer of defense, not the only one. For raster images, decoding and re-encoding
-is still the most reliable measure; malmal decides which files get that far.
+is still the most reliable measure; malmal decides which files get that far, and with the
+`cdr` feature does the re-encoding too (`malmal sanitize`, [Rebuilding images](#rebuilding-images)).
 
 ## Build
 
@@ -26,7 +27,7 @@ The output is in `target/x86_64-unknown-linux-musl/release/`:
 | File | What it is |
 |---|---|
 | `malmal` | CLI, fully statically linked |
-| `malmald` | Daemon (Unix socket, HTTP, ClamAV protocol), fully statically linked |
+| `malmald` | Daemon (Unix socket, HTTP, ClamAV protocol, ICAP), fully statically linked |
 | `libmalmal_ffi.a` | Static library for C; the header is `crates/malmal-ffi/include/malmal.h` |
 
 Both binaries run on a bare Debian install with no extra packages.
@@ -43,11 +44,33 @@ suite has not been run on macOS.
 
 ### Installing the commands
 
-The released version installs from crates.io, without cloning anything:
+Each release on GitHub carries the static binaries for x86-64 and ARM64 Linux, with the C
+library and its header, as `malmal-v<version>-<target>.tar.gz` and a `.sha256` next to it.
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall) fetches the same archive:
+
+```bash
+cargo binstall malmal-cli
+```
+
+The released version also builds from crates.io, without cloning anything:
 
 ```bash
 cargo install malmal-cli
 ```
+
+### Container
+
+The image holds the two binaries and nothing else; it starts the daemon's HTTP endpoint.
+
+```bash
+docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/nguyenthuan155632/malmal
+```
+
+```bash
+docker run --rm -v "$PWD:/files:ro" --entrypoint /usr/local/bin/malmal ghcr.io/nguyenthuan155632/malmal scan /files/upload.pdf
+```
+
+`docker build -t malmal .` builds the same image from a checkout.
 
 From a checkout, building does not put anything on your `PATH`. Either run the binary by
 path (`./target/release/malmal`), or install `malmal` and `malmald` into `~/.cargo/bin`:
@@ -83,6 +106,8 @@ stops by itself at the size limit.
 - **`Limits`** caps file size (64 MB), decompressed data (256 MB), embedded-file depth (4),
   time (10 seconds) and pixel count (2^28).
 - **`HashList`** is a SHA-256 blocklist that reads `sha256sum` output directly.
+- **`pdf_passwords`** on the builder are tried on encrypted PDFs, as user and as owner
+  password. A document one of them opens is decrypted and inspected like any other.
 
 Every finding code, with its severity and what to do about it, is in
 [docs/findings.md](docs/findings.md). Examples for axum and actix-web are in
@@ -106,10 +131,37 @@ malmal scan --types jpeg,png,gif,webp,bmp,tiff,psd,heif,avif,jxl,ico,svg,pdf upl
 
 `malmald` takes the same option. From Rust it is `Policy::with_allowed_types`.
 
+`--pdf-passwords FILE` names a file of passwords, one per line, to try on encrypted PDFs.
+
 Before it opens the first file, the process confines itself: Landlock allows reading only
 the files passed on the command line, seccomp blocks `execve`, sockets and other dangerous
 syscalls, and an rlimit caps memory. `--require-sandbox` turns a failure to confine into an
 error; `--no-sandbox` disables confinement. The sandbox exists on Linux only.
+
+## Rebuilding images
+
+```bash
+malmal sanitize upload.jpg stored.jpg
+```
+
+scans the file and, if it is a clean raster image, decodes it and writes a new file from
+the pixels. Metadata, colour profiles, comments, unknown chunks and anything appended are
+not carried over, because nothing but pixels is. The exit status is 0 only when the new
+file was written.
+
+| Input | Output |
+|---|---|
+| JPEG | JPEG at `--jpeg-quality` (90), rotated as its Exif orientation says |
+| PNG | PNG |
+| GIF | GIF with every frame |
+| WebP | lossless WebP |
+| BMP, TIFF, ICO | PNG |
+
+Animated PNG and WebP are refused rather than flattened, and so is every other type. From
+Rust it is `Scanner::sanitize` and `malmal::cdr::rebuild`, behind the `cdr` feature; over
+HTTP it is `POST /sanitize`. The decoders are those of the
+[`image`](https://crates.io/crates/image) crate. A colour profile is dropped, not
+converted, and a lossy WebP grows when it is stored losslessly.
 
 ## Daemon
 
@@ -117,13 +169,14 @@ error; `--no-sandbox` disables confinement. The sandbox exists on Linux only.
 malmald --socket /run/malmal.sock --http 127.0.0.1:8080 --workers 8 --require-sandbox
 ```
 
-`malmald` serves any combination of three endpoints:
+`malmald` serves any combination of four endpoints:
 
 | Option | Protocol |
 |---|---|
 | `--socket <PATH>` | One JSON line, then the file, on a Unix socket |
-| `--http <ADDR>` | `POST /scan` with the file as the body; `GET /metrics` for Prometheus; `GET /healthz` |
+| `--http <ADDR>` | `POST /scan` with the file as the body; `POST /sanitize` for the rebuilt image; `GET /metrics` for Prometheus; `GET /healthz` |
 | `--clamd <ADDR>` | The `INSTREAM` command of ClamAV's daemon, for clients that already speak it |
+| `--icap <ADDR>` | ICAP (`REQMOD`, `RESPMOD`), for a proxy such as Squid to pass uploads and downloads through |
 
 ```bash
 curl --data-binary @upload.pdf 'http://127.0.0.1:8080/scan?filename=upload.pdf'
@@ -146,6 +199,21 @@ malmal_scanner_free(scanner);
 
 Full example: `crates/malmal-ffi/examples/scan.c`.
 
+## Using it from Python
+
+`bindings/python` wraps the C library with `ctypes`; it needs nothing but the standard
+library. Building and installing it is described in
+[bindings/python/README.md](bindings/python/README.md).
+
+```python
+import malmal
+
+scanner = malmal.Scanner()
+report = scanner.scan(data, filename="a.png", content_type="image/png")
+if not report.clean:
+    reject([finding["code"] for finding in report.findings])
+```
+
 ## YARA (optional)
 
 ```bash
@@ -154,7 +222,7 @@ malmal scan --yara rules/ upload.jpg
 ```
 
 This feature is off by default because it pulls in a WebAssembly runtime and takes the
-binary from 0.8 MB to 16 MB. The YARA build **does not build for musl**; it links
+binary to about 16 MB. The YARA build **does not build for musl**; it links
 dynamically against glibc, so build it on the Debian release that will run it. YARA's `pe`
 and `elf` modules are not enabled.
 
@@ -197,8 +265,8 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
   locations are checked, not the HEVC or AV1 stream.
 - **A bare JPEG XL codestream has no end that can be found without decoding it**, so data
   appended to one is not reported as trailing data; it is still searched for payloads. In the
-  boxed form the end is known. Brotli-compressed metadata boxes are not decompressed and are
-  reported as `image.compressed_metadata` at Info.
+  boxed form the end is known, and Brotli-compressed metadata boxes are decompressed and
+  searched.
 - **PSD layer records are walked, layer pixels are not decoded.** In 16- and 32-bit
   documents the layer list sits in an extra block, which is read when the block is found.
 - **Phone camera trailers** (Samsung metadata, motion photo video) are reported as
@@ -206,13 +274,21 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
   `with_override` to reject them. Other trailing data stays `image.trailing_data`.
 - **Changes to `errordict` and `systemdict` are not reported.** Exploits use them to keep
   running after an error, and so does the prolog of every Illustrator EPS.
-- **PDFs that need a password are not decrypted** and yield `pdf.encrypted` at Medium. Those
-  encrypted with an empty password, which every reader opens without asking, are decrypted
-  and inspected. Only the standard security handler is supported, not certificate encryption.
+- **PDFs that need a password are decrypted only when it is supplied** (`pdf_passwords`,
+  `--pdf-passwords`); otherwise they yield `pdf.encrypted` at Medium. Those encrypted with
+  an empty password, which every reader opens without asking, are always decrypted and
+  inspected. Only the standard security handler is supported, not certificate encryption.
 - **Strings in a PDF are not inspected**, encrypted or not: JavaScript is reported because
   it is there, not for what it does.
 - **XFA forms are searched for scripts and nothing else.**
 - **The ClamAV protocol carries no file name**, so `type.mismatch` and
   `name.dangerous_extension` cannot be reported over it.
+- **Over ICAP a request body is judged as a file** unless it is a form: route only upload
+  URLs to it, or JSON API calls are blocked as `type.unknown`. The ICAP endpoint is tested
+  against the protocol as specified, not yet against a particular proxy.
+- **Rebuilding keeps the pixels**, so data encoded in them survives, and it relies on the
+  `image` crate's decoders. The time limit does not interrupt a decode.
+- **The time limit is checked between steps of the analysis**; it bounds a scan without
+  cutting it off at an exact moment.
 - Office documents, archives and video are out of scope; they are rejected with
   `type.not_allowed` or `type.unknown`.

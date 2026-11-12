@@ -18,7 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          [scan, jpeg, png, gif, webp, bmp, tiff, bigtiff, psd, heif, jxl, ico, svg, pdf, ps]
+          [scan, jpeg, png, gif, webp, bmp, tiff, bigtiff, psd, heif, jxl, ico, svg, pdf, ps, cdr]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

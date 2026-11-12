@@ -28,6 +28,15 @@ landlock = "0.4"
 libc = "0.2"
 seccompiler = "0.5"
 
+# Where `cargo binstall malmal-cli` finds the prebuilt binaries.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/malmal-v{ version }-{ target }.tar.gz"
+bin-dir = "malmal-v{ version }-{ target }/bin/{ bin }"
+pkg-fmt = "tgz"
+
 [features]
+default = ["cdr"]
+# Adds `malmal sanitize` and the daemon's `POST /sanitize`.
+cdr = ["malmal/cdr"]
 # Adds the --yara option.
 yara = ["malmal/yara"]

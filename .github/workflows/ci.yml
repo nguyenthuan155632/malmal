@@ -35,6 +35,19 @@ jobs:
           docker run --rm -v "$PWD/target/x86_64-unknown-linux-musl/release:/w:ro" \
             debian:stable-slim /w/malmal --version
 
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p malmal-ffi
+      - name: Python binding
+        run: python3 -m unittest discover -s bindings/python/tests
+        env:
+          MALMAL_LIBRARY: ${{ github.workspace }}/target/release/libmalmal_ffi.so
+          PYTHONPATH: bindings/python
+
   yara:
     runs-on: ubuntu-latest
     steps:

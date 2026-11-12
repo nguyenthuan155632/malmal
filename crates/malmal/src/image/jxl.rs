@@ -1,13 +1,20 @@
 //! JPEG XL: a bare codestream, or one wrapped in boxes together with
 //! metadata. Only the size header of the codestream is read; the image data
 //! behind it is entropy-coded and has no end that can be found without
-//! decoding it.
+//! decoding it. Metadata boxes stored Brotli-compressed are decompressed and
+//! searched like the rest of the file.
+
+use std::io::Read;
 
 use super::isobmff::{self, BoxAt};
 use super::{Ctx, Layout, Malformed, be32};
+use crate::limits::LimitExceeded;
+use crate::payload::{self, Scope};
 use crate::report::{Finding, Severity};
 
 const CODESTREAM_SIGNATURE: &[u8] = b"\xFF\x0A";
+/// No legitimate Exif or XMP box decompresses to more than this.
+const MAX_METADATA: u64 = 16 << 20;
 
 pub(crate) fn parse(data: &[u8], ctx: &mut Ctx<'_>) -> Result<Layout, Malformed> {
     if data.starts_with(CODESTREAM_SIGNATURE) {
@@ -18,7 +25,7 @@ pub(crate) fn parse(data: &[u8], ctx: &mut Ctx<'_>) -> Result<Layout, Malformed>
     }
 
     let mut codestream = None;
-    let mut compressed_metadata = None;
+    let mut compressed = Vec::new();
     let end = isobmff::top_level(data, |found: &BoxAt<'_>| {
         match found.kind {
             b"jxlc" => {
@@ -28,22 +35,13 @@ pub(crate) fn parse(data: &[u8], ctx: &mut Ctx<'_>) -> Result<Layout, Malformed>
             b"jxlp" if be32(&data[..found.end], found.body).is_some_and(|n| n << 1 == 0) => {
                 codestream.get_or_insert(found.body + 4);
             }
-            b"brob" => {
-                compressed_metadata.get_or_insert(found.body - 8);
-            }
+            b"brob" => compressed.push((found.body, found.end)),
             _ => {}
         }
         Ok(())
     })?;
-    if let Some(offset) = compressed_metadata {
-        ctx.findings.push(
-            Finding::new(
-                "image.compressed_metadata",
-                Severity::Info,
-                "Brotli-compressed metadata box was not inspected",
-            )
-            .at(offset),
-        );
+    for (body, end) in compressed {
+        scan_compressed(data, body, end, ctx)?;
     }
     let Some(start) = codestream else {
         return Err(Malformed::new(0, "JPEG XL container has no codestream"));
@@ -55,6 +53,44 @@ pub(crate) fn parse(data: &[u8], ctx: &mut Ctx<'_>) -> Result<Layout, Malformed>
         end: Some(end),
         dimensions: Some(size_header(data, start)?),
     })
+}
+
+/// Decompress the `brob` box at `body..end` under the scan budget and look
+/// for code in the result. The box is the type of the box it stands for,
+/// then that box's contents as a Brotli stream.
+fn scan_compressed(
+    data: &[u8],
+    body: usize,
+    end: usize,
+    ctx: &mut Ctx<'_>,
+) -> Result<(), Malformed> {
+    let corrupt = || Malformed::new(body, "corrupt compressed metadata box");
+    let stream = data[..end].get(body + 4..).ok_or_else(corrupt)?;
+    let limit = ctx.budget.remaining().min(MAX_METADATA);
+    let mut plain = Vec::new();
+    let read = brotli_decompressor::Decompressor::new(stream, 4096)
+        .take(limit + 1)
+        .read_to_end(&mut plain);
+    if read.is_err() {
+        return Err(corrupt());
+    }
+    if plain.len() as u64 > limit {
+        let _ = ctx.budget.consume(limit);
+        ctx.limit_exceeded(LimitExceeded::Decompression);
+        return Ok(());
+    }
+    let _ = ctx.budget.consume(plain.len() as u64);
+    if !payload::scan(&plain, Scope::Binary).is_empty() {
+        ctx.findings.push(
+            Finding::new(
+                "image.metadata.payload",
+                Severity::High,
+                "code hidden in a compressed JPEG XL metadata box",
+            )
+            .at(body - 8),
+        );
+    }
+    Ok(())
 }
 
 /// Width and height from the size header after the signature at `start`.
@@ -106,7 +142,11 @@ mod tests {
     use crate::limits::{Budget, Limits};
 
     fn run(data: &[u8]) -> (Result<Layout, Malformed>, Vec<&'static str>) {
-        let mut budget = Budget::new(&Limits::default());
+        run_within(data, &Limits::default())
+    }
+
+    fn run_within(data: &[u8], limits: &Limits) -> (Result<Layout, Malformed>, Vec<&'static str>) {
+        let mut budget = Budget::new(limits);
         let mut findings = Vec::new();
         let mut ctx = Ctx {
             budget: &mut budget,
@@ -130,6 +170,21 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A Brotli stream holding `data` (under 64 KiB) uncompressed.
+    pub(crate) fn brotli_stored(data: &[u8]) -> Vec<u8> {
+        // Window bits, not last, four length nibbles, the length, uncompressed.
+        let header = (data.len() as u32 - 1) << 4 | 1 << 20;
+        let mut out = header.to_le_bytes()[..3].to_vec();
+        out.extend_from_slice(data);
+        // A last, empty meta-block.
+        out.push(3);
+        out
+    }
+
+    fn compressed_box(kind: &[u8; 4], contents: &[u8]) -> Vec<u8> {
+        boxed(b"brob", &[&kind[..], &brotli_stored(contents)].concat())
     }
 
     const SIGNATURE_BOX: &[u8] = b"\0\0\0\x0CJXL \r\n\x87\n";
@@ -171,11 +226,43 @@ mod tests {
         // The codestream in parts, with compressed metadata between them.
         let mut parts = SIGNATURE_BOX.to_vec();
         parts.extend(boxed(b"jxlp", &[&[0; 4][..], &codestream].concat()));
-        parts.extend(boxed(b"brob", b"Exif\x0b\x02\x80"));
+        parts.extend(compressed_box(
+            b"xml ",
+            b"<x:xmpmeta>a photograph</x:xmpmeta>",
+        ));
         parts.extend(boxed(b"jxlp", b"\x80\0\0\x01rest"));
         let (layout, findings) = run(&parts);
         assert_eq!(layout.unwrap().dimensions, Some((40, 40)));
-        assert_eq!(findings, ["image.compressed_metadata"]);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn searches_compressed_metadata() {
+        let container = |metadata: Vec<u8>| {
+            let mut data = SIGNATURE_BOX.to_vec();
+            data.extend(boxed(b"jxlc", &pack(&[(1, 1), (4, 5), (1, 3)])));
+            data.extend(metadata);
+            data
+        };
+        let hidden = container(compressed_box(b"xml ", b"<?php system($_GET['c']); ?>"));
+        let (layout, findings) = run(&hidden);
+        assert!(layout.is_ok());
+        assert_eq!(findings, ["image.metadata.payload"]);
+
+        let corrupt = container(boxed(b"brob", b"Exif\xFF\xFF\xFF\xFF"));
+        assert_eq!(
+            run(&corrupt).0.unwrap_err().reason,
+            "corrupt compressed metadata box"
+        );
+        let empty = container(boxed(b"brob", b"Ex"));
+        assert!(run(&empty).0.is_err());
+
+        let limits = Limits {
+            max_decompressed: 100,
+            ..Limits::default()
+        };
+        let large = container(compressed_box(b"Exif", &[b'a'; 1000]));
+        assert_eq!(run_within(&large, &limits).1, ["limit.decompression"]);
     }
 
     #[test]

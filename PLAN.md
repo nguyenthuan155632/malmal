@@ -282,8 +282,33 @@ Done after the first release, from the list of known limits and what a deploymen
 - [x] API: `FileType`, `Report` and `Finding` are `#[non_exhaustive]`; `payload`, `Budget`
       and `LimitExceeded` are no longer public; every public item is documented.
 
-Not done: ICAP (the ClamAV protocol covers the same clients with far less code), decoding
-Brotli metadata in JPEG XL, decrypting PDFs that need a password.
+- [x] PDF passwords supplied by the caller, tried as user and as owner password, checked
+      against files written by qpdf for every revision.
+- [x] Brotli metadata in JPEG XL is decompressed and searched (`brotli-decompressor`).
+- [x] `malmald --icap`: `OPTIONS`, `REQMOD`, `RESPMOD`, previews, multipart forms. Not yet
+      run against Squid or c-icap.
+
+### M10 — Distribution
+
+- [x] `.github/workflows/release.yml`: a `v<version>` tag builds static binaries for x86-64
+      and ARM64, attaches them to a GitHub release, pushes a multi-arch image to GHCR and
+      publishes the crates when `CARGO_REGISTRY_TOKEN` is set.
+- [x] `Dockerfile` for building the same image from a checkout; `cargo binstall` metadata.
+- [x] `bindings/python`: a `ctypes` wrapper over the C library, tested in CI. It is not on
+      PyPI: a wheel would have to carry the library for each platform.
+
+### M11 — Rebuilding images (CDR)
+
+- [x] `malmal::cdr` behind the `cdr` feature, on the `image` crate: JPEG, PNG, GIF with its
+      frames, WebP, and BMP/TIFF/ICO to PNG. Limits apply before and during decoding; a
+      panic in a codec is an error, not a crash.
+- [x] `Scanner::sanitize` (scan, then rebuild), `malmal sanitize`, `POST /sanitize`.
+- [x] Every sample that can be rebuilt is checked to come out clean; a fuzz target does the
+      same with arbitrary input.
+
+Not done: animated PNG and WebP (no encoder), converting colour profiles instead of
+dropping them, HEIC/AVIF/JPEG XL (no pure-Rust decoder to depend on), rebuilding through
+the C interface.
 
 ## Order and dependencies
 
@@ -303,7 +328,6 @@ M3 and M4 are independent. M5 needs M4 because modern AI files are PDFs. M6 need
 
 ## Out of scope (recorded for later)
 
-- Image re-encoding (CDR): the strongest defense for raster images, and the natural next project.
 - Office (DOCX/XLSX macros), archives (recursive ZIP/RAR), video.
-- Decrypting PDFs that need a password (the caller would have to supply it).
-- ICAP; prebuilt binaries, a container image and bindings for other languages.
+- Rebuilding PDF and SVG (CDR for documents): a different problem from pixels.
+- Bindings beyond C and Python; a wheel on PyPI.

@@ -12,6 +12,16 @@ categories = ["parsing", "command-line-utilities"]
 
 [dependencies]
 aes = "0.8"
+brotli-decompressor = "6.3"
+image = { version = "0.25.10", default-features = false, optional = true, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "tiff",
+    "webp",
+] }
 md-5 = "0.10"
 memchr = "2.8.3"
 miniz_oxide = "0.9.1"
@@ -31,6 +41,9 @@ yara-x = { version = "1.23.0", default-features = false, optional = true, featur
 # YARA rule matching. Off by default: it adds a WebAssembly runtime and
 # several megabytes to the binary.
 yara = ["dep:yara-x"]
+# Rebuilding raster images from their pixels (`malmal::cdr`). Off by
+# default: it adds the decoders and encoders of the `image` crate.
+cdr = ["dep:image"]
 
 [lints.rust]
 # Set by cargo-fuzz.

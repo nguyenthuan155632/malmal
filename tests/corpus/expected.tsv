@@ -5,6 +5,7 @@ corpus/clean/icon.ico	Clean
 corpus/clean/layers.psd	Clean	
 corpus/clean/line.eps	Clean	
 corpus/clean/page.pdf	Clean	
+corpus/clean/photo-compressed-metadata.jxl	Clean	
 corpus/clean/photo-container.jxl	Clean	
 corpus/clean/photo.avif	Clean	
 corpus/clean/photo.heic	Clean	
@@ -29,6 +30,7 @@ corpus/malicious/onload.svg	Malicious	svg.event_handler
 corpus/malicious/pdf-polyglot.jpg	Malicious	image.polyglot
 corpus/malicious/php-after-image.heic	Malicious	image.malformed,payload.php
 corpus/malicious/php-after-image.jxl	Malicious	payload.php
+corpus/malicious/php-in-compressed-metadata.jxl	Malicious	image.metadata.payload
 corpus/malicious/php-tail.psd	Malicious	image.trailing_data,payload.php
 corpus/malicious/pipe.eps	Malicious	ps.file_access,ps.pipe
 corpus/malicious/ps-driver-key.eps	Malicious	ps.device_access

@@ -45,6 +45,29 @@ dependency in `crates/malmal-cli/Cargo.toml` and `crates/malmal-ffi/Cargo.toml`.
 Add the release to `CHANGELOG.md`, commit, and publish the three crates in the
 order above.
 
+## Releasing from a tag
+
+`.github/workflows/release.yml` does all of the above when a tag is pushed:
+
+```bash
+git tag v0.2.0
+```
+
+```bash
+git push origin v0.2.0
+```
+
+The tag must be `v` followed by the version in `Cargo.toml`. The workflow runs the tests,
+builds static binaries for x86-64 and ARM64 Linux, attaches them to a GitHub release with
+the changelog section as its notes, and pushes `ghcr.io/nguyenthuan155632/malmal` for both
+architectures.
+
+It publishes the three crates as well if the repository has a secret named
+`CARGO_REGISTRY_TOKEN` (*Settings → Secrets and variables → Actions*) holding a crates.io
+API token; without the secret that job does nothing and the crates are published by hand as
+described above. The container package is private until its visibility is changed under
+the repository's *Packages*.
+
 ## After publishing
 
 People can then install the CLI without cloning anything:

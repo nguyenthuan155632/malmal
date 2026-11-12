@@ -45,6 +45,28 @@ fn valid_png() -> Vec<u8> {
     data
 }
 
+/// A 1x1 PNG a decoder accepts, carrying a comment.
+#[cfg(feature = "cdr")]
+fn commented_png() -> Vec<u8> {
+    let mut data = b"\x89PNG\r\n\x1a\n".to_vec();
+    let chunks: [(&[u8; 4], &[u8]); 4] = [
+        (b"IHDR", b"\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0"),
+        (b"tEXt", b"Comment\0taken on holiday"),
+        // One stored block: a filter byte and a transparent pixel.
+        (b"IDAT", b"\x78\x01\x01\x05\0\xFA\xFF\0\0\0\0\0\0\x05\0\x01"),
+        (b"IEND", b""),
+    ];
+    for (kind, body) in chunks {
+        data.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        let start = data.len();
+        data.extend_from_slice(kind);
+        data.extend_from_slice(body);
+        let crc = crc32(&data[start..]);
+        data.extend_from_slice(&crc.to_be_bytes());
+    }
+    data
+}
+
 /// A fresh directory for one test.
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("malmal-test-{}-{name}", std::process::id()));
@@ -318,6 +340,111 @@ fn daemon_scans_over_http() {
     );
 }
 
+#[cfg(feature = "cdr")]
+#[test]
+fn sanitize_rebuilds_clean_images_only() {
+    let dir = scratch("sanitize");
+    let (input, output) = (dir.join("in.png"), dir.join("out.png"));
+    fs::write(&input, commented_png()).unwrap();
+    let run = |input: &Path, output: &Path| {
+        let result = Command::new(MALMAL)
+            .arg("sanitize")
+            .args([input, output])
+            .output()
+            .unwrap();
+        (
+            result.status.code(),
+            String::from_utf8(result.stderr).unwrap(),
+        )
+    };
+
+    let (code, message) = run(&input, &output);
+    assert_eq!(code, Some(0), "{message}");
+    assert!(
+        message.contains("rebuilt as png (1x1, 1 frame"),
+        "{message}"
+    );
+    let rebuilt = fs::read(&output).unwrap();
+    assert!(rebuilt.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert!(!rebuilt.windows(7).any(|window| window == b"holiday"));
+
+    // What is not clean, or not an image, leaves the output as it was.
+    let executable = dir.join("photo.png");
+    fs::write(&executable, ELF).unwrap();
+    let (code, message) = run(&executable, &output);
+    assert_eq!(code, Some(2), "{message}");
+    assert!(message.contains("type.executable"), "{message}");
+    let document = dir.join("page.pdf");
+    fs::write(
+        &document,
+        b"%PDF-1.7\n1 0 obj\n<< >>\nendobj\ntrailer\n<< >>\n%%EOF\n",
+    )
+    .unwrap();
+    assert_eq!(run(&document, &output).0, Some(3));
+    assert_eq!(fs::read(&output).unwrap(), rebuilt);
+
+    // Standard input to standard output.
+    let mut child = Command::new(MALMAL)
+        .args(["sanitize", "--jpeg-quality", "80", "-", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&commented_png())
+        .unwrap();
+    let piped = child.wait_with_output().unwrap();
+    assert_eq!(piped.status.code(), Some(0));
+    assert_eq!(piped.stdout, rebuilt);
+
+    let wrong = Command::new(MALMAL)
+        .args(["sanitize", "one-file-only"])
+        .output()
+        .unwrap();
+    assert_eq!(wrong.status.code(), Some(3));
+}
+
+#[cfg(feature = "cdr")]
+#[test]
+fn daemon_rebuilds_over_http() {
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    let (_daemon, address) = daemon_on_tcp("--http");
+    let post = |body: &[u8]| {
+        let mut stream = TcpStream::connect(&address).unwrap();
+        let head = format!(
+            "POST /sanitize HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).unwrap();
+        let end = reply.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        (
+            String::from_utf8_lossy(&reply[..end]).into_owned(),
+            reply[end..].to_vec(),
+        )
+    };
+
+    let (head, body) = post(&commented_png());
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+    assert!(head.contains("Content-Type: image/png\r\n"), "{head}");
+    assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert!(!body.windows(7).any(|window| window == b"holiday"));
+
+    let (head, body) = post(ELF);
+    assert!(head.starts_with("HTTP/1.1 422 "), "{head}");
+    assert!(String::from_utf8_lossy(&body).contains("type.executable"));
+    let (head, _) = post(b"<svg xmlns='http://www.w3.org/2000/svg'/>");
+    assert!(head.starts_with("HTTP/1.1 415 "), "{head}");
+}
+
 #[test]
 fn daemon_answers_clamd_clients() {
     use std::io::Read;
@@ -344,11 +471,47 @@ fn daemon_answers_clamd_clients() {
 }
 
 #[test]
+fn daemon_answers_icap_clients() {
+    use std::io::Read;
+    use std::net::{Shutdown, TcpStream};
+
+    let (_daemon, address) = daemon_on_tcp("--icap");
+    let respmod = |body: &[u8]| {
+        let head = "HTTP/1.1 200 OK\r\n\r\n";
+        let mut stream = TcpStream::connect(&address).unwrap();
+        let request = format!(
+            "RESPMOD icap://{address}/scan ICAP/1.0\r\nAllow: 204\r\n\
+             Encapsulated: res-hdr=0, res-body={}\r\n\r\n{head}{:x}\r\n",
+            head.len(),
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        stream.write_all(b"\r\n0\r\n\r\n").unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).unwrap();
+        reply
+    };
+    let clean = respmod(&valid_png());
+    assert!(
+        clean.starts_with("ICAP/1.0 204 No Modifications"),
+        "{clean}"
+    );
+    let blocked = respmod(ELF);
+    assert!(blocked.contains("Threat=Malmal.Malicious.type.executable"));
+    assert!(blocked.contains("HTTP/1.1 403 Forbidden"), "{blocked}");
+}
+
+#[test]
 fn daemon_needs_an_endpoint() {
     let output = Command::new(MALMALD).output().unwrap();
     assert_eq!(output.status.code(), Some(1));
     let text = String::from_utf8(output.stderr).unwrap();
-    assert!(text.contains("--socket, --http or --clamd"), "{text}");
+    assert!(
+        text.contains("--socket, --http, --clamd or --icap"),
+        "{text}"
+    );
 }
 
 /// Landlock and seccomp bind the calling thread, so the restrictions can be

@@ -27,11 +27,17 @@
 //!
 //! - `yara`: match files against YARA rules with [`YaraRules`]. Off by
 //!   default; it adds a WebAssembly runtime to the build.
+//! - `cdr`: rebuild raster images from their pixels with
+//!   [`Scanner::sanitize`], so that nothing but the picture is kept. Off by
+//!   default; it adds the codecs of the `image` crate to the build.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(feature = "cdr")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cdr")))]
+pub mod cdr;
 /// Telling a file's type from its content, and the claims made about it.
 pub mod detect;
 /// SHA-256 blocklists.
@@ -82,8 +88,19 @@ pub struct Scanner {
     limits: Limits,
     policy: Policy,
     hashlist: HashList,
+    pdf_passwords: Passwords,
     #[cfg(feature = "yara")]
     yara: Option<YaraRules>,
+}
+
+/// Passwords are kept out of `Debug` output, which ends up in logs.
+#[derive(Clone, Default)]
+struct Passwords(Vec<Vec<u8>>);
+
+impl std::fmt::Debug for Passwords {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Passwords({} hidden)", self.0.len())
+    }
 }
 
 /// Builds a [`Scanner`]; everything left unset keeps its default.
@@ -112,6 +129,22 @@ impl ScannerBuilder {
         self
     }
 
+    /// Passwords to try on encrypted PDFs, after the empty one. Each is
+    /// tried as the user password and as the owner password; a document one
+    /// of them opens is decrypted and inspected like any other. At most 32
+    /// are used.
+    ///
+    /// Revisions 2 to 4 of the PDF security handler take the password in
+    /// PDFDocEncoding and later ones in UTF-8; pass both spellings of a
+    /// password with characters outside ASCII.
+    pub fn pdf_passwords<P: Into<Vec<u8>>>(
+        mut self,
+        passwords: impl IntoIterator<Item = P>,
+    ) -> Self {
+        self.scanner.pdf_passwords = Passwords(passwords.into_iter().map(Into::into).collect());
+        self
+    }
+
     /// Match every scanned file against these YARA rules.
     #[cfg(feature = "yara")]
     pub fn yara(mut self, rules: YaraRules) -> Self {
@@ -135,6 +168,26 @@ impl Scanner {
     /// The limits this scanner was built with.
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// Scan a file and, if it is a clean raster image, write it anew from
+    /// its pixels. The result is the file to store in place of the upload;
+    /// an error means there is nothing to store. See [`cdr`] for what is
+    /// rebuilt and how.
+    #[cfg(feature = "cdr")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "cdr")))]
+    pub fn sanitize(
+        &self,
+        data: &[u8],
+        hints: ScanHints<'_>,
+        options: &cdr::Options,
+    ) -> Result<cdr::Sanitized, cdr::Error> {
+        let report = self.scan_bytes(data, hints);
+        if report.verdict != Verdict::Clean {
+            return Err(cdr::Error::Rejected(Box::new(report)));
+        }
+        let image = cdr::rebuild(data, &self.limits, options)?;
+        Ok(cdr::Sanitized { report, image })
     }
 
     /// Scan from a reader, buffering at most one byte past the size limit.
@@ -237,7 +290,7 @@ impl Scanner {
                     |inner: &[u8], budget: &mut Budget, findings: &mut Vec<Finding>| {
                         self.scan_embedded(inner, budget, findings)
                     };
-                pdf::analyze(data, budget, findings, &mut nested);
+                pdf::analyze(data, budget, findings, &self.pdf_passwords.0, &mut nested);
             }
             FileType::PostScript => ps::analyze(data, &self.limits, budget, findings),
             _ => image::analyze(data, detected, &self.limits, budget, findings),

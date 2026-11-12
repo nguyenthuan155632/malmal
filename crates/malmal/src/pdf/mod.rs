@@ -29,6 +29,8 @@ const MAX_FILTERS: usize = 8;
 const FALLBACK_WINDOW: usize = 64 << 10;
 /// Dictionaries naming `/Encrypt` that are tried as the source of the key.
 const MAX_ENCRYPT_SOURCES: usize = 8;
+/// Passwords tried on one document, the empty one included.
+const MAX_PASSWORDS: usize = 33;
 
 /// Names whose `#xx`-escaped spelling is reported as obfuscation.
 const SENSITIVE_NAMES: &[&[u8]] = &[
@@ -243,6 +245,7 @@ pub(crate) fn analyze(
     data: &[u8],
     budget: &mut Budget,
     findings: &mut Vec<Finding>,
+    passwords: &[Vec<u8>],
     nested: &mut NestedScan<'_>,
 ) {
     let mut out = Output {
@@ -274,25 +277,35 @@ pub(crate) fn analyze(
     }
 
     // In an encrypted file, object streams and embedded files are ciphertext
-    // unless the empty password opens it, as it does in any reader.
+    // unless the empty password opens it, as it does in any reader, or one
+    // of the passwords the caller knows does.
     let encrypted = out.encrypt_sources.first().copied();
     if let Some(offset) = encrypted {
-        doc.crypt = open_with_empty_password(&doc, &out.encrypt_sources);
-        if doc.crypt.is_some() {
-            out.report(
-                "pdf.encrypted",
+        let opened = std::iter::once(&[][..])
+            .chain(passwords.iter().map(Vec::as_slice))
+            .take(MAX_PASSWORDS)
+            .find_map(|password| open_with(&doc, &out.encrypt_sources, password));
+        let (severity, message) = match (&opened, passwords.is_empty()) {
+            (Some((_, false)), _) => (
                 Severity::Info,
                 "document is encrypted with an empty password; it was decrypted and inspected",
-                offset,
-            );
-        } else {
-            out.report(
-                "pdf.encrypted",
+            ),
+            (Some((_, true)), _) => (
+                Severity::Info,
+                "document is encrypted; it was decrypted with a supplied password and inspected",
+            ),
+            (None, true) => (
                 Severity::Medium,
                 "document is encrypted; strings, streams and object streams cannot be inspected",
-                offset,
-            );
-        }
+            ),
+            (None, false) => (
+                Severity::Medium,
+                "document is encrypted and no supplied password opens it; \
+                 strings, streams and object streams cannot be inspected",
+            ),
+        };
+        out.report("pdf.encrypted", severity, message, offset);
+        doc.crypt = opened.map(|(crypt, _)| crypt);
     }
     if encrypted.is_none() || doc.crypt.is_some() {
         let top_level = doc.objects.len();
@@ -375,7 +388,8 @@ fn check_end(data: &[u8], out: &mut Output<'_>) {
 }
 
 /// Try each dictionary that names `/Encrypt` as the source of the key.
-fn open_with_empty_password(doc: &Document<'_>, sources: &[usize]) -> Option<Decryptor> {
+/// Returns the decryptor and whether `password` was a real one.
+fn open_with(doc: &Document<'_>, sources: &[usize], password: &[u8]) -> Option<(Decryptor, bool)> {
     let data = doc.data;
     // The trailer or cross-reference stream dictionary follows its keyword.
     let dict_after = |offset: usize| {
@@ -403,8 +417,9 @@ fn open_with_empty_password(doc: &Document<'_>, sources: &[usize]) -> Option<Dec
                 }
                 _ => return None,
             };
-            Decryptor::open(data, at, &id)
+            Decryptor::open(data, at, &id, password)
         })
+        .map(|crypt| (crypt, !password.is_empty()))
 }
 
 /// Parse every `N G obj` in the file, wherever it is.
@@ -1075,7 +1090,7 @@ fn uses_operator(content: &[u8], operator: &[u8]) -> bool {
 mod tests {
     use miniz_oxide::deflate::compress_to_vec_zlib;
 
-    use super::crypt::testing::{Encrypted, ID, Scheme};
+    use super::crypt::testing::{Encrypted, ID, OWNER_PASSWORD, Scheme};
     use super::*;
     use crate::limits::Limits;
 
@@ -1098,6 +1113,10 @@ mod tests {
     }
 
     fn run(data: &[u8]) -> Vec<(&'static str, Severity)> {
+        run_with(data, &[])
+    }
+
+    fn run_with(data: &[u8], passwords: &[Vec<u8>]) -> Vec<(&'static str, Severity)> {
         let mut budget = Budget::new(&Limits::default());
         let mut findings = Vec::new();
         let mut nested = |inner: &[u8], _: &mut Budget, findings: &mut Vec<Finding>| {
@@ -1105,7 +1124,7 @@ mod tests {
                 findings.push(Finding::new("type.executable", Severity::Critical, "elf"));
             }
         };
-        analyze(data, &mut budget, &mut findings, &mut nested);
+        analyze(data, &mut budget, &mut findings, passwords, &mut nested);
         findings.iter().map(|f| (f.code, f.severity)).collect()
     }
 
@@ -1385,6 +1404,25 @@ mod tests {
                 "{scheme:?}"
             );
         }
+        // A password the caller knows opens them, the owner's included.
+        for scheme in SCHEMES {
+            let data = encrypted_pdf(scheme, b"secret");
+            for password in [&b"secret"[..], OWNER_PASSWORD] {
+                assert_eq!(
+                    run_with(&data, &[b"wrong".to_vec(), password.to_vec()]),
+                    [
+                        ("pdf.encrypted", Severity::Info),
+                        ("pdf.javascript", Severity::High),
+                    ],
+                    "{scheme:?}"
+                );
+            }
+            assert_eq!(
+                run_with(&data, &[b"wrong".to_vec()]),
+                [("pdf.encrypted", Severity::Medium)],
+                "{scheme:?}"
+            );
+        }
         // The encryption dictionary sits inline in a cross-reference stream.
         let inline = Encrypted::new(Scheme::Aes256, b"").dict;
         let id: String = ID.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -1538,6 +1576,7 @@ mod tests {
             &pdf(&[CATALOG, &bomb]),
             &mut budget,
             &mut findings,
+            &[],
             &mut |_, _, _| {},
         );
         assert_eq!(findings[0].code, "limit.decompression");

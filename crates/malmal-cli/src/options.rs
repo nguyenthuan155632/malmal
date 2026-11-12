@@ -15,6 +15,8 @@ pub const HELP: &str = "  --policy <NAME>      default or strict [default: defau
                        [default: jpeg,png,gif,webp,bmp,tiff,psd,heif,avif,jxl,ico,
                        svg,pdf,postscript]
   --hashlist <FILE>    SHA-256 blocklist, one hex digest per line
+  --pdf-passwords <FILE>
+                       Passwords to try on encrypted PDFs, one per line
   --max-size <BYTES>   Largest file analyzed in full [default: 67108864]
   --scan-timeout <S>   Seconds one scan may take [default: 10]
   --no-sandbox         Do not restrict the process
@@ -26,6 +28,8 @@ pub const HELP: &str = "  --policy <NAME>      default or strict [default: defau
                        [default: jpeg,png,gif,webp,bmp,tiff,psd,heif,avif,jxl,ico,
                        svg,pdf,postscript]
   --hashlist <FILE>    SHA-256 blocklist, one hex digest per line
+  --pdf-passwords <FILE>
+                       Passwords to try on encrypted PDFs, one per line
   --max-size <BYTES>   Largest file analyzed in full [default: 67108864]
   --scan-timeout <S>   Seconds one scan may take [default: 10]
   --yara <PATH>        YARA rule file, or directory of .yar/.yara files (repeatable)
@@ -46,6 +50,7 @@ pub struct Common {
     /// Replaces the policy's accepted types when given.
     pub types: Option<Vec<FileType>>,
     pub hashlist: HashList,
+    pub pdf_passwords: Vec<String>,
     pub limits: Limits,
     pub sandbox: Mode,
     #[cfg(feature = "yara")]
@@ -58,6 +63,7 @@ impl Default for Common {
             policy: Policy::default(),
             types: None,
             hashlist: HashList::default(),
+            pdf_passwords: Vec::new(),
             limits: Limits::default(),
             sandbox: Mode::BestEffort,
             #[cfg(feature = "yara")]
@@ -99,6 +105,12 @@ impl Common {
                 let text = fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
                 self.hashlist = HashList::parse(&text).map_err(|e| format!("{path}: {e}"))?;
             }
+            "--pdf-passwords" => {
+                let path = rest.next().ok_or("--pdf-passwords needs a value")?;
+                let text = fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+                let lines = text.lines().filter(|line| !line.is_empty());
+                self.pdf_passwords = lines.map(str::to_owned).collect();
+            }
             #[cfg(feature = "yara")]
             "--yara" => {
                 let path = rest.next().ok_or("--yara needs a value")?;
@@ -137,7 +149,8 @@ impl Common {
         let builder = Scanner::builder()
             .limits(self.limits.clone())
             .policy(policy)
-            .hashlist(self.hashlist.clone());
+            .hashlist(self.hashlist.clone())
+            .pdf_passwords(self.pdf_passwords.iter().map(String::as_str));
         #[cfg(feature = "yara")]
         let builder = if self.yara_sources.is_empty() {
             builder
