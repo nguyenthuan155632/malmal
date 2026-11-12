@@ -1,0 +1,239 @@
+filename,expect,technique,bytes
+elf.jpg,block,ELF executable named as a JPEG,64
+pe.png,block,Windows executable named as a PNG,88
+macho.gif,block,Mach-O executable named as a GIF,32
+shell-script.jpg,block,Shell script named as a JPEG,32
+java-class.bmp,block,Java class file named as a BMP,32
+zip.png,block,ZIP archive named as a PNG,57
+html.jpg,block,HTML page named as a JPEG,83
+php.png,block,PHP source named as a PNG,33
+png-named.jpg,block,PNG content under a JPEG name,70
+image.php.jpg,block,Valid JPEG with a double extension,159
+image.png.exe,block,Valid PNG named as an executable,70
+image.phtml,block,Valid GIF named as a PHP template,35
+random.png,block,Unrecognizable bytes named as a PNG,512
+empty.jpg,block,Empty file,0
+htaccess.jpg,block,Apache configuration named as a JPEG,37
+svg-named.png,block,SVG with a script under a PNG name,177
+gif-php-header.gif,block,PHP file starting with a GIF signature,39
+gif-javascript-header.gif,block,GIF header that reads as a script,37
+jpeg-php-comment.jpg,block,PHP in a JPEG comment segment,9118
+jpeg-php-exif.jpg,block,PHP in an EXIF ImageDescription,9150
+jpeg-php-after-eoi.jpg,block,PHP appended after the end of the image,9114
+jpeg-short-tag-after-eoi.jpg,block,PHP short tag appended to a JPEG,9098
+jpeg-jsp-comment.jpg,block,JSP directive in a JPEG comment,9151
+jpeg-asp-comment.jpg,block,ASP expression in a JPEG comment,9123
+jpeg-script-comment.jpg,block,HTML script in a JPEG comment,9127
+jpeg-zip-polyglot.jpg,block,ZIP archive appended to a JPEG,9138
+jpeg-pdf-polyglot.jpg,block,PDF appended to a JPEG,9514
+jpeg-elf-appended.jpg,block,ELF executable appended to a JPEG,9145
+jpeg-truncated.jpg,block,JPEG cut off before its end marker,9017
+jpeg-pixel-bomb.jpg,block,JPEG declaring 65535x65535 pixels,159
+jpeg-html-appended.jpg,block,HTML page appended to a JPEG,9149
+jpeg-php-icc.jpg,block,PHP in an ICC profile segment,9132
+png-php-text.png,block,PHP in a PNG tEXt chunk,349361
+png-php-ztxt.png,block,PHP in a compressed zTXt chunk,349370
+png-script-itxt.png,block,Script in a compressed iTXt chunk,349377
+png-php-after-iend.png,block,PHP appended after IEND,349341
+png-zip-polyglot.png,block,ZIP archive appended to a PNG,349365
+png-pixel-bomb.png,block,PNG declaring 65535x65535 pixels,70
+png-truncated.png,block,PNG without its IEND chunk,349296
+png-bad-crc.png,block,PNG chunk with a wrong checksum,349323
+png-ztxt-bomb.png,block,zTXt chunk inflating to 300 MB,655096
+png-php-private-chunk.png,block,PHP in a private ancillary chunk,349353
+png-jsp-text.png,block,JSP directive in a PNG tEXt chunk,349394
+png-php-idat.png,block,PHP placed in an extra IDAT chunk,349353
+gif-php-comment.gif,block,PHP in a GIF comment extension,28702
+gif-script-after-trailer.gif,block,Script appended after the GIF trailer,28707
+gif-php-after-trailer.gif,block,PHP appended after the GIF trailer,28698
+gif-truncated.gif,block,GIF without its trailer,14332
+gif-pixel-bomb.gif,block,GIF declaring a 65535x65535 screen,35
+gif-php-application.gif,block,PHP in a GIF application extension,28714
+webp-php-exif.webp,block,PHP in a WebP EXIF chunk,7246
+webp-php-trailing.webp,block,PHP appended after the RIFF container,7237
+webp-short-riff.webp,block,RIFF size smaller than the file,7204
+webp-php-xmp.webp,block,PHP in a WebP XMP chunk,7246
+bmp-php-trailing.bmp,block,PHP appended to a BMP,230487
+bmp-pixel-bomb.bmp,block,BMP declaring 65535x65535 pixels,58
+bmp-zip-polyglot.bmp,block,ZIP archive appended to a BMP,230511
+tiff-php-description.tif,block,PHP in a TIFF ImageDescription,158
+tiff-ifd-loop.tif,block,TIFF whose directory points at itself,112
+tiff-bigtiff.tif,block,BigTIFF header,32
+tiff-php-trailing.tif,block,PHP appended to a TIFF,614711
+psd-php-resource.psd,block,PHP in a PSD image resource,87
+psd-php-trailing.psd,block,PHP appended to a PSD,914952
+psd-script-resource.psd,block,Script in a PSD XMP resource,95
+svg-script.svg,block,Script element,177
+svg-script-cdata.svg,block,Script element with CDATA,212
+svg-script-external.svg,block,Script loaded from another host,186
+svg-script-prefixed.svg,block,Script element under a namespace prefix,104
+svg-onload.svg,block,onload handler on the root,200
+svg-onclick.svg,block,onclick handler on a shape,184
+svg-onbegin.svg,block,onbegin handler on an animation,191
+svg-javascript-href.svg,block,javascript: link,205
+svg-javascript-entities.svg,block,javascript: link spelled with character references,214
+svg-animate-href.svg,block,Animation that sets a javascript: link,228
+svg-set-href.svg,block,set element that writes a javascript: link,230
+svg-data-html.svg,block,Link to an HTML data: URI,238
+svg-data-svg-image.svg,block,Image holding a nested SVG with a script,273
+svg-foreign-object.svg,block,foreignObject with an HTML iframe,266
+svg-foreign-object-script.svg,block,foreignObject with an HTML script,264
+svg-xxe.svg,block,External entity reading a local file,214
+svg-xxe-parameter.svg,block,Parameter entity loading a remote DTD,227
+svg-entity-bomb.svg,block,Nested entity expansion,683
+svg-external-image.svg,block,Image fetched from another host,205
+svg-external-use.svg,block,use element pointing at another host,186
+svg-css-import.svg,block,Stylesheet importing a remote file,225
+svg-css-url.svg,block,Style attribute fetching a remote file,215
+svg-xml-stylesheet.svg,block,xml-stylesheet instruction naming a remote file,237
+svg-file-image.svg,block,Image read from a local path,171
+svg-script.svgz,block,Compressed SVG with a script,137
+svg-utf16-script.svg,block,UTF-16 SVG with a script,230
+svg-php-comment.svg,block,PHP inside an XML comment,207
+svg-handler.svg,block,XML Events handler element,223
+pdf-openaction-js.pdf,block,JavaScript run when the document opens,545
+pdf-names-js.pdf,block,JavaScript in the document name tree,577
+pdf-page-aa.pdf,block,JavaScript in a page's additional actions,546
+pdf-catalog-aa.pdf,block,JavaScript run when the document closes,547
+pdf-js-stream.pdf,block,JavaScript held in a compressed stream,645
+pdf-js-hex-filter.pdf,block,JavaScript behind ASCIIHex and Flate filters,667
+pdf-js-obfuscated-name.pdf,block,JavaScript key written with hex escapes,536
+pdf-js-hex-string.pdf,block,JavaScript written as a hex string,538
+pdf-launch.pdf,block,Launch action naming a program,517
+pdf-launch-win.pdf,block,Launch action with Windows parameters,557
+pdf-uri.pdf,block,URI action run when the document opens,532
+pdf-submit-form.pdf,block,Form submitted to another host,544
+pdf-import-data.pdf,block,ImportData action,521
+pdf-gotor.pdf,block,Remote go-to action,553
+pdf-gotoe.pdf,block,Embedded go-to action,525
+pdf-embedded-exe.pdf,block,Embedded Windows executable,763
+pdf-embedded-svg.pdf,block,Embedded SVG that carries a script,828
+pdf-file-attachment.pdf,block,File attachment annotation,737
+pdf-rich-media.pdf,block,RichMedia annotation,563
+pdf-xfa.pdf,block,XFA form,638
+pdf-field-js.pdf,block,JavaScript on a form field keystroke,696
+pdf-annot-js.pdf,block,JavaScript on a link annotation,637
+pdf-encrypted.pdf,block,Encrypted document,678
+pdf-incremental-js.pdf,block,JavaScript added by an incremental update,691
+pdf-launch-objstm.pdf,block,Launch action hidden in an object stream,632
+pdf-ps-xobject.pdf,block,PostScript XObject,591
+pdf-flate-bomb.pdf,block,Page content stream inflating to 300 MB,306214
+pdf-php-after-eof.pdf,block,PHP appended after the end of the PDF,466
+pdf-junk-prefix.pdf,block,HTML page placed before the PDF header,489
+pdf-truncated.pdf,block,PDF cut off before its cross-reference table,270
+pdf-js-no-action-type.pdf,block,JavaScript reached through a /Next chain,638
+ps-pipe-read.eps,block,Command run through the %pipe% device,115
+ps-pipe-write.eps,block,Output piped to a command,128
+ps-pipe-concat.eps,block,%pipe% name assembled from two strings,132
+ps-file-read.eps,block,Local file opened for reading,141
+ps-file-write.eps,block,Local file opened for writing,138
+ps-deletefile.eps,block,File deleted,130
+ps-renamefile.eps,block,File renamed,124
+ps-filenameforall.eps,block,Directory listed,138
+ps-run.eps,block,Another file executed with run,126
+ps-forceput.eps,block,Protected dictionary written with .forceput,129
+ps-superexec.eps,block,superexec,143
+ps-setuserparams.eps,block,Permissions changed through .setuserparams,141
+ps-putdeviceprops.eps,block,Device properties replaced,176
+ps-setpagedevice-output.eps,block,Output file set through setpagedevice,151
+ps-tempfile.eps,block,Scratch file created,128
+ps-libfile.eps,block,Library file opened,117
+ps-getenv.eps,block,Environment variable read,109
+ps-exec-string.eps,block,Code built from a string and executed,118
+ps-exec-hex-string.eps,block,Code hidden in a hex string,145
+ps-exec-a85.eps,block,Code decoded from ASCII85 at run time,165
+ps-exec-name.eps,block,Operator name built at run time,138
+ps-load-operator.eps,block,Operator fetched from systemdict by name,136
+ps-bind-alias.eps,block,File operator hidden behind an alias,138
+ps-restore-trick.eps,block,Type confusion setup named in advisories,125
+ps-pdf-interpreter.eps,block,Internal PDF interpreter operator,114
+ps-statusdict.eps,block,statusdict used to reach printer state,136
+ps-stdin.eps,block,Further code read from standard input,122
+ps-pipe.ai,block,Illustrator file running a command,117
+ps-pipe.ps,block,Plain PostScript running a command,71
+ps-pipe-named.jpg,block,PostScript running a command under a JPEG name,115
+ps-dos-binary-pipe.eps,block,DOS binary EPS whose PostScript runs a command,177
+ps-pjl-prefix.eps,block,Printer job language before the PostScript,155
+obf-php-split-comments.jpg,block,PHP tag split across two JPEG comments,9110
+obf-php-nullbytes.jpg,block,PHP tag with null bytes between letters,9105
+obf-php-upper.png,block,PHP opener in capitals,349338
+obf-php-base64-text.png,block,PHP wrapped in a base64 blob in a tEXt chunk,349389
+obf-script-mixed-case.gif,block,Script tag in mixed case,28694
+obf-short-tag-whitespace.jpg,block,Short tag with odd whitespace,9108
+obf-php-heredoc.png,block,PHP using a heredoc body,349349
+obf-pdf-js-octal.pdf,block,JavaScript action with an octal-escaped string,531
+obf-pdf-js-full-hex-name.pdf,block,Every name byte written as hex,574
+obf-pdf-js-split-array.pdf,block,JavaScript assembled from a string array,534
+obf-pdf-js-deep-filter.pdf,block,JavaScript behind Flate then ASCIIHex then Flate,684
+obf-pdf-js-comment-split.pdf,block,JavaScript name broken by a PDF comment,531
+obf-svg-onload-upper.svg,block,Event handler attribute in capitals,183
+obf-svg-js-mixedcase.svg,block,javascript scheme in mixed case,205
+obf-svg-js-newline.svg,block,javascript scheme split by a newline entity,204
+obf-svg-script-comment.svg,block,Script tag broken by an XML comment is still one tag to a browser,168
+obf-svg-utf7.svg,block,SVG declared as UTF-7 with an encoded script,126
+obf-svg-ns-prefix.svg,block,Script under an unusual namespace prefix,103
+obf-ps-concat-name.eps,block,deletefile assembled from two strings,143
+obf-ps-systemdict-get.eps,block,file operator fetched from systemdict,141
+obf-ps-def-alias.eps,block,%pipe% hidden behind a defined alias,128
+obf-ps-hex-pipe.eps,block,pipe command built from a hex string,123
+obf-ps-a85-code.eps,block,runnable code decoded from ASCII85,165
+obf-ps-radix-name.eps,block,operator reached through a radix-coded index,162
+clean-photo.jpg,clean,An ordinary rendered photo,9081
+clean-photo.png,clean,An ordinary rendered photo,349308
+clean-photo.webp,clean,An ordinary rendered photo,7204
+clean-photo.tif,clean,An ordinary rendered photo,614678
+clean-xmp-packet.jpg,clean,Real photo with an Adobe XMP packet (starts with <?x),9244
+clean-exif-caption.jpg,clean,EXIF caption that merely contains an angle bracket,9126
+clean-icc.png,clean,PNG carrying a large colour profile,349352
+clean-local-gradient.svg,clean,SVG using a local gradient reference,274
+clean-inline-css.svg,clean,SVG with inline CSS and no remote resource,218
+clean-data-png.svg,clean,SVG embedding a PNG data: image (not HTML/SVG),208
+clean-title-desc.svg,clean,SVG with title and description text,224
+clean-netscape-loop.gif,clean,Animated GIF with the Netscape loop extension,28684
+clean-exif-description.tif,clean,TIFF with a normal ImageDescription,149
+clean-form-no-js.pdf,clean,PDF form with fields but no JavaScript,588
+clean-link-uri.pdf,clean,"PDF with a plain outline, no actions",515
+clean-eps-prolog.eps,clean,Illustrator-style prolog touching errordict/nulldevice,169
+clean-a85-image.eps,clean,EPS carrying a long ASCII85 image stream,1662
+clean-double-dot.jpg,clean,"Harmless dotted name, not a dangerous extension",9081
+clean-plain.svg,clean,A simple shape-only SVG,176
+struct-png-huge-chunk-len.png,block,PNG chunk claiming a 2 GB length,349316
+struct-png-zero-idat.png,block,PNG with an empty image-data chunk,349320
+struct-png-neg-dims.png,block,PNG header with zero width and height,70
+struct-jpeg-bad-seg-len.jpg,block,JPEG segment length past the end of file,9090
+struct-gif-no-ct.gif,block,GIF claiming a global colour table it lacks,14
+struct-tiff-truncated-ifd.tif,block,TIFF cut off in the middle of its directory,24
+struct-tiff-many-ifd.tif,block,TIFF chaining a hundred directories,1808
+struct-bmp-huge-bpp.bmp,block,BMP claiming 255 bits per pixel,58
+struct-bmp-neg-height.bmp,block,BMP with an enormous negative height,58
+struct-psd-huge-channels.psd,block,PSD header claiming 9999 channels,36
+struct-webp-huge-canvas.webp,block,WebP VP8X claiming a 16000x16000 canvas,30
+struct-pdf-selfref.pdf,block,PDF whose page lists itself as its parent,447
+struct-pdf-bad-startxref.pdf,block,PDF whose startxref points to nothing,436
+struct-pdf-deep-objstm.pdf,block,Launch action in a nested object stream,718
+struct-pdf-two-eof.pdf,block,PDF with a second body after the first EOF,978
+poly-pdf-zip.pdf,block,PDF with a ZIP archive appended,542
+poly-pdf-eps.pdf,block,File valid as both EPS and PDF,548
+poly-jar.png,block,Java archive named as a PNG,160
+poly-7z.jpg,block,7-Zip archive named as a JPEG,38
+poly-rar.png,block,RAR archive named as a PNG,39
+poly-fat-macho.gif,block,Universal Mach-O named as a GIF,40
+poly-ole2.png,block,Legacy Office (OLE2) named as a PNG,40
+poly-html-png.png,block,PNG with a full HTML page appended,349392
+poly-exif-svg.jpg,block,JPEG whose EXIF holds an SVG with a script,9251
+poly-pdf-in-pdf.pdf,block,PDF embedding a PDF that runs JavaScript on open,1222
+poly-pdf-svg-script.pdf,block,PDF embedding an SVG that embeds HTML script,909
+bomb-png-iccp.png,block,PNG iCCP profile inflating to 300 MB,655090
+bomb-png-ztxt.png,block,PNG zTXt chunk inflating to 300 MB,655090
+bomb-svgz.svgz,block,gzip-compressed SVG inflating to 300 MB,305836
+bomb-pdf-flate-stream.pdf,block,PDF page content inflating to 300 MB,306214
+bomb-pdf-double-flate.pdf,block,PDF stream behind two Flate layers,1100
+bomb-pdf-embedded.pdf,block,PDF embedded file inflating to 300 MB,306462
+name-double-php.php.jpg,block,Valid JPEG with a .php.jpg double extension,9081
+name-phtml.jpg,block,Valid JPEG carrying a .phtml segment,9102
+name-jsp.png.jsp,block,Valid PNG named as a JSP,349308
+name-aspx.gif.aspx,block,Valid GIF named as an ASPX page,28665
+name-htaccess.png,block,Apache override text under a PNG name,37
+name-svg-xml.png,block,SVG with a script under a PNG name,160
+name-double-ext.jpg.exe,block,Valid JPEG named as an executable,9081
+malmal‮gpj.php,block,Right-to-left override makes a .php look like a .jpg,9081

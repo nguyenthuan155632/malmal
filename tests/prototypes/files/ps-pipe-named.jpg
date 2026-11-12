@@ -1,0 +1,6 @@
+%!PS-Adobe-3.0 EPSF-3.0
+%%BoundingBox: 0 0 10 10
+(%pipe%id) (r) file
+0 0 moveto 10 10 lineto stroke
+showpage
+%%EOF
