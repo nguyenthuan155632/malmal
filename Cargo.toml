@@ -5,8 +5,9 @@ members = ["crates/malmal", "crates/malmal-cli", "crates/malmal-ffi"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# No license has been chosen yet, so the crates are not publishable.
-publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nguyenthuan155632/malmal"
+authors = ["nguyenthuan155632 <nguyenthuan155632@gmail.com>"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -3,7 +3,11 @@ name = "malmal-ffi"
 description = "C ABI for the malmal upload scanner"
 version.workspace = true
 edition.workspace = true
-publish.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["malware", "scanner", "ffi", "security", "c-abi"]
+categories = ["parsing", "external-ffi-bindings"]
 
 [lib]
 crate-type = ["staticlib", "cdylib"]
@@ -12,5 +16,5 @@ doc = false
 test = true
 
 [dependencies]
-malmal = { path = "../malmal" }
+malmal = { path = "../malmal", version = "0.1.0" }
 serde_json.workspace = true

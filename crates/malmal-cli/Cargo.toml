@@ -3,7 +3,11 @@ name = "malmal-cli"
 description = "Command-line scanner and daemon for the malmal upload scanner"
 version.workspace = true
 edition.workspace = true
-publish.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["malware", "scanner", "upload", "security", "cli"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "malmal"
@@ -14,7 +18,7 @@ name = "malmald"
 path = "src/bin/malmald.rs"
 
 [dependencies]
-malmal = { path = "../malmal" }
+malmal = { path = "../malmal", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 
