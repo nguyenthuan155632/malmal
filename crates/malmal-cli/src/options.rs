@@ -6,9 +6,10 @@ use malmal::{FileType, HashList, Policy, Scanner};
 
 use crate::sandbox::Mode;
 
+// The literals start on the quote's own line: a `"\` continuation would strip
+// the leading spaces of the first line and misalign it from the rest.
 #[cfg(not(feature = "yara"))]
-pub const HELP: &str = "\
-  --policy <NAME>      default or strict [default: default]
+pub const HELP: &str = "  --policy <NAME>      default or strict [default: default]
   --types <LIST>       Accepted file types, comma-separated
                        [default: jpeg,png,gif,webp,bmp,tiff,psd,svg,pdf,postscript]
   --hashlist <FILE>    SHA-256 blocklist, one hex digest per line
@@ -16,8 +17,7 @@ pub const HELP: &str = "\
   --require-sandbox    Exit with an error if the sandbox cannot be applied";
 
 #[cfg(feature = "yara")]
-pub const HELP: &str = "\
-  --policy <NAME>      default or strict [default: default]
+pub const HELP: &str = "  --policy <NAME>      default or strict [default: default]
   --types <LIST>       Accepted file types, comma-separated
                        [default: jpeg,png,gif,webp,bmp,tiff,psd,svg,pdf,postscript]
   --hashlist <FILE>    SHA-256 blocklist, one hex digest per line

@@ -17,8 +17,7 @@ Scans each FILE; `-` reads standard input.
 Options:
   --json               Print one JSON object per file";
 
-const EXIT_STATUS: &str = "\
-  -h, --help           Print this help
+const EXIT_STATUS: &str = "  -h, --help           Print this help
   -V, --version        Print version
 
 Exit status: 0 clean, 1 suspicious, 2 malicious, 3 error";
@@ -88,19 +87,23 @@ fn print_report(path: &str, report: &Report, json: bool) {
 }
 
 fn main() -> ExitCode {
-    let mut raw = std::env::args().skip(1).peekable();
-    match raw.peek().map(String::as_str) {
-        Some("-h" | "--help") => {
-            println!("{}", usage());
-            return ExitCode::SUCCESS;
-        }
-        Some("-V" | "--version") => {
-            println!("malmal {}", env!("CARGO_PKG_VERSION"));
-            return ExitCode::SUCCESS;
-        }
-        _ => {}
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    // Help and version are honoured wherever they appear among the options,
+    // including after the `scan` command, but not past a `--` terminator.
+    let is_flag = |names: &[&str]| {
+        raw.iter()
+            .take_while(|arg| *arg != "--")
+            .any(|arg| names.contains(&arg.as_str()))
+    };
+    if is_flag(&["-h", "--help"]) {
+        println!("{}", usage());
+        return ExitCode::SUCCESS;
     }
-    let args = match parse_args(raw) {
+    if is_flag(&["-V", "--version"]) {
+        println!("malmal {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    let args = match parse_args(raw.into_iter()) {
         Ok(args) => args,
         Err(message) => {
             eprintln!("malmal: {message}\n\n{}", usage());

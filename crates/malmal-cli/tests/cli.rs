@@ -98,6 +98,19 @@ fn types_option_replaces_the_accepted_types() {
 }
 
 #[test]
+fn help_works_after_the_command_and_stays_aligned() {
+    for args in [&["--help"][..], &["scan", "--help"][..], &["scan", "-h"][..]] {
+        let output = Command::new(MALMAL).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        // Every option line is indented by the same two spaces.
+        for line in ["  --json ", "  --policy ", "  --require-sandbox ", "  -h, --help "] {
+            assert!(text.contains(line), "{line:?} missing or misaligned in:\n{text}");
+        }
+    }
+}
+
+#[test]
 fn scans_files_and_reports_the_worst_verdict() {
     let dir = scratch("scan");
     let (png, elf) = (dir.join("ok.png"), dir.join("photo.jpg"));
