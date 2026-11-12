@@ -1,5 +1,11 @@
 //! Scanner for uploaded files: images, SVG, PDF and PostScript.
 //!
+//! A [`Scanner`] takes the bytes of an upload and what the uploader claimed
+//! about it, and returns a [`Report`]: a [`Verdict`] and the [`Finding`]s it
+//! rests on. It checks that the file is the type it claims to be, that it
+//! carries no active content, and that it is structurally sound. A file that
+//! cannot be analyzed to the end is never reported clean.
+//!
 //! ```
 //! use malmal::{ScanHints, Scanner, Verdict};
 //!
@@ -7,18 +13,38 @@
 //! let hints = ScanHints { filename: Some("photo.jpg"), content_type: Some("image/jpeg") };
 //! let report = scanner.scan_bytes(b"\x7fELF\x02\x01\x01", hints);
 //! assert_eq!(report.verdict, Verdict::Malicious);
+//! assert!(report.has("type.executable"));
 //! ```
+//!
+//! # Stability
+//!
+//! Finding codes are part of the API: a code keeps its meaning, and new
+//! codes arrive in minor releases. [`FileType`], [`Report`] and [`Finding`]
+//! may grow, so match on them with a wildcard. Messages are for people and
+//! may be reworded at any time.
+//!
+//! # Features
+//!
+//! - `yara`: match files against YARA rules with [`YaraRules`]. Off by
+//!   default; it adds a WebAssembly runtime to the build.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
+/// Telling a file's type from its content, and the claims made about it.
 pub mod detect;
+/// SHA-256 blocklists.
 pub mod hashlist;
 mod image;
+/// Resource limits for a scan.
 pub mod limits;
-pub mod payload;
+mod payload;
 mod pdf;
+/// Accepted file types and the mapping from findings to a verdict.
 pub mod policy;
 mod ps;
+/// The result of a scan.
 pub mod report;
 mod svg;
 #[cfg(feature = "yara")]
@@ -30,10 +56,12 @@ use sha2::{Digest, Sha256};
 
 pub use detect::FileType;
 pub use hashlist::{HashList, HashListError};
-pub use limits::{Budget, LimitExceeded, Limits};
+pub use limits::Limits;
+use limits::{Budget, LimitExceeded};
 pub use policy::Policy;
 pub use report::{Finding, Report, Severity, Verdict};
 #[cfg(feature = "yara")]
+#[cfg_attr(docsrs, doc(cfg(feature = "yara")))]
 pub use yara::{YaraError, YaraRules};
 
 use payload::{PayloadKind, Scope};
@@ -41,10 +69,14 @@ use payload::{PayloadKind, Scope};
 /// What the uploader claimed about the file. Never trusted, only checked.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScanHints<'a> {
+    /// The name the file was uploaded under.
     pub filename: Option<&'a str>,
+    /// The `Content-Type` the client sent for it.
     pub content_type: Option<&'a str>,
 }
 
+/// A configured scanner. It holds no per-scan state: build one and share
+/// it between threads, or clone it, which is cheap.
 #[derive(Debug, Clone, Default)]
 pub struct Scanner {
     limits: Limits,
@@ -54,22 +86,27 @@ pub struct Scanner {
     yara: Option<YaraRules>,
 }
 
+/// Builds a [`Scanner`]; everything left unset keeps its default.
 #[derive(Debug, Clone, Default)]
 pub struct ScannerBuilder {
     scanner: Scanner,
 }
 
 impl ScannerBuilder {
+    /// Replace the resource limits.
     pub fn limits(mut self, limits: Limits) -> Self {
         self.scanner.limits = limits;
         self
     }
 
+    /// Replace the policy that accepts file types and turns findings into
+    /// a verdict.
     pub fn policy(mut self, policy: Policy) -> Self {
         self.scanner.policy = policy;
         self
     }
 
+    /// Report files whose SHA-256 is on this list as `hash.blocklisted`.
     pub fn hashlist(mut self, hashlist: HashList) -> Self {
         self.scanner.hashlist = hashlist;
         self
@@ -82,14 +119,22 @@ impl ScannerBuilder {
         self
     }
 
+    /// Finish building.
     pub fn build(self) -> Scanner {
         self.scanner
     }
 }
 
 impl Scanner {
+    /// Start from the defaults: every supported type accepted, the default
+    /// policy and limits, no blocklist.
     pub fn builder() -> ScannerBuilder {
         ScannerBuilder::default()
+    }
+
+    /// The limits this scanner was built with.
+    pub fn limits(&self) -> &Limits {
+        &self.limits
     }
 
     /// Scan from a reader, buffering at most one byte past the size limit.
@@ -102,6 +147,8 @@ impl Scanner {
         Ok(self.scan_bytes(&data, hints))
     }
 
+    /// Scan a file held in memory. This never fails and never panics on
+    /// hostile input; what could not be analyzed is a finding.
     pub fn scan_bytes(&self, data: &[u8], hints: ScanHints<'_>) -> Report {
         let mut findings = Vec::new();
         let size = data.len() as u64;
@@ -210,6 +257,11 @@ impl Scanner {
             ));
         }
         self.analyze_content(data, detected, budget, findings);
+        // The rules saw the container, where this file may be compressed.
+        #[cfg(feature = "yara")]
+        if let Some(rules) = &self.yara {
+            rules.scan(data, self.limits.max_duration, findings);
+        }
     }
 
     /// Compare the content against the filename and Content-Type claims.

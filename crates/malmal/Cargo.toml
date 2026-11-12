@@ -6,10 +6,13 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "../../README.md"
 keywords = ["malware", "scanner", "upload", "security", "antivirus"]
 categories = ["parsing", "command-line-utilities"]
 
 [dependencies]
+aes = "0.8"
+md-5 = "0.10"
 memchr = "2.8.3"
 miniz_oxide = "0.9.1"
 quick-xml = { version = "0.42.0", default-features = false }
@@ -31,4 +34,8 @@ yara = ["dep:yara-x"]
 
 [lints.rust]
 # Set by cargo-fuzz.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(docsrs)"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

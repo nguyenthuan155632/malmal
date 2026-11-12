@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "../../README.md"
 keywords = ["malware", "scanner", "ffi", "security", "c-abi"]
 categories = ["parsing", "external-ffi-bindings"]
 
@@ -16,5 +17,5 @@ doc = false
 test = true
 
 [dependencies]
-malmal = { path = "../malmal", version = "0.1.0" }
+malmal = { path = "../malmal", version = "0.2.0" }
 serde_json.workspace = true

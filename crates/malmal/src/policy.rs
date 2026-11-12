@@ -20,6 +20,10 @@ const DEFAULT_ALLOWED: &[FileType] = &[
     FileType::Bmp,
     FileType::Tiff,
     FileType::Psd,
+    FileType::Heif,
+    FileType::Avif,
+    FileType::Jxl,
+    FileType::Ico,
     FileType::Svg,
     FileType::Pdf,
     FileType::PostScript,
@@ -58,6 +62,7 @@ impl Policy {
         self
     }
 
+    /// Whether files of this type are accepted.
     pub fn is_allowed(&self, file_type: FileType) -> bool {
         self.allowed.contains(&file_type)
     }

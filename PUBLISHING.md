@@ -35,7 +35,15 @@ cargo publish -p malmal-cli
 
 > Publishing is permanent. A version can be **yanked** (hidden from new
 > resolution) but never deleted or overwritten. To ship a fix, bump the
-> version in the workspace `Cargo.toml` and publish again.
+> version and publish again.
+
+## Releasing a new version
+
+The version is written in three places that must agree: `version` in the
+workspace `Cargo.toml`, and the `malmal = { ..., version = "..." }`
+dependency in `crates/malmal-cli/Cargo.toml` and `crates/malmal-ffi/Cargo.toml`.
+Add the release to `CHANGELOG.md`, commit, and publish the three crates in the
+order above.
 
 ## After publishing
 

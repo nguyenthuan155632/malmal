@@ -3,6 +3,7 @@
 //! file is parsed where it stands, object streams are unpacked, and every
 //! dictionary found either way is inspected for active content.
 
+pub(crate) mod crypt;
 pub(crate) mod filters;
 pub(crate) mod parser;
 
@@ -11,8 +12,10 @@ use std::collections::HashMap;
 
 use memchr::memmem;
 
+use crate::detect::{self, FileType};
 use crate::limits::{Budget, LimitExceeded};
 use crate::report::{Finding, Severity};
+use crypt::{Decryptor, StreamKind};
 use filters::{DecodeError, Params};
 use parser::{Dict, Name, Parser, Value, is_regular, is_whitespace};
 
@@ -24,6 +27,8 @@ const MAX_NODES: usize = 2_000_000;
 const MAX_FILTERS: usize = 8;
 /// How far past an unparsable object's start to look for names.
 const FALLBACK_WINDOW: usize = 64 << 10;
+/// Dictionaries naming `/Encrypt` that are tried as the source of the key.
+const MAX_ENCRYPT_SOURCES: usize = 8;
 
 /// Names whose `#xx`-escaped spelling is reported as obfuscation.
 const SENSITIVE_NAMES: &[&[u8]] = &[
@@ -62,6 +67,7 @@ static NULL: Value = Value::Null;
 
 struct Object {
     number: u32,
+    generation: u16,
     /// Where the object (or the object stream holding it) starts in the file.
     offset: usize,
     value: Value,
@@ -74,6 +80,8 @@ struct Document<'a> {
     objects: Vec<Object>,
     /// Latest definition of each object number, as incremental updates intend.
     by_number: HashMap<u32, usize>,
+    /// Set when the document is encrypted and the empty password opens it.
+    crypt: Option<Decryptor>,
 }
 
 impl<'a> Document<'a> {
@@ -143,7 +151,23 @@ impl<'a> Document<'a> {
         }
         let parms = self.resolve(dict.get(b"DecodeParms"));
 
-        let mut data = Cow::Borrowed(raw);
+        let mut data = match &self.crypt {
+            Some(crypt) => {
+                let is = |key: &[u8], name: &[u8]| self.name_is(dict.get(key), name);
+                let kind = if is(b"Type", b"XRef") {
+                    StreamKind::CrossReference
+                } else if is(b"Type", b"EmbeddedFile") {
+                    StreamKind::EmbeddedFile
+                } else if is(b"Type", b"Metadata") {
+                    StreamKind::Metadata
+                } else {
+                    StreamKind::Ordinary
+                };
+                let plain = crypt.decrypt(object.number, object.generation, kind, raw);
+                Cow::Owned(plain.ok_or(DecodeError::Corrupt)?)
+            }
+            None => Cow::Borrowed(raw),
+        };
         for (index, filter) in filters.iter().enumerate() {
             let parm_dict = match parms {
                 Value::Dict(dict) if index == 0 => Some(dict),
@@ -182,7 +206,10 @@ struct Output<'a> {
     embedded: Vec<u32>,
     /// Object numbers that pages, fonts and patterns name as content streams.
     contents: Vec<u32>,
-    encrypted: bool,
+    /// Object numbers that an `/XFA` entry names as form packets.
+    xfa: Vec<u32>,
+    /// Where `/Encrypt` was seen: the trailer or object that names it.
+    encrypt_sources: Vec<usize>,
 }
 
 impl Output<'_> {
@@ -206,13 +233,9 @@ impl Output<'_> {
     }
 
     fn encrypted(&mut self, offset: usize) {
-        self.encrypted = true;
-        self.report(
-            "pdf.encrypted",
-            Severity::Medium,
-            "document is encrypted; strings, streams and object streams cannot be inspected",
-            offset,
-        );
+        if !self.encrypt_sources.contains(&offset) {
+            self.encrypt_sources.push(offset);
+        }
     }
 }
 
@@ -226,12 +249,14 @@ pub(crate) fn analyze(
         findings,
         embedded: Vec::new(),
         contents: Vec::new(),
-        encrypted: false,
+        xfa: Vec::new(),
+        encrypt_sources: Vec::new(),
     };
     let mut doc = Document {
         data,
         objects: Vec::new(),
         by_number: HashMap::new(),
+        crypt: None,
     };
     let mut nodes_left = MAX_NODES;
 
@@ -248,8 +273,28 @@ pub(crate) fn analyze(
         walk(&doc, &object.value, object.offset, &mut out);
     }
 
-    // In an encrypted file, object streams and embedded files are ciphertext.
-    if !out.encrypted {
+    // In an encrypted file, object streams and embedded files are ciphertext
+    // unless the empty password opens it, as it does in any reader.
+    let encrypted = out.encrypt_sources.first().copied();
+    if let Some(offset) = encrypted {
+        doc.crypt = open_with_empty_password(&doc, &out.encrypt_sources);
+        if doc.crypt.is_some() {
+            out.report(
+                "pdf.encrypted",
+                Severity::Info,
+                "document is encrypted with an empty password; it was decrypted and inspected",
+                offset,
+            );
+        } else {
+            out.report(
+                "pdf.encrypted",
+                Severity::Medium,
+                "document is encrypted; strings, streams and object streams cannot be inspected",
+                offset,
+            );
+        }
+    }
+    if encrypted.is_none() || doc.crypt.is_some() {
         let top_level = doc.objects.len();
         expand_object_streams(&mut doc, &mut nodes_left, budget, &mut out);
         for object in &doc.objects[top_level..] {
@@ -257,6 +302,7 @@ pub(crate) fn analyze(
         }
         scan_embedded_files(&doc, budget, &mut out, nested);
         scan_content_streams(&doc, budget, &mut out);
+        scan_xfa(&doc, budget, &mut out);
     }
 
     if doc.objects.is_empty() {
@@ -283,7 +329,8 @@ fn check_end(data: &[u8], out: &mut Output<'_>) {
     let Some(first) = markers.next() else {
         return out.malformed("PDF has no %%EOF marker", data.len());
     };
-    if markers.next().is_some() {
+    let last = markers.last();
+    if last.is_some() {
         out.report(
             "pdf.incremental_update",
             Severity::Info,
@@ -291,6 +338,73 @@ fn check_end(data: &[u8], out: &mut Output<'_>) {
             first,
         );
     }
+
+    // Readers stop at the last marker; whatever follows is carried along
+    // unseen by them and by whoever looks at the document.
+    let end = last.unwrap_or(first) + b"%%EOF".len();
+    let trailing = &data[end..];
+    let padding = trailing
+        .iter()
+        .take_while(|&&b| b == 0 || b.is_ascii_whitespace())
+        .count();
+    if padding == trailing.len() {
+        return;
+    }
+    out.report(
+        "pdf.trailing_data",
+        Severity::Low,
+        &format!("{} bytes after the last %%EOF marker", trailing.len()),
+        end,
+    );
+    let appended = detect::detect(&trailing[padding..]);
+    if appended != FileType::Unknown {
+        out.report(
+            "pdf.polyglot",
+            Severity::High,
+            &format!("data after the document is a {} file", appended.as_str()),
+            end + padding,
+        );
+    } else if let Some(offset) = detect::zip_end_record(data) {
+        out.report(
+            "pdf.polyglot",
+            Severity::High,
+            "ZIP end-of-central-directory record closes the file; it also opens as an archive",
+            offset,
+        );
+    }
+}
+
+/// Try each dictionary that names `/Encrypt` as the source of the key.
+fn open_with_empty_password(doc: &Document<'_>, sources: &[usize]) -> Option<Decryptor> {
+    let data = doc.data;
+    // The trailer or cross-reference stream dictionary follows its keyword.
+    let dict_after = |offset: usize| {
+        let window = data.get(offset..)?;
+        let window = &window[..window.len().min(256)];
+        Some(offset + memmem::find(window, b"<<")?)
+    };
+    sources
+        .iter()
+        .take(MAX_ENCRYPT_SOURCES)
+        .find_map(|&source| {
+            let entries = crypt::raw_entries(data, dict_after(source)?)?;
+            let range = |key: &[u8]| {
+                let found = entries.iter().find(|(name, _)| name == key);
+                found.map(|(_, range)| range.clone())
+            };
+            let id = crypt::first_id(data, &range(b"ID")?)?;
+            let encrypt = range(b"Encrypt")?;
+            let mut parser = Parser::new(&data[..encrypt.end], encrypt.start, 64);
+            let at = match parser.parse_value()? {
+                Value::Dict(_) => encrypt.start,
+                Value::Ref(number) => {
+                    let object = &doc.objects[*doc.by_number.get(&number)?];
+                    dict_after(object.offset)?
+                }
+                _ => return None,
+            };
+            Decryptor::open(data, at, &id)
+        })
 }
 
 /// Parse every `N G obj` in the file, wherever it is.
@@ -315,7 +429,7 @@ fn discover_objects(
         if data.get(body).is_some_and(|&b| is_regular(b)) {
             continue;
         }
-        let Some((number, offset)) = object_header(data, at) else {
+        let Some((number, generation, offset)) = object_header(data, at) else {
             continue;
         };
 
@@ -349,6 +463,7 @@ fn discover_objects(
         });
         doc.add(Object {
             number,
+            generation,
             offset,
             value,
             stream_start,
@@ -357,8 +472,8 @@ fn discover_objects(
 }
 
 /// Read `N G` backwards from the `obj` keyword at `obj_at`; returns the
-/// object number and where the header starts.
-fn object_header(data: &[u8], obj_at: usize) -> Option<(u32, usize)> {
+/// object number, the generation and where the header starts.
+fn object_header(data: &[u8], obj_at: usize) -> Option<(u32, u16, usize)> {
     let field = |pos: &mut usize| -> Option<u64> {
         let after_space = *pos;
         while *pos > 0 && is_whitespace(data[*pos - 1]) {
@@ -374,9 +489,10 @@ fn object_header(data: &[u8], obj_at: usize) -> Option<(u32, usize)> {
         std::str::from_utf8(&data[*pos..end]).ok()?.parse().ok()
     };
     let mut pos = obj_at;
-    let _generation = field(&mut pos)?;
+    let generation = field(&mut pos)?;
     let number = field(&mut pos)?;
-    Some((u32::try_from(number).ok()?, pos))
+    // The generation only matters as key material, where it is 16 bits wide.
+    Some((u32::try_from(number).ok()?, generation as u16, pos))
 }
 
 /// Unpack `/Type /ObjStm` streams and add the objects stored inside them.
@@ -433,6 +549,7 @@ fn expand_object_streams(
             match (value, u32::try_from(number)) {
                 (Some(value), Ok(number)) => unpacked.push(Object {
                     number,
+                    generation: 0,
                     offset,
                     value,
                     stream_start: None,
@@ -549,7 +666,15 @@ fn check_entry(doc: &Document<'_>, key: &Name, value: &Value, offset: usize, out
                 out.contents.extend(streams);
             }
         }
-        b"XFA" => xfa(offset, out),
+        b"XFA" => {
+            xfa(offset, out);
+            // One stream, or an array pairing packet names with streams.
+            match (value, doc.resolve(Some(value))) {
+                (_, Value::Array(items)) => out.xfa.extend(items.iter().filter_map(as_ref)),
+                (Value::Ref(number), _) => out.xfa.push(*number),
+                _ => {}
+            }
+        }
         b"Encrypt" => out.encrypted(offset),
         b"URI" => uri(offset, out),
         b"S" => match doc.resolve(Some(value)).as_name() {
@@ -817,6 +942,68 @@ fn scan_content_streams(doc: &Document<'_>, budget: &mut Budget, out: &mut Outpu
     }
 }
 
+/// Search the packets of an XFA form for scripts. XFA has its own scripting
+/// hooks, separate from the document's JavaScript actions.
+fn scan_xfa(doc: &Document<'_>, budget: &mut Budget, out: &mut Output<'_>) {
+    let mut targets: Vec<usize> = out
+        .xfa
+        .iter()
+        .filter_map(|number| doc.by_number.get(number).copied())
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+
+    for index in targets {
+        let object = &doc.objects[index];
+        if object.stream_start.is_none() {
+            continue;
+        }
+        match doc.decode(object, budget) {
+            Ok(packet) if has_script_element(&packet) => {
+                return out.report(
+                    "pdf.javascript",
+                    Severity::High,
+                    "XFA form contains scripts",
+                    object.offset,
+                );
+            }
+            Ok(_) => {}
+            Err(DecodeError::Limit) => return out.limit(LimitExceeded::Decompression),
+            // An unread packet may hold the script.
+            Err(_) => out.malformed("XFA packet cannot be decoded", object.offset),
+        }
+    }
+}
+
+/// Whether XML text opens a `script` element, with or without a namespace
+/// prefix, in UTF-8 or UTF-16.
+fn has_script_element(packet: &[u8]) -> bool {
+    let text: Vec<u8> = packet
+        .iter()
+        .filter(|&&byte| byte != 0)
+        .map(u8::to_ascii_lowercase)
+        .collect();
+    memmem::find_iter(&text, b"script").any(|at| {
+        let closes_name = text
+            .get(at + b"script".len())
+            .is_none_or(|&b| b.is_ascii_whitespace() || matches!(b, b'>' | b'/'));
+        // Directly after `<`, or after a namespace prefix that is.
+        let before = &text[..at];
+        let opens_name = match before.strip_suffix(b":") {
+            Some(prefixed) => {
+                let prefix = prefixed
+                    .iter()
+                    .rev()
+                    .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+                    .count();
+                prefix > 0 && prefixed[..prefixed.len() - prefix].ends_with(b"<")
+            }
+            None => before.ends_with(b"<"),
+        };
+        closes_name && opens_name
+    })
+}
+
 /// Whether a content stream has `operator` as a token of its own, outside
 /// strings, names and comments.
 fn uses_operator(content: &[u8], operator: &[u8]) -> bool {
@@ -888,6 +1075,7 @@ fn uses_operator(content: &[u8], operator: &[u8]) -> bool {
 mod tests {
     use miniz_oxide::deflate::compress_to_vec_zlib;
 
+    use super::crypt::testing::{Encrypted, ID, Scheme};
     use super::*;
     use crate::limits::Limits;
 
@@ -1141,13 +1329,154 @@ mod tests {
         assert_eq!(codes(&pdf(&[CATALOG, &text])), ["pdf.embedded_file"]);
     }
 
+    /// A document whose only script sits in an encrypted object stream.
+    fn encrypted_pdf(scheme: Scheme, password: &[u8]) -> Vec<u8> {
+        let encrypted = Encrypted::new(scheme, password);
+        let inner = b"10 0 11 16 << /Foo /Bar >> << /S /JavaScript /JS (x) >>";
+        let packed = stream(
+            "/Type /ObjStm /N 2 /First 11 /Filter /FlateDecode",
+            &encrypted.seal(2, &compress_to_vec_zlib(inner, 6)),
+        );
+        let mut out = b"%PDF-1.7\n".to_vec();
+        for (index, body) in [CATALOG, &packed, encrypted.dict.as_bytes()]
+            .iter()
+            .enumerate()
+        {
+            out.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+        }
+        let id: String = ID.iter().map(|byte| format!("{byte:02x}")).collect();
+        out.extend_from_slice(
+            format!("trailer\n<< /Root 1 0 R /Encrypt 3 0 R /ID [<{id}> <{id}>] >>\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    const SCHEMES: [Scheme; 5] = [
+        Scheme::Rc4Short,
+        Scheme::Rc4Long,
+        Scheme::Aes128,
+        Scheme::Aes256,
+        Scheme::Aes256Extension,
+    ];
+
+    #[test]
+    fn empty_password_encryption_is_seen_through() {
+        for scheme in SCHEMES {
+            assert_eq!(
+                run(&encrypted_pdf(scheme, b"")),
+                [
+                    ("pdf.encrypted", Severity::Info),
+                    ("pdf.javascript", Severity::High),
+                ],
+                "{scheme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn password_protected_documents_stay_unreadable() {
+        for scheme in SCHEMES {
+            assert_eq!(
+                run(&encrypted_pdf(scheme, b"secret")),
+                [("pdf.encrypted", Severity::Medium)],
+                "{scheme:?}"
+            );
+        }
+        // The encryption dictionary sits inline in a cross-reference stream.
+        let inline = Encrypted::new(Scheme::Aes256, b"").dict;
+        let id: String = ID.iter().map(|byte| format!("{byte:02x}")).collect();
+        let xref = stream(
+            &format!("/Type /XRef /Root 1 0 R /Encrypt {inline} /ID [<{id}> <{id}>]"),
+            b"\0\0\0",
+        );
+        assert_eq!(
+            run(&pdf(&[CATALOG, &xref])),
+            [("pdf.encrypted", Severity::Info)]
+        );
+    }
+
+    #[test]
+    fn data_after_the_end_marker() {
+        let mut padded = pdf(&[CATALOG]);
+        padded.extend_from_slice(b"\r\n\0\0  \n");
+        assert_eq!(codes(&padded), [] as [&str; 0]);
+
+        let mut noted = pdf(&[CATALOG]);
+        noted.extend_from_slice(b"generated by an old printer driver");
+        assert_eq!(run(&noted), [("pdf.trailing_data", Severity::Low)]);
+
+        for appended in [&b"\n\x7fELF\x02\x01\x01"[..], b"<html><script>x</script>"] {
+            let mut polyglot = pdf(&[CATALOG]);
+            polyglot.extend_from_slice(appended);
+            assert_eq!(
+                run(&polyglot),
+                [
+                    ("pdf.trailing_data", Severity::Low),
+                    ("pdf.polyglot", Severity::High),
+                ]
+            );
+        }
+
+        // An archive is found from its end record, wherever it starts.
+        let mut archive = pdf(&[CATALOG]);
+        archive.extend_from_slice(b"entries");
+        archive.extend_from_slice(b"PK\x05\x06");
+        archive.extend_from_slice(&[0; 18]);
+        assert_eq!(codes(&archive), ["pdf.trailing_data", "pdf.polyglot"]);
+    }
+
+    #[test]
+    fn xfa_packets_are_searched_for_scripts() {
+        let form = b"<< /AcroForm << /XFA [(template) 2 0 R (datasets) 3 0 R] >> >>";
+        let template = stream(
+            "/Filter /FlateDecode",
+            &compress_to_vec_zlib(
+                b"<template><subform><event activity=\"initialize\">\
+                  <xfa:Script contentType=\"application/x-javascript\">x()</xfa:Script>\
+                  </event></subform></template>",
+                6,
+            ),
+        );
+        let data = stream(
+            "",
+            b"<xfa:datasets><description>script</description></xfa:datasets>",
+        );
+        assert_eq!(
+            codes(&pdf(&[form, &template, &data])),
+            ["pdf.xfa", "pdf.javascript"]
+        );
+        // A form with fields and no script is only an XFA form.
+        assert_eq!(codes(&pdf(&[form, &data, &data])), ["pdf.xfa"]);
+
+        let single = b"<< /AcroForm << /XFA 2 0 R >> >>";
+        let wide: Vec<u8> = "<script>x</script>"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            codes(&pdf(&[single, &stream("", &wide)])),
+            ["pdf.xfa", "pdf.javascript"]
+        );
+        let unreadable = stream("/Filter /FlateDecode", b"\xFF\xFF\xFF");
+        assert_eq!(
+            codes(&pdf(&[single, &unreadable])),
+            ["pdf.xfa", "pdf.malformed"]
+        );
+    }
+
     #[test]
     fn encryption_and_other_features() {
         let mut encrypted = pdf(&[CATALOG]);
         encrypted.extend_from_slice(b"trailer\n<< /Root 1 0 R /Encrypt 7 0 R >>\n%%EOF\n");
         assert_eq!(
-            codes(&encrypted),
-            ["pdf.encrypted", "pdf.incremental_update"]
+            run(&encrypted),
+            [
+                ("pdf.encrypted", Severity::Medium),
+                ("pdf.incremental_update", Severity::Info),
+            ]
         );
 
         let form = b"<< /AcroForm << /XFA 8 0 R >> >>";

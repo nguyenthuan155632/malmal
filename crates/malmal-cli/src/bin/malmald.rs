@@ -1,49 +1,54 @@
-//! Scanning daemon on a Unix socket.
-//!
-//! A request is one line of JSON, `{"size": N, "filename": ..., "content_type": ...}`
-//! (the last two optional), followed by exactly N bytes of file content. The
-//! reply is one line of JSON: `{"ok": true, "report": {...}}` or
-//! `{"ok": false, "error": "..."}`. A connection may carry any number of
-//! requests. Anything but `"ok": true` means the file was not scanned.
+//! Scanning daemon. It listens on any of three endpoints, each with its own
+//! protocol; see [`malmal_cli::serve`] for what they carry.
 
 #![forbid(unsafe_code)]
 
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use malmal::{Limits, ScanHints, Scanner};
 use malmal_cli::options::{self, Common};
 use malmal_cli::sandbox;
-use serde::Deserialize;
+use malmal_cli::serve::{self, Service};
 
 const USAGE: &str = "\
-Usage: malmald --socket <PATH> [OPTIONS]
+Usage: malmald (--socket <PATH> | --http <ADDR> | --clamd <ADDR>)... [OPTIONS]
+
+An ADDR is host:port, or the path of a Unix socket.
 
 Options:
-  --socket <PATH>      Unix socket to listen on (created with mode 0660)
-  --workers <N>        Connections served at once [default: 4]
+  --socket <PATH>      Unix socket for the JSON protocol (created with mode 0660)
+  --http <ADDR>        HTTP: POST /scan, GET /metrics, GET /healthz
+  --clamd <ADDR>       ClamAV daemon protocol (PING, VERSION, INSTREAM)
+  --workers <N>        Connections served at once on each endpoint [default: 4]
   --timeout <SECONDS>  Idle time before a connection is dropped [default: 30]";
 
-const MAX_HEADER_LEN: u64 = 16 << 10;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Protocol {
+    Json,
+    Http,
+    Clamd,
+}
 
-#[derive(Deserialize)]
-struct Request {
-    size: u64,
-    #[serde(default)]
-    filename: Option<String>,
-    #[serde(default)]
-    content_type: Option<String>,
+impl Protocol {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Http => "http",
+            Self::Clamd => "clamd",
+        }
+    }
 }
 
 struct Args {
-    socket: PathBuf,
+    endpoints: Vec<(Protocol, String)>,
     workers: usize,
     timeout: Duration,
     common: Common,
@@ -57,14 +62,16 @@ fn usage() -> String {
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
-    let mut socket = None;
+    let mut endpoints = Vec::new();
     let mut workers = 4;
     let mut timeout = 30;
     let mut common = Common::default();
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
         match arg.as_str() {
-            "--socket" => socket = Some(PathBuf::from(value("--socket")?)),
+            "--socket" => endpoints.push((Protocol::Json, value("--socket")?)),
+            "--http" => endpoints.push((Protocol::Http, value("--http")?)),
+            "--clamd" => endpoints.push((Protocol::Clamd, value("--clamd")?)),
             "--workers" => {
                 workers = value("--workers")?
                     .parse()
@@ -86,79 +93,119 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             }
         }
     }
+    if endpoints.is_empty() {
+        return Err("one of --socket, --http or --clamd is required".into());
+    }
     Ok(Args {
-        socket: socket.ok_or("--socket is required")?,
+        endpoints,
         workers,
         timeout: Duration::from_secs(timeout),
         common,
     })
 }
 
-fn listen(path: &Path) -> io::Result<UnixListener> {
-    // A socket left behind by a previous run would make bind fail.
-    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket()) {
-        fs::remove_file(path)?;
+enum Listener {
+    Unix(UnixListener),
+    Tcp(TcpListener),
+}
+
+enum Stream {
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl Listener {
+    /// `--socket` always names a path; the other endpoints do when the
+    /// address has a slash in it.
+    fn bind(protocol: Protocol, address: &str) -> io::Result<(Self, String)> {
+        if protocol != Protocol::Json && !address.contains('/') {
+            let listener = TcpListener::bind(address)?;
+            // The port may have been chosen by the system.
+            let bound = listener.local_addr()?.to_string();
+            return Ok((Self::Tcp(listener), bound));
+        }
+        let path = Path::new(address);
+        // A socket left behind by a previous run would make bind fail.
+        if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket()) {
+            fs::remove_file(path)?;
+        }
+        let listener = UnixListener::bind(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o660))?;
+        Ok((Self::Unix(listener), address.to_string()))
     }
-    let listener = UnixListener::bind(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o660))?;
-    Ok(listener)
+
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(match self {
+            Self::Unix(listener) => Self::Unix(listener.try_clone()?),
+            Self::Tcp(listener) => Self::Tcp(listener.try_clone()?),
+        })
+    }
+
+    fn accept(&self) -> io::Result<Stream> {
+        Ok(match self {
+            Self::Unix(listener) => Stream::Unix(listener.accept()?.0),
+            Self::Tcp(listener) => Stream::Tcp(listener.accept()?.0),
+        })
+    }
 }
 
-fn reply(mut stream: &UnixStream, value: serde_json::Value) -> io::Result<()> {
-    let mut line = value.to_string();
-    line.push('\n');
-    stream.write_all(line.as_bytes())
+impl Stream {
+    fn set_timeout(&self, timeout: Duration) -> io::Result<()> {
+        match self {
+            Self::Unix(stream) => {
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))
+            }
+            Self::Tcp(stream) => {
+                // Replies are small and written whole; do not wait to batch them.
+                stream.set_nodelay(true)?;
+                stream.set_read_timeout(Some(timeout))?;
+                stream.set_write_timeout(Some(timeout))
+            }
+        }
+    }
 }
 
-fn reply_error(stream: &UnixStream, message: &str) -> io::Result<()> {
-    reply(stream, serde_json::json!({ "ok": false, "error": message }))
+impl Read for &Stream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Stream::Unix(stream) => (&*stream).read(buffer),
+            Stream::Tcp(stream) => (&*stream).read(buffer),
+        }
+    }
 }
 
-/// Serve requests on one connection until the peer closes it or misbehaves.
-fn serve(stream: &UnixStream, scanner: &Scanner, max_size: u64) -> io::Result<()> {
-    let mut reader = BufReader::new(stream);
+impl Write for &Stream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Unix(stream) => (&*stream).write(buffer),
+            Stream::Tcp(stream) => (&*stream).write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Stream::Unix(stream) => (&*stream).flush(),
+            Stream::Tcp(stream) => (&*stream).flush(),
+        }
+    }
+}
+
+fn worker(listener: Listener, protocol: Protocol, service: Arc<Service>, timeout: Duration) {
     loop {
-        let mut header = String::new();
-        if reader
-            .by_ref()
-            .take(MAX_HEADER_LEN)
-            .read_line(&mut header)?
-            == 0
-        {
-            return Ok(());
-        }
-        let request: Request = match serde_json::from_str(&header) {
-            Ok(request) => request,
-            Err(error) => return reply_error(stream, &format!("invalid request: {error}")),
+        let Ok(stream) = listener.accept() else {
+            continue;
         };
-        // The body cannot be skipped safely, so the connection ends here.
-        if request.size > max_size {
-            return reply_error(stream, "file exceeds the size limit");
+        if stream.set_timeout(timeout).is_err() {
+            continue;
         }
-        let mut body = vec![0; request.size as usize];
-        reader.read_exact(&mut body)?;
-
-        let hints = ScanHints {
-            filename: request.filename.as_deref(),
-            content_type: request.content_type.as_deref(),
+        let mut reader = BufReader::new(&stream);
+        // Errors here are the peer's: a timeout, a reset, a short body.
+        let _ = match protocol {
+            Protocol::Json => serve::json(&mut reader, &stream, &service),
+            Protocol::Http => serve::http(&mut reader, &stream, &service),
+            Protocol::Clamd => serve::clamd(&mut reader, &stream, &service),
         };
-        match catch_unwind(AssertUnwindSafe(|| scanner.scan_bytes(&body, hints))) {
-            Ok(report) => reply(stream, serde_json::json!({ "ok": true, "report": report }))?,
-            Err(_) => reply_error(stream, "internal error while scanning")?,
-        }
-    }
-}
-
-fn worker(listener: UnixListener, scanner: Scanner, timeout: Duration, max_size: u64) {
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        let configured = stream
-            .set_read_timeout(Some(timeout))
-            .and_then(|()| stream.set_write_timeout(Some(timeout)));
-        if configured.is_ok() {
-            // Errors here are the peer's: a timeout, a reset, a short body.
-            let _ = serve(&stream, &scanner, max_size);
-        }
     }
 }
 
@@ -175,13 +222,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let listener = match listen(&args.socket) {
-        Ok(listener) => listener,
-        Err(error) => {
-            eprintln!("malmald: {}: {error}", args.socket.display());
-            return ExitCode::FAILURE;
+    let mut listeners = Vec::new();
+    for (protocol, address) in &args.endpoints {
+        match Listener::bind(*protocol, address) {
+            Ok((listener, bound)) => listeners.push((*protocol, listener, bound)),
+            Err(error) => {
+                eprintln!("malmald: {address}: {error}");
+                return ExitCode::FAILURE;
+            }
         }
-    };
+    }
     let scanner = match args.common.scanner() {
         Ok(scanner) => scanner,
         Err(message) => {
@@ -190,31 +240,40 @@ fn main() -> ExitCode {
         }
     };
 
-    // The socket is open; the file system is not needed again.
+    // The sockets are open; the file system is not needed again, and the
+    // sandbox forbids opening any more of them.
     match sandbox::enter(args.common.sandbox, &[], options::MEMORY_LIMIT) {
-        Ok(status) => eprintln!(
-            "malmald: listening on {} (sandbox: file system {}, system calls {})",
-            args.socket.display(),
-            if status.filesystem { "on" } else { "off" },
-            if status.syscalls { "on" } else { "off" },
-        ),
+        Ok(status) => {
+            let endpoints: Vec<String> = listeners
+                .iter()
+                .map(|(protocol, _, bound)| format!("{bound} ({})", protocol.name()))
+                .collect();
+            eprintln!(
+                "malmald: listening on {} (sandbox: file system {}, system calls {})",
+                endpoints.join(", "),
+                if status.filesystem { "on" } else { "off" },
+                if status.syscalls { "on" } else { "off" },
+            );
+        }
         Err(message) => {
             eprintln!("malmald: {message}");
             return ExitCode::FAILURE;
         }
     }
 
-    let max_size = Limits::default().max_file_size;
+    let service = Arc::new(Service::new(scanner));
     let mut handles = Vec::new();
-    for _ in 0..args.workers {
-        let Ok(listener) = listener.try_clone() else {
-            eprintln!("malmald: cannot share the listening socket");
-            return ExitCode::FAILURE;
-        };
-        let scanner = scanner.clone();
-        handles.push(thread::spawn(move || {
-            worker(listener, scanner, args.timeout, max_size)
-        }));
+    for (protocol, listener, _) in &listeners {
+        for _ in 0..args.workers {
+            let Ok(listener) = listener.try_clone() else {
+                eprintln!("malmald: cannot share the listening socket");
+                return ExitCode::FAILURE;
+            };
+            let (protocol, service, timeout) = (*protocol, Arc::clone(&service), args.timeout);
+            handles.push(thread::spawn(move || {
+                worker(listener, protocol, service, timeout)
+            }));
+        }
     }
     for handle in handles {
         let _ = handle.join();

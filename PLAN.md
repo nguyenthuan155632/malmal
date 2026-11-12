@@ -91,6 +91,7 @@ override severity per code.
 | | `hash.blocklisted`, `yara.match` | Critical |
 | Images | `image.malformed` | Medium |
 | | `image.trailing_data` (ignores zero padding and JPEG MPF frames) | Low |
+| | `image.compressed_metadata` (Brotli-compressed metadata box in a JPEG XL file, not decompressed) | Info |
 | | `image.vendor_trailer` (a complete Samsung metadata trailer or motion photo video after the image) | Info |
 | | `image.polyglot` (the excess is ZIP/PDF/PE/ELF/HTML; a PDF header in the first 1024 bytes; a ZIP record ending the file) | High |
 | | `image.metadata.payload` (code in compressed PNG chunks `zTXt`/`iTXt`/`iCCP`) | High |
@@ -108,7 +109,9 @@ override severity per code.
 | | `pdf.embedded_file` (embedded files are also scanned recursively), `pdf.rich_media`, `pdf.xfa` | Medium |
 | | `pdf.submit_form`, `pdf.remote_goto`, `pdf.uri` | Low (`uri` is Info) |
 | | `pdf.obfuscated_name` (`#xx` in a sensitive key name) | High |
-| | `pdf.encrypted`, `pdf.malformed`, `pdf.incremental_update` | Medium / Medium / Info |
+| | `pdf.encrypted` | Medium; Info when the empty password opens it and the content was inspected |
+| | `pdf.malformed`, `pdf.incremental_update` | Medium / Info |
+| | `pdf.trailing_data` (bytes after the last `%%EOF`), `pdf.polyglot` (those bytes are a recognizable file, or a ZIP record ends the file) | Low / High |
 | PostScript | `ps.file_access` (`file` other than `%stdin`/`%stdout`, `run`, `deletefile`, `renamefile`, `status` on a file name, `/OutputFile` however the key is spelled) | High |
 | | `ps.device_access` (`putdeviceprops`, `selectdevice`, `finddevice`, `setdevice`, the `/OutputDevice` and `/Driver` keys) | High |
 | | `ps.pipe` (`%pipe%` anywhere, including written with escapes or hex) | Critical |
@@ -259,6 +262,29 @@ A milestone is done when `cargo test` is green, `cargo clippy -- -D warnings` is
 > strings read with `token`, and protocol filters. Changes to `errordict` and `systemdict` are
 > still not reported, because Adobe's own prologs make them.
 
+### M9 — Known limits, daemon protocols, API (0.2.0)
+
+Done after the first release, from the list of known limits and what a deployment needs.
+
+- [x] PDF: bytes after the last `%%EOF` (`pdf.trailing_data`, `pdf.polyglot`).
+- [x] PDF: the standard security handler with the empty user password, revisions 2 to 6
+      (RC4, AES-128, AES-256), checked against files written by qpdf. `md-5` and `aes` join
+      the dependencies; RC4 and CBC are a few lines each on top of them.
+- [x] PDF: XFA packets are searched for scripts; attachments go through the YARA rules.
+- [x] BigTIFF; PSD layer records, including the layer list of 16- and 32-bit documents.
+- [x] HEIC and AVIF (boxes, `ispe` sizes, `iloc` bounds), JPEG XL (size header, container
+      boxes), ICO (directory, PNG and bitmap images). Accepted by default.
+- [x] `malmald`: HTTP endpoint, Prometheus metrics, the ClamAV `INSTREAM` protocol,
+      `--max-size` and `--scan-timeout`. Listeners are opened before the sandbox is entered.
+- [x] `tests/corpus/expected.tsv` records every sample's findings; the `survey` example
+      measures a directory of real files; a nightly workflow fuzzes each target for longer.
+- [x] `docs/findings.md` (checked against the sources by a test), `docs/integration.md`.
+- [x] API: `FileType`, `Report` and `Finding` are `#[non_exhaustive]`; `payload`, `Budget`
+      and `LimitExceeded` are no longer public; every public item is documented.
+
+Not done: ICAP (the ClamAV protocol covers the same clients with far less code), decoding
+Brotli metadata in JPEG XL, decrypting PDFs that need a password.
+
 ## Order and dependencies
 
 ```
@@ -279,4 +305,5 @@ M3 and M4 are independent. M5 needs M4 because modern AI files are PDFs. M6 need
 
 - Image re-encoding (CDR): the strongest defense for raster images, and the natural next project.
 - Office (DOCX/XLSX macros), archives (recursive ZIP/RAR), video.
-- Decrypting password-protected PDFs.
+- Decrypting PDFs that need a password (the caller would have to supply it).
+- ICAP; prebuilt binaries, a container image and bindings for other languages.

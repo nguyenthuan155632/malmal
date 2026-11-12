@@ -2,6 +2,9 @@ use std::time::{Duration, Instant};
 
 use crate::report::{Finding, Severity};
 
+/// Resource limits for one scan. Whatever exceeds one is reported with a
+/// `limit.*` finding, so a file that was not analyzed to the end is never
+/// clean.
 #[derive(Debug, Clone)]
 pub struct Limits {
     /// Inputs larger than this are truncated and flagged `limit.size`.
@@ -10,6 +13,8 @@ pub struct Limits {
     pub max_decompressed: u64,
     /// Nesting depth for embedded files scanned recursively.
     pub max_depth: u32,
+    /// Time the analyzers may spend on one scan. It is checked between
+    /// steps, so a scan can run somewhat longer than this.
     pub max_duration: Duration,
     /// Images declaring more pixels than this are flagged `image.pixel_bomb`.
     pub max_pixels: u64,
@@ -27,8 +32,9 @@ impl Default for Limits {
     }
 }
 
+/// A limit a scan ran into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LimitExceeded {
+pub(crate) enum LimitExceeded {
     Decompression,
     Depth,
     Time,
@@ -60,7 +66,7 @@ impl LimitExceeded {
 
 /// Per-scan resource budget shared by every analyzer and decoder.
 #[derive(Debug)]
-pub struct Budget {
+pub(crate) struct Budget {
     decompressed_left: u64,
     depth_left: u32,
     deadline: Instant,

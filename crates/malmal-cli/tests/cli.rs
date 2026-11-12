@@ -263,6 +263,94 @@ fn daemon_scans_over_a_unix_socket() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// Start the daemon on a system-chosen TCP port and return that address.
+fn daemon_on_tcp(option: &str) -> (Daemon, String) {
+    let mut child = Command::new(MALMALD)
+        .args([option, "127.0.0.1:0", "--timeout", "5"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut banner = String::new();
+    BufReader::new(child.stderr.take().unwrap())
+        .read_line(&mut banner)
+        .unwrap();
+    let address = banner
+        .strip_prefix("malmald: listening on ")
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap_or_else(|| panic!("unexpected banner {banner:?}"))
+        .to_string();
+    (Daemon(child), address)
+}
+
+#[test]
+fn daemon_scans_over_http() {
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    let (_daemon, address) = daemon_on_tcp("--http");
+    let exchange = |request: Vec<u8>| {
+        let mut stream = TcpStream::connect(&address).unwrap();
+        stream.write_all(&request).unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).unwrap();
+        reply
+    };
+    let post = |name: &str, body: &[u8]| {
+        let mut request = format!(
+            "POST /scan?filename={name} HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        exchange(request)
+    };
+
+    let reply = post("ok.png", &valid_png());
+    assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+    assert!(reply.contains(r#""verdict":"clean""#), "{reply}");
+    let reply = post("photo.jpg", ELF);
+    assert!(reply.contains(r#""verdict":"malicious""#), "{reply}");
+
+    let metrics = exchange(b"GET /metrics HTTP/1.1\r\nConnection: close\r\n\r\n".to_vec());
+    assert!(
+        metrics.contains("malmal_scans_total{verdict=\"malicious\"} 1"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn daemon_answers_clamd_clients() {
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    let (_daemon, address) = daemon_on_tcp("--clamd");
+    let instream = |body: &[u8]| {
+        let mut stream = TcpStream::connect(&address).unwrap();
+        stream.write_all(b"zINSTREAM\0").unwrap();
+        stream
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .unwrap();
+        stream.write_all(body).unwrap();
+        stream.write_all(&[0; 4]).unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).unwrap();
+        reply
+    };
+    assert_eq!(instream(&valid_png()), "stream: OK\0");
+    assert_eq!(
+        instream(ELF),
+        "stream: Malmal.Malicious.type.executable FOUND\0"
+    );
+}
+
+#[test]
+fn daemon_needs_an_endpoint() {
+    let output = Command::new(MALMALD).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stderr).unwrap();
+    assert!(text.contains("--socket, --http or --clamd"), "{text}");
+}
+
 /// Landlock and seccomp bind the calling thread, so the restrictions can be
 /// observed from inside a thread without affecting the other tests.
 #[test]

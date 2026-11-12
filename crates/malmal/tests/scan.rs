@@ -536,5 +536,16 @@ fn yara_rules_add_findings() {
     assert!(report.has("yara.match"), "{:?}", report.findings);
     assert!(report.findings.iter().any(|f| f.message.contains("marker")));
 
+    // A compressed attachment is matched on what it unpacks to.
+    let attachment = pdf_stream(
+        "/Type /EmbeddedFile /Filter /FlateDecode",
+        &compress_to_vec_zlib(b"notes MALMAL-TEST-MARKER", 6),
+    );
+    let report = scanner.scan_bytes(
+        &pdf(&[PDF_CATALOG, PDF_PAGES, &attachment]),
+        ScanHints::default(),
+    );
+    assert!(report.has("yara.match"), "{:?}", report.findings);
+
     assert!(malmal::YaraRules::compile(["rule broken {"]).is_err());
 }

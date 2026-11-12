@@ -4,7 +4,10 @@
 
 mod bmp;
 mod gif;
+mod ico;
+mod isobmff;
 mod jpeg;
+mod jxl;
 mod png;
 mod psd;
 mod tiff;
@@ -72,6 +75,9 @@ pub(crate) fn analyze(
         FileType::Bmp => bmp::parse(data),
         FileType::Tiff => tiff::parse(data),
         FileType::Psd => psd::parse(data),
+        FileType::Heif | FileType::Avif => isobmff::parse(data),
+        FileType::Jxl => jxl::parse(data, &mut Ctx { budget, findings }),
+        FileType::Ico => ico::parse(data, &mut Ctx { budget, findings }),
         _ => return,
     };
     match parsed {
@@ -173,7 +179,7 @@ fn check_polyglot(data: &[u8], findings: &mut Vec<Finding>) {
             )
             .at(offset),
         );
-    } else if let Some(offset) = zip_end_record(data) {
+    } else if let Some(offset) = detect::zip_end_record(data) {
         findings.push(
             Finding::new(
                 "image.polyglot",
@@ -183,26 +189,6 @@ fn check_polyglot(data: &[u8], findings: &mut Vec<Finding>) {
             .at(offset),
         );
     }
-}
-
-const ZIP_EOCD_LEN: usize = 22;
-
-/// ZIP readers find the archive from the end of the file. An end record whose
-/// comment length runs exactly to EOF is not a coincidence.
-fn zip_end_record(data: &[u8]) -> Option<usize> {
-    let window_start = data.len().saturating_sub(ZIP_EOCD_LEN + u16::MAX as usize);
-    let window = &data[window_start..];
-    let mut from = 0;
-    while let Some(index) = find(&window[from..], b"PK\x05\x06") {
-        let at = from + index;
-        if let Some(comment_len) = le16(window, at + 20)
-            && at + ZIP_EOCD_LEN + comment_len as usize == window.len()
-        {
-            return Some(window_start + at);
-        }
-        from = at + 1;
-    }
-    None
 }
 
 fn bytes<const N: usize>(data: &[u8], offset: usize) -> Option<[u8; N]> {

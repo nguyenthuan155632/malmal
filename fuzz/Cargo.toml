@@ -91,3 +91,31 @@ path = "fuzz_targets/psd.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "heif"
+path = "fuzz_targets/heif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jxl"
+path = "fuzz_targets/jxl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ico"
+path = "fuzz_targets/ico.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bigtiff"
+path = "fuzz_targets/bigtiff.rs"
+test = false
+doc = false
+bench = false

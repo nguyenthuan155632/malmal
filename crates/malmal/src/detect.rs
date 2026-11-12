@@ -5,32 +5,60 @@ use serde::Serialize;
 
 use crate::payload::find;
 
+/// A file type as told from the content. More types may be added in a
+/// minor release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum FileType {
+    /// JPEG.
     Jpeg,
+    /// PNG.
     Png,
+    /// GIF.
     Gif,
+    /// WebP.
     Webp,
+    /// Windows bitmap.
     Bmp,
+    /// TIFF or BigTIFF.
     Tiff,
     /// Photoshop PSD or PSB.
     Psd,
+    /// HEIF with HEVC-coded images, as phones write it (`.heic`).
+    Heif,
+    /// AVIF.
+    Avif,
+    /// JPEG XL, as a bare codestream or in its container.
+    Jxl,
+    /// Windows icon.
+    Ico,
+    /// SVG, plain or gzip-compressed.
     Svg,
+    /// PDF, which includes Illustrator files since version 9.
     Pdf,
+    /// PostScript, EPS and older Illustrator files.
     PostScript,
+    /// ZIP archive, which includes Office documents.
     Zip,
+    /// gzip stream that does not hold an SVG.
     Gzip,
+    /// HTML.
     Html,
+    /// Windows executable or library.
     Pe,
+    /// Linux executable or library.
     Elf,
+    /// macOS executable, or a Java class file.
     MachO,
     /// Text starting with a `#!` interpreter line.
     Script,
+    /// None of the above.
     Unknown,
 }
 
 impl FileType {
+    /// Lowercase name, as used in reports and on the command line.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Jpeg => "jpeg",
@@ -40,6 +68,10 @@ impl FileType {
             Self::Bmp => "bmp",
             Self::Tiff => "tiff",
             Self::Psd => "psd",
+            Self::Heif => "heif",
+            Self::Avif => "avif",
+            Self::Jxl => "jxl",
+            Self::Ico => "ico",
             Self::Svg => "svg",
             Self::Pdf => "pdf",
             Self::PostScript => "postscript",
@@ -56,7 +88,7 @@ impl FileType {
 
     /// The type that [`Self::as_str`] spells as `name`.
     pub fn from_name(name: &str) -> Option<Self> {
-        const ALL: [FileType; 18] = [
+        const ALL: [FileType; 22] = [
             FileType::Jpeg,
             FileType::Png,
             FileType::Gif,
@@ -64,6 +96,10 @@ impl FileType {
             FileType::Bmp,
             FileType::Tiff,
             FileType::Psd,
+            FileType::Heif,
+            FileType::Avif,
+            FileType::Jxl,
+            FileType::Ico,
             FileType::Svg,
             FileType::Pdf,
             FileType::PostScript,
@@ -79,14 +115,26 @@ impl FileType {
         ALL.into_iter().find(|file_type| file_type.as_str() == name)
     }
 
+    /// Whether the type is a program: never acceptable as an upload.
     pub fn is_executable(self) -> bool {
         matches!(self, Self::Pe | Self::Elf | Self::MachO | Self::Script)
     }
 
+    /// Whether the type is a pixel image, where no code has a reason to be.
     pub fn is_raster_image(self) -> bool {
         matches!(
             self,
-            Self::Jpeg | Self::Png | Self::Gif | Self::Webp | Self::Bmp | Self::Tiff | Self::Psd
+            Self::Jpeg
+                | Self::Png
+                | Self::Gif
+                | Self::Webp
+                | Self::Bmp
+                | Self::Tiff
+                | Self::Psd
+                | Self::Heif
+                | Self::Avif
+                | Self::Jxl
+                | Self::Ico
         )
     }
 }
@@ -100,6 +148,7 @@ const MACHO_MAGICS: [[u8; 4]; 5] = [
     [0xCA, 0xFE, 0xBA, 0xBE],
 ];
 
+/// Tell the type of a file from its content.
 pub fn detect(data: &[u8]) -> FileType {
     if data.starts_with(b"\xFF\xD8\xFF") {
         return FileType::Jpeg;
@@ -122,6 +171,12 @@ pub fn detect(data: &[u8]) -> FileType {
     }
     if data.starts_with(b"8BPS\0\x01") || data.starts_with(b"8BPS\0\x02") {
         return FileType::Psd;
+    }
+    if let Some(image) = detect_isobmff(data) {
+        return image;
+    }
+    if data.starts_with(b"\xFF\x0A") || data.starts_with(JXL_CONTAINER) {
+        return FileType::Jxl;
     }
     if data.starts_with(b"\x7fELF") {
         return FileType::Elf;
@@ -151,6 +206,9 @@ pub fn detect(data: &[u8]) -> FileType {
     if is_bmp(data) {
         return FileType::Bmp;
     }
+    if is_ico(data) {
+        return FileType::Ico;
+    }
     // Readers accept the PDF header anywhere in the first 1024 bytes.
     if find(&data[..data.len().min(1024)], b"%PDF-").is_some() {
         return FileType::Pdf;
@@ -170,6 +228,80 @@ fn is_bmp(data: &[u8]) -> bool {
             u32::from_le_bytes([data[14], data[15], data[16], data[17]]),
             12 | 16 | 40 | 52 | 56 | 64 | 108 | 124
         )
+}
+
+const ZIP_EOCD_LEN: usize = 22;
+
+/// ZIP readers find the archive from the end of the file. An end record whose
+/// comment length runs exactly to EOF is not a coincidence.
+pub(crate) fn zip_end_record(data: &[u8]) -> Option<usize> {
+    let window_start = data.len().saturating_sub(ZIP_EOCD_LEN + u16::MAX as usize);
+    let window = &data[window_start..];
+    let mut from = 0;
+    while let Some(index) = find(&window[from..], b"PK\x05\x06") {
+        let at = from + index;
+        if let Some(&[low, high]) = window.get(at + 20..at + 22)
+            && at + ZIP_EOCD_LEN + u16::from_le_bytes([low, high]) as usize == window.len()
+        {
+            return Some(window_start + at);
+        }
+        from = at + 1;
+    }
+    None
+}
+
+/// The signature box that opens a JPEG XL container.
+const JXL_CONTAINER: &[u8] = b"\0\0\0\x0CJXL \r\n\x87\n";
+
+/// HEIF and AVIF share a container with MP4 video; the brands in the leading
+/// `ftyp` box tell them apart. Video is not an accepted type and stays unknown.
+fn detect_isobmff(data: &[u8]) -> Option<FileType> {
+    if data.get(4..8) != Some(b"ftyp") {
+        return None;
+    }
+    let size = u32::from_be_bytes(data[..4].try_into().ok()?) as usize;
+    let brands = data.get(8..size.clamp(12, 264).min(data.len()))?;
+    // The major brand, a version word, then the compatible brands.
+    let mut brands = brands.as_chunks::<4>().0.iter().enumerate();
+    let is_avif = |brand: &[u8; 4]| matches!(brand, b"avif" | b"avis");
+    let is_heif = |brand: &[u8; 4]| {
+        matches!(
+            brand,
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis" | b"hevm" | b"hevs"
+        )
+    };
+    let (_, major) = brands.next()?;
+    if is_avif(major) {
+        return Some(FileType::Avif);
+    }
+    if is_heif(major) {
+        return Some(FileType::Heif);
+    }
+    // A generic image brand: the compatible brands name the codec.
+    if !matches!(major, b"mif1" | b"msf1" | b"miaf") {
+        return None;
+    }
+    let compatible: Vec<&[u8; 4]> = brands.filter(|(i, _)| *i != 1).map(|(_, b)| b).collect();
+    if compatible.iter().any(|brand| is_avif(brand)) {
+        Some(FileType::Avif)
+    } else {
+        Some(FileType::Heif)
+    }
+}
+
+/// The icon signature is four bytes shared with plenty of binary data, so
+/// the first directory entry must also make sense.
+fn is_ico(data: &[u8]) -> bool {
+    let (Some(header), Some(entry)) = (data.get(..6), data.get(6..22)) else {
+        return false;
+    };
+    let count = u16::from_le_bytes([header[4], header[5]]) as usize;
+    let offset = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
+    header.starts_with(b"\0\0\x01\0")
+        && count > 0
+        && entry[3] == 0
+        && offset >= 6 + count * 16
+        && offset < data.len()
 }
 
 fn skip_bom_and_whitespace(data: &[u8]) -> &[u8] {
@@ -209,6 +341,10 @@ pub fn types_for_extension(ext: &str) -> Option<&'static [FileType]> {
         "bmp" | "dib" => &[FileType::Bmp],
         "tif" | "tiff" => &[FileType::Tiff],
         "psd" | "psb" => &[FileType::Psd],
+        "heic" | "heif" | "hif" => &[FileType::Heif],
+        "avif" => &[FileType::Avif],
+        "jxl" => &[FileType::Jxl],
+        "ico" => &[FileType::Ico],
         // A gzip-wrapped SVG is reported as the SVG it contains.
         "svg" | "svgz" => &[FileType::Svg],
         "pdf" => &[FileType::Pdf],
@@ -218,6 +354,7 @@ pub fn types_for_extension(ext: &str) -> Option<&'static [FileType]> {
     })
 }
 
+/// Types a `Content-Type` value claims, ignoring its parameters.
 pub fn types_for_mime(content_type: &str) -> Option<&'static [FileType]> {
     let mime = content_type.split(';').next().unwrap_or("").trim();
     Some(match mime.to_ascii_lowercase().as_str() {
@@ -233,6 +370,12 @@ pub fn types_for_mime(content_type: &str) -> Option<&'static [FileType]> {
         | "application/photoshop"
         | "application/x-photoshop"
         | "application/psd" => &[FileType::Psd],
+        "image/heic" | "image/heif" | "image/heic-sequence" | "image/heif-sequence" => {
+            &[FileType::Heif]
+        }
+        "image/avif" | "image/avif-sequence" => &[FileType::Avif],
+        "image/jxl" => &[FileType::Jxl],
+        "image/x-icon" | "image/vnd.microsoft.icon" | "image/ico" => &[FileType::Ico],
         "image/svg+xml" => &[FileType::Svg],
         "application/pdf" => &[FileType::Pdf],
         "application/eps" | "application/x-eps" | "image/x-eps" => &[FileType::PostScript],
@@ -285,6 +428,51 @@ mod tests {
         assert_eq!(detect(b"\xCF\xFA\xED\xFE\x07"), FileType::MachO);
         assert_eq!(detect(b"PK\x03\x04\x14\0"), FileType::Zip);
         assert_eq!(detect(b"#!/bin/sh\nid\n"), FileType::Script);
+    }
+
+    #[test]
+    fn tells_images_from_video_by_brand() {
+        assert_eq!(
+            detect(b"\0\0\0\x18ftypheic\0\0\0\0mif1heic"),
+            FileType::Heif
+        );
+        assert_eq!(
+            detect(b"\0\0\0\x1Cftypavif\0\0\0\0avifmif1miaf"),
+            FileType::Avif
+        );
+        assert_eq!(
+            detect(b"\0\0\0\x18ftypmif1\0\0\0\0mif1avif"),
+            FileType::Avif
+        );
+        assert_eq!(
+            detect(b"\0\0\0\x18ftypmif1\0\0\0\0mif1heic"),
+            FileType::Heif
+        );
+        assert_eq!(
+            detect(b"\0\0\0\x18ftypisom\0\0\0\0isommp42"),
+            FileType::Unknown
+        );
+        assert_eq!(detect(b"\0\0\0\x14ftypqt  \0\0\0\0qt  "), FileType::Unknown);
+        // The compatible brands end where the box does.
+        assert_eq!(detect(b"\0\0\0\x10ftypmif1\0\0\0\0avif"), FileType::Heif);
+    }
+
+    #[test]
+    fn detects_jpeg_xl_and_icons() {
+        assert_eq!(detect(b"\xFF\x0A\x7F\x04"), FileType::Jxl);
+        assert_eq!(
+            detect(b"\0\0\0\x0CJXL \r\n\x87\n\0\0\0\x14ftyp"),
+            FileType::Jxl
+        );
+
+        let mut icon = b"\0\0\x01\0\x01\0".to_vec();
+        icon.extend_from_slice(&[16, 16, 0, 0, 1, 0, 32, 0, 40, 0, 0, 0, 22, 0, 0, 0]);
+        icon.extend_from_slice(&[0; 40]);
+        assert_eq!(detect(&icon), FileType::Ico);
+        // The same four bytes with an entry that points nowhere.
+        icon[18] = 5;
+        assert_eq!(detect(&icon), FileType::Unknown);
+        assert_eq!(detect(b"\0\0\x01\0\0\0 and then zeroes"), FileType::Unknown);
     }
 
     #[test]

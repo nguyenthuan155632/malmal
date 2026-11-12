@@ -21,6 +21,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Known-good files must come back clean
+        run: cargo run --release -p malmal --example survey -- --expect-clean tests/corpus/clean
       - name: Build static binaries
         run: cargo build --release --workspace --target x86_64-unknown-linux-musl
       - name: Binaries must not link dynamically

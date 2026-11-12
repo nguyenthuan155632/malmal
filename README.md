@@ -1,7 +1,8 @@
 # malmal
 
 A Rust library that scans uploaded files before a backend processes them: raster images
-(JPEG, PNG, GIF, WebP, BMP, TIFF, PSD), SVG, PDF, PostScript/EPS and Illustrator files. It does not compete with antivirus on
+(JPEG, PNG, GIF, WebP, BMP, TIFF, PSD, HEIC, AVIF, JPEG XL, ICO), SVG, PDF, PostScript/EPS and
+Illustrator files. It does not compete with antivirus on
 signature count; it checks three things antivirus usually skips:
 
 1. **Is the file the type it claims to be** (content against extension and `Content-Type`).
@@ -25,7 +26,7 @@ The output is in `target/x86_64-unknown-linux-musl/release/`:
 | File | What it is |
 |---|---|
 | `malmal` | CLI, fully statically linked |
-| `malmald` | Daemon on a Unix socket, fully statically linked |
+| `malmald` | Daemon (Unix socket, HTTP, ClamAV protocol), fully statically linked |
 | `libmalmal_ffi.a` | Static library for C; the header is `crates/malmal-ffi/include/malmal.h` |
 
 Both binaries run on a bare Debian install with no extra packages.
@@ -42,8 +43,14 @@ suite has not been run on macOS.
 
 ### Installing the commands
 
-Building does not put anything on your `PATH`. Either run the binary by path
-(`./target/release/malmal`), or install `malmal` and `malmald` into `~/.cargo/bin`:
+The released version installs from crates.io, without cloning anything:
+
+```bash
+cargo install malmal-cli
+```
+
+From a checkout, building does not put anything on your `PATH`. Either run the binary by
+path (`./target/release/malmal`), or install `malmal` and `malmald` into `~/.cargo/bin`:
 
 ```bash
 cargo install --path crates/malmal-cli
@@ -77,7 +84,9 @@ stops by itself at the size limit.
   time (10 seconds) and pixel count (2^28).
 - **`HashList`** is a SHA-256 blocklist that reads `sha256sum` output directly.
 
-The full table of finding codes is in [PLAN.md](PLAN.md).
+Every finding code, with its severity and what to do about it, is in
+[docs/findings.md](docs/findings.md). Examples for axum and actix-web are in
+[docs/integration.md](docs/integration.md).
 
 ## CLI
 
@@ -92,7 +101,7 @@ is accepted by default, so a service that only wants PDF-based Illustrator files
 refuses PostScript with:
 
 ```bash
-malmal scan --types jpeg,png,gif,webp,bmp,tiff,psd,svg,pdf upload.ai
+malmal scan --types jpeg,png,gif,webp,bmp,tiff,psd,heif,avif,jxl,ico,svg,pdf upload.ai
 ```
 
 `malmald` takes the same option. From Rust it is `Policy::with_allowed_types`.
@@ -105,18 +114,25 @@ error; `--no-sandbox` disables confinement. The sandbox exists on Linux only.
 ## Daemon
 
 ```bash
-malmald --socket /run/malmal.sock --workers 8 --require-sandbox
+malmald --socket /run/malmal.sock --http 127.0.0.1:8080 --workers 8 --require-sandbox
 ```
 
-Each request is one JSON line followed by exactly `size` bytes of file content:
+`malmald` serves any combination of three endpoints:
 
-```
-{"size": 1234, "filename": "a.png", "content_type": "image/png"}\n<1234 bytes>
+| Option | Protocol |
+|---|---|
+| `--socket <PATH>` | One JSON line, then the file, on a Unix socket |
+| `--http <ADDR>` | `POST /scan` with the file as the body; `GET /metrics` for Prometheus; `GET /healthz` |
+| `--clamd <ADDR>` | The `INSTREAM` command of ClamAV's daemon, for clients that already speak it |
+
+```bash
+curl --data-binary @upload.pdf 'http://127.0.0.1:8080/scan?filename=upload.pdf'
 ```
 
-The reply is one JSON line: `{"ok": true, "report": {...}}` or
-`{"ok": false, "error": "..."}`. A connection can carry many requests. Anything other than
-`"ok": true` means the file was not scanned.
+The reply is `{"ok": true, "report": {...}}`; anything else means the file was not scanned.
+The daemon has no authentication: bind it to the loopback interface or a Unix socket.
+`--max-size` and `--scan-timeout` set the limits for every request. The protocols, the
+metrics and client examples are in [docs/integration.md](docs/integration.md).
 
 ## Using it from C
 
@@ -154,6 +170,12 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
 
 - `tests/corpus/clean` and `tests/corpus/malicious` are scanned by `cargo test`; drop real
   files in to add test cases.
+- `tests/corpus/expected.tsv` records the verdict and findings of every sample. A change to
+  an analyzer fails the test with the samples that moved; record an intended change with
+  `MALMAL_RECORD=1 cargo test -p malmal --test corpus`.
+- `cargo run --release --example survey -- --expect-clean DIR...` scans a directory of
+  known-good files and lists those that did not come back clean: the false-positive rate on
+  your own uploads.
 - `fuzz/` has one target per format (`cargo fuzz list`).
 - `cargo run --release --example throughput -- FILE...` measures throughput.
 
@@ -171,17 +193,26 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
 - **Short tags (`<?=`, `<%=`, `<%@`) in images are reported only as complete tags**: text that
   is closed, balanced and reaches a call or variable. Uncompressed pixels otherwise match
   them by chance.
-- **PSD layers are not parsed.** The header, the image resource blocks and the end of the
-  merged image are checked, and the whole file is searched for payloads.
+- **No pixel data is decoded.** For HEIC and AVIF the boxes, the declared sizes and the item
+  locations are checked, not the HEVC or AV1 stream.
+- **A bare JPEG XL codestream has no end that can be found without decoding it**, so data
+  appended to one is not reported as trailing data; it is still searched for payloads. In the
+  boxed form the end is known. Brotli-compressed metadata boxes are not decompressed and are
+  reported as `image.compressed_metadata` at Info.
+- **PSD layer records are walked, layer pixels are not decoded.** In 16- and 32-bit
+  documents the layer list sits in an extra block, which is read when the block is found.
 - **Phone camera trailers** (Samsung metadata, motion photo video) are reported as
   `image.vendor_trailer` at Info when their structure accounts for every byte; raise it with
   `with_override` to reject them. Other trailing data stays `image.trailing_data`.
 - **Changes to `errordict` and `systemdict` are not reported.** Exploits use them to keep
   running after an error, and so does the prolog of every Illustrator EPS.
-- **Encrypted PDFs are not decrypted**, including those with an empty password; they yield
-  `pdf.encrypted`.
-- **XFA content and data after a PDF's `%%EOF` are not analyzed.**
-- **BigTIFF is not supported** and is reported as `image.malformed`.
-- **Files embedded in a PDF do not go through YARA.**
+- **PDFs that need a password are not decrypted** and yield `pdf.encrypted` at Medium. Those
+  encrypted with an empty password, which every reader opens without asking, are decrypted
+  and inspected. Only the standard security handler is supported, not certificate encryption.
+- **Strings in a PDF are not inspected**, encrypted or not: JavaScript is reported because
+  it is there, not for what it does.
+- **XFA forms are searched for scripts and nothing else.**
+- **The ClamAV protocol carries no file name**, so `type.mismatch` and
+  `name.dangerous_extension` cannot be reported over it.
 - Office documents, archives and video are out of scope; they are rejected with
   `type.not_allowed` or `type.unknown`.

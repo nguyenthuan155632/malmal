@@ -5,6 +5,7 @@ use std::fmt;
 #[derive(Debug, Clone, Default)]
 pub struct HashList(HashSet<[u8; 32]>);
 
+/// A line of a blocklist that could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HashListError {
     /// 1-based line of the entry that is not a SHA-256 hex digest.
@@ -36,18 +37,22 @@ impl HashList {
         Ok(list)
     }
 
+    /// Add one digest.
     pub fn insert(&mut self, hash: [u8; 32]) {
         self.0.insert(hash);
     }
 
+    /// Whether `hash` is on the list.
     pub fn contains(&self, hash: &[u8; 32]) -> bool {
         self.0.contains(hash)
     }
 
+    /// Number of digests on the list.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Whether the list has no digests.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

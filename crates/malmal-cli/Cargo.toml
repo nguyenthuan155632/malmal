@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "../../README.md"
 keywords = ["malware", "scanner", "upload", "security", "cli"]
 categories = ["command-line-utilities"]
 
@@ -18,7 +19,7 @@ name = "malmald"
 path = "src/bin/malmald.rs"
 
 [dependencies]
-malmal = { path = "../malmal", version = "0.1.0" }
+malmal = { path = "../malmal", version = "0.2.0" }
 serde.workspace = true
 serde_json.workspace = true
 

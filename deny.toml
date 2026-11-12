@@ -29,10 +29,6 @@ allow = [
     "CC0-1.0",
 ]
 
-# The workspace crates carry no license yet and are marked `publish = false`.
-[licenses.private]
-ignore = true
-
 [bans]
 multiple-versions = "allow"
 wildcards = "deny"

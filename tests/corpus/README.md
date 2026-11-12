@@ -11,3 +11,10 @@
 
 Add a file to the matching directory and the test covers it; no code changes
 are needed.
+
+`expected.tsv` records the verdict and finding codes of every file here and in
+`tests/prototypes/files`. The test fails when any of them moves, which is how
+a change to an analyzer shows what it did to real files. After adding a file,
+or when a change is intended, record the new state:
+
+    MALMAL_RECORD=1 cargo test -p malmal --test corpus

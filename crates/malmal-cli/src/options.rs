@@ -1,8 +1,9 @@
 //! Command-line options both binaries accept.
 
 use std::fs;
+use std::time::Duration;
 
-use malmal::{FileType, HashList, Policy, Scanner};
+use malmal::{FileType, HashList, Limits, Policy, Scanner};
 
 use crate::sandbox::Mode;
 
@@ -11,16 +12,22 @@ use crate::sandbox::Mode;
 #[cfg(not(feature = "yara"))]
 pub const HELP: &str = "  --policy <NAME>      default or strict [default: default]
   --types <LIST>       Accepted file types, comma-separated
-                       [default: jpeg,png,gif,webp,bmp,tiff,psd,svg,pdf,postscript]
+                       [default: jpeg,png,gif,webp,bmp,tiff,psd,heif,avif,jxl,ico,
+                       svg,pdf,postscript]
   --hashlist <FILE>    SHA-256 blocklist, one hex digest per line
+  --max-size <BYTES>   Largest file analyzed in full [default: 67108864]
+  --scan-timeout <S>   Seconds one scan may take [default: 10]
   --no-sandbox         Do not restrict the process
   --require-sandbox    Exit with an error if the sandbox cannot be applied";
 
 #[cfg(feature = "yara")]
 pub const HELP: &str = "  --policy <NAME>      default or strict [default: default]
   --types <LIST>       Accepted file types, comma-separated
-                       [default: jpeg,png,gif,webp,bmp,tiff,psd,svg,pdf,postscript]
+                       [default: jpeg,png,gif,webp,bmp,tiff,psd,heif,avif,jxl,ico,
+                       svg,pdf,postscript]
   --hashlist <FILE>    SHA-256 blocklist, one hex digest per line
+  --max-size <BYTES>   Largest file analyzed in full [default: 67108864]
+  --scan-timeout <S>   Seconds one scan may take [default: 10]
   --yara <PATH>        YARA rule file, or directory of .yar/.yara files (repeatable)
   --no-sandbox         Do not restrict the process
   --require-sandbox    Exit with an error if the sandbox cannot be applied";
@@ -39,6 +46,7 @@ pub struct Common {
     /// Replaces the policy's accepted types when given.
     pub types: Option<Vec<FileType>>,
     pub hashlist: HashList,
+    pub limits: Limits,
     pub sandbox: Mode,
     #[cfg(feature = "yara")]
     pub yara_sources: Vec<String>,
@@ -50,6 +58,7 @@ impl Default for Common {
             policy: Policy::default(),
             types: None,
             hashlist: HashList::default(),
+            limits: Limits::default(),
             sandbox: Mode::BestEffort,
             #[cfg(feature = "yara")]
             yara_sources: Vec::new(),
@@ -95,6 +104,21 @@ impl Common {
                 let path = rest.next().ok_or("--yara needs a value")?;
                 self.yara_sources.extend(read_rules(&path)?);
             }
+            "--max-size" => {
+                self.limits.max_file_size = rest
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|&bytes: &u64| bytes > 0)
+                    .ok_or("--max-size needs a positive number of bytes")?;
+            }
+            "--scan-timeout" => {
+                let seconds = rest
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|&seconds: &u64| seconds > 0)
+                    .ok_or("--scan-timeout needs a positive number of seconds")?;
+                self.limits.max_duration = Duration::from_secs(seconds);
+            }
             "--no-sandbox" => self.sandbox = Mode::Off,
             "--require-sandbox" => self.sandbox = Mode::Require,
             _ => return Ok(false),
@@ -111,6 +135,7 @@ impl Common {
             None => self.policy.clone(),
         };
         let builder = Scanner::builder()
+            .limits(self.limits.clone())
             .policy(policy)
             .hashlist(self.hashlist.clone());
         #[cfg(feature = "yara")]
