@@ -294,8 +294,11 @@ Done after the first release, from the list of known limits and what a deploymen
       and ARM64, attaches them to a GitHub release, pushes a multi-arch image to GHCR and
       publishes the crates when `CARGO_REGISTRY_TOKEN` is set.
 - [x] `Dockerfile` for building the same image from a checkout; `cargo binstall` metadata.
-- [x] `bindings/python`: a `ctypes` wrapper over the C library, tested in CI. It is not on
-      PyPI: a wheel would have to carry the library for each platform.
+- [x] `bindings/python`: a `ctypes` wrapper over the C library, tested in CI.
+- [x] Wheels that carry the library, for x86-64 and ARM64 Linux (`build_wheel.sh`, linked
+      against glibc 2.17 with cargo-zigbuild). The release workflow builds them, attaches
+      them to the release and uploads them to PyPI when `PYPI_PUBLISH` is set. No wheels
+      for macOS or Windows; there the package works from a checkout.
 
 ### M11 — Rebuilding images (CDR)
 
@@ -306,9 +309,23 @@ Done after the first release, from the list of known limits and what a deploymen
 - [x] Every sample that can be rebuilt is checked to come out clean; a fuzz target does the
       same with arbitrary input.
 
-Not done: animated PNG and WebP (no encoder), converting colour profiles instead of
-dropping them, HEIC/AVIF/JPEG XL (no pure-Rust decoder to depend on), rebuilding through
-the C interface.
+- [x] Animated PNG (written with the `png` crate) and animated WebP (the container is
+      assembled around lossless frames, the encoder having no animation support), with
+      delays and loop count. Checked against ffmpeg in both directions.
+- [x] RGB colour profiles are applied with `moxcms`, converting the pixels to sRGB; a
+      profile that is sRGB already leaves them untouched.
+- [x] `malmal_sanitize` in the C interface, `Scanner.sanitize` in Python.
+- [x] `malmal sanitize` writes through a second, sandboxed process and renames the result
+      into place, so the output is whole or untouched.
+
+Not done: HEIC/AVIF/JPEG XL (no pure-Rust decoder to depend on), animated PNG at 16 bits,
+CMYK and grey colour profiles.
+
+### M12 — A time limit that holds
+
+- [x] `--hard-timeout` and a watchdog thread in both commands: a scan or rebuild still
+      running after it ends the process with status 3. The library's limit stays a
+      cooperative one; `cdr::rebuild` now checks it between frames (`Error::TimedOut`).
 
 ## Order and dependencies
 
@@ -330,4 +347,4 @@ M3 and M4 are independent. M5 needs M4 because modern AI files are PDFs. M6 need
 
 - Office (DOCX/XLSX macros), archives (recursive ZIP/RAR), video.
 - Rebuilding PDF and SVG (CDR for documents): a different problem from pixels.
-- Bindings beyond C and Python; a wheel on PyPI.
+- Bindings beyond C and Python; wheels for macOS and Windows.

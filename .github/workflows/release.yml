@@ -1,8 +1,9 @@
 name: Release
 
-# Pushing the tag v<version> builds the binaries, attaches them to a GitHub
-# release, pushes the container image and, when the CARGO_REGISTRY_TOKEN
-# secret is set, publishes the crates.
+# Pushing the tag v<version> builds the binaries and the Python wheels,
+# attaches them to a GitHub release, pushes the container image and
+# publishes the crates when the CARGO_REGISTRY_TOKEN secret is set, and the
+# wheels when the PYPI_PUBLISH variable is "true".
 on:
   push:
     tags: ["v*"]
@@ -60,8 +61,40 @@ jobs:
           name: image-${{ matrix.arch }}
           path: image
 
+  wheels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install cargo-zigbuild ziglang auditwheel
+      - name: The tag must be the version of the package
+        run: grep -qx "version = \"${GITHUB_REF_NAME#v}\"" bindings/python/pyproject.toml
+      - name: Build
+        run: |
+          for arch in x86_64 aarch64; do
+            sh bindings/python/build_wheel.sh $arch
+          done
+      - name: Wheels must run on the systems their tag names
+        run: |
+          for wheel in bindings/python/dist/*.whl; do
+            auditwheel show $wheel | tee /dev/stderr | grep -q '"manylinux_2_17_'
+          done
+      - name: Test the wheel as installed
+        run: |
+          pip install bindings/python/dist/*x86_64.whl
+          cd "$RUNNER_TEMP" && python -m unittest discover -s "$GITHUB_WORKSPACE/bindings/python/tests"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: bindings/python/dist/*.whl
+
   github:
-    needs: build
+    needs: [build, wheels]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -71,6 +104,9 @@ jobs:
         with:
           pattern: archive-*
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -79,7 +115,7 @@ jobs:
           awk -v version="${GITHUB_REF_NAME#v}" '
             /^## / { printing = ($2 == version); next }
             printing' CHANGELOG.md > notes.md
-          gh release create "$GITHUB_REF_NAME" malmal-*.tar.gz* \
+          gh release create "$GITHUB_REF_NAME" malmal-*.tar.gz* malmal-*.whl \
             --title "$GITHUB_REF_NAME" --notes-file notes.md
 
   image:
@@ -137,3 +173,18 @@ jobs:
           cargo publish --locked -p malmal
           cargo publish --locked -p malmal-ffi
           cargo publish --locked -p malmal-cli
+
+  pypi:
+    needs: wheels
+    if: vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # PyPI takes the workflow's identity in place of a token.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

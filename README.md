@@ -147,21 +147,26 @@ malmal sanitize upload.jpg stored.jpg
 scans the file and, if it is a clean raster image, decodes it and writes a new file from
 the pixels. Metadata, colour profiles, comments, unknown chunks and anything appended are
 not carried over, because nothing but pixels is. The exit status is 0 only when the new
-file was written.
+file was written; it then takes the place of `stored.jpg` in one step, and otherwise
+`stored.jpg` is left as it was, or absent.
 
 | Input | Output |
 |---|---|
 | JPEG | JPEG at `--jpeg-quality` (90), rotated as its Exif orientation says |
-| PNG | PNG |
+| PNG | PNG; an animated one keeps every frame, at 8 bits a channel |
 | GIF | GIF with every frame |
-| WebP | lossless WebP |
+| WebP | lossless WebP, with every frame of an animated one |
 | BMP, TIFF, ICO | PNG |
 
-Animated PNG and WebP are refused rather than flattened, and so is every other type. From
-Rust it is `Scanner::sanitize` and `malmal::cdr::rebuild`, behind the `cdr` feature; over
-HTTP it is `POST /sanitize`. The decoders are those of the
-[`image`](https://crates.io/crates/image) crate. A colour profile is dropped, not
-converted, and a lossy WebP grows when it is stored losslessly.
+An animation keeps its frame delays and its loop count. Every other type is refused. The
+new file carries no colour profile, so it is read as sRGB: the pixels of an image with an
+RGB profile are converted to sRGB first, which keeps its colours as far as sRGB can show
+them, and any other profile is dropped. A lossy WebP grows when it is stored losslessly.
+
+From Rust it is `Scanner::sanitize` and `malmal::cdr::rebuild`, behind the `cdr` feature;
+over HTTP it is `POST /sanitize`; from C and Python, `malmal_sanitize` and
+`Scanner.sanitize`. The decoders are those of the [`image`](https://crates.io/crates/image)
+crate.
 
 ## Daemon
 
@@ -184,8 +189,11 @@ curl --data-binary @upload.pdf 'http://127.0.0.1:8080/scan?filename=upload.pdf'
 
 The reply is `{"ok": true, "report": {...}}`; anything else means the file was not scanned.
 The daemon has no authentication: bind it to the loopback interface or a Unix socket.
-`--max-size` and `--scan-timeout` set the limits for every request. The protocols, the
-metrics and client examples are in [docs/integration.md](docs/integration.md).
+`--max-size` and `--scan-timeout` set the limits for every request. A scan still running
+after `--hard-timeout` (six times the scan timeout unless given) ends the daemon, for its
+supervisor to start again; see [Limits and timeouts](docs/integration.md#limits-and-timeouts).
+The protocols, the metrics and client examples are in
+[docs/integration.md](docs/integration.md).
 
 ## Using it from C
 
@@ -197,13 +205,14 @@ malmal_string_free(report);
 malmal_scanner_free(scanner);
 ```
 
-Full example: `crates/malmal-ffi/examples/scan.c`.
+`malmal_sanitize` returns the rebuilt image. Full example:
+`crates/malmal-ffi/examples/scan.c`.
 
 ## Using it from Python
 
 `bindings/python` wraps the C library with `ctypes`; it needs nothing but the standard
-library. Building and installing it is described in
-[bindings/python/README.md](bindings/python/README.md).
+library. The release workflow builds wheels for Linux that carry the library; building
+one yourself is described in [bindings/python/README.md](bindings/python/README.md).
 
 ```python
 import malmal
@@ -212,6 +221,9 @@ scanner = malmal.Scanner()
 report = scanner.scan(data, filename="a.png", content_type="image/png")
 if not report.clean:
     reject([finding["code"] for finding in report.findings])
+
+image = scanner.sanitize(data, filename="a.png")   # raises unless there is a new file
+store(image.data, image.file_type)
 ```
 
 ## YARA (optional)
@@ -287,8 +299,12 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
   URLs to it, or JSON API calls are blocked as `type.unknown`. The ICAP endpoint is tested
   against the protocol as specified, not yet against a particular proxy.
 - **Rebuilding keeps the pixels**, so data encoded in them survives, and it relies on the
-  `image` crate's decoders. The time limit does not interrupt a decode.
-- **The time limit is checked between steps of the analysis**; it bounds a scan without
-  cutting it off at an exact moment.
+  `image` crate's decoders. An animated PNG with 16 bits a channel is refused, and CMYK
+  and grey colour profiles are dropped rather than applied.
+- **The time limit is checked between steps** of the analysis, and between the frames of
+  an image being rebuilt; it bounds the work without cutting it off at an exact moment.
+  The library cannot stop a step that does not end. The commands can: past
+  `--hard-timeout` the process exits with status 3, and whatever else the daemon was
+  doing at that moment is lost with it.
 - Office documents, archives and video are out of scope; they are rejected with
   `type.not_allowed` or `type.unknown`.

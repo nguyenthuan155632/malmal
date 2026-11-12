@@ -25,6 +25,8 @@ image = { version = "0.25.10", default-features = false, optional = true, featur
 md-5 = "0.10"
 memchr = "2.8.3"
 miniz_oxide = "0.9.1"
+moxcms = { version = "0.8.1", optional = true }
+png = { version = "0.18.1", optional = true }
 quick-xml = { version = "0.42.0", default-features = false }
 serde.workspace = true
 sha2.workspace = true
@@ -42,8 +44,9 @@ yara-x = { version = "1.23.0", default-features = false, optional = true, featur
 # several megabytes to the binary.
 yara = ["dep:yara-x"]
 # Rebuilding raster images from their pixels (`malmal::cdr`). Off by
-# default: it adds the decoders and encoders of the `image` crate.
-cdr = ["dep:image"]
+# default: it adds the decoders and encoders of the `image` crate, which
+# already depends on the other two.
+cdr = ["dep:image", "dep:moxcms", "dep:png"]
 
 [lints.rust]
 # Set by cargo-fuzz.

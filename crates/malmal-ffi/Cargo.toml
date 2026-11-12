@@ -17,5 +17,5 @@ doc = false
 test = true
 
 [dependencies]
-malmal = { path = "../malmal", version = "0.2.0" }
+malmal = { path = "../malmal", version = "0.2.0", features = ["cdr"] }
 serde_json.workspace = true

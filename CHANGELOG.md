@@ -22,10 +22,16 @@
 - The `cdr` feature: `Scanner::sanitize` and `malmal::cdr::rebuild` decode a clean raster
   image and write a new file from its pixels. `malmal sanitize INPUT OUTPUT` and the
   daemon's `POST /sanitize` do the same; `malmal-cli` enables the feature by default.
+  Animations keep their frames, delays and loop count; an RGB colour profile is applied,
+  so that the new file, which has none, shows the same colours. `malmal sanitize` puts the
+  new file in place of the old one in a single step, or leaves the old one alone.
+- `malmal_sanitize` in the C interface and `Scanner.sanitize` in the Python binding.
+- `--hard-timeout`: a scan still running after it ends the process, where the scan's own
+  time limit, checked between steps, could be waited for in vain.
 - `malmald --icap`: ICAP `REQMOD` and `RESPMOD` for proxies. Multipart forms are taken
   apart and each uploaded file is scanned.
 - Release archives with static binaries for x86-64 and ARM64, a container image, a Python
-  binding in `bindings/python`, and metadata for `cargo binstall`.
+  binding in `bindings/python` with wheels for Linux, and metadata for `cargo binstall`.
 - `malmald --http`: `POST /scan`, `GET /metrics` (Prometheus), `GET /healthz`.
 - `malmald --clamd`: the `INSTREAM` command of the ClamAV daemon protocol.
 - `--max-size` and `--scan-timeout` for both commands; `Scanner::limits()`.
@@ -39,9 +45,12 @@
 - `malmald --socket` is no longer required on its own: one of `--socket`, `--http`,
   `--clamd` or `--icap` is.
 - New dependencies: `md-5` and `aes`, for PDF decryption; `brotli-decompressor`, for JPEG XL
-  metadata; `image`, only with the `cdr` feature.
+  metadata; `image`, `png` and `moxcms`, only with the `cdr` feature.
 
 ### Behaviour to check when upgrading
+
+- `malmal` and `malmald` exit with status 3 when a scan runs for six times the scan
+  timeout. Run the daemon under a supervisor that restarts it, or pass `--hard-timeout 0`.
 
 - Files that were `type.unknown` because they were HEIC, AVIF, JPEG XL or ICO are now
   analyzed and may be clean.

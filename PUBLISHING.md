@@ -62,6 +62,14 @@ builds static binaries for x86-64 and ARM64 Linux, attaches them to a GitHub rel
 the changelog section as its notes, and pushes `ghcr.io/nguyenthuan155632/malmal` for both
 architectures.
 
+It also builds the Python wheels for x86-64 and ARM64 Linux and attaches them to the
+release. They go to PyPI as well when the repository variable `PYPI_PUBLISH` is `true`
+(*Settings → Secrets and variables → Actions → Variables*). No token is stored for that:
+on PyPI, add a trusted publisher for the project `malmal` naming this repository, the
+workflow `release.yml` and the environment `pypi` (*Publishing* in the account settings
+for a project that does not exist yet, in the project's settings afterwards). The version
+in `bindings/python/pyproject.toml` has to be the tag's as well.
+
 It publishes the three crates as well if the repository has a secret named
 `CARGO_REGISTRY_TOKEN` (*Settings → Secrets and variables → Actions*) holding a crates.io
 API token; without the secret that job does nothing and the crates are published by hand as

@@ -382,6 +382,40 @@ fn sanitize_rebuilds_clean_images_only() {
     .unwrap();
     assert_eq!(run(&document, &output).0, Some(3));
     assert_eq!(fs::read(&output).unwrap(), rebuilt);
+    // And an output that was not there is still not there.
+    let absent = dir.join("absent.png");
+    assert_eq!(run(&executable, &absent).0, Some(2));
+    assert_eq!(run(&dir.join("no-such-input.png"), &absent).0, Some(3));
+    assert!(!absent.exists());
+
+    // A file that is replaced keeps its permissions, and nothing is left
+    // beside it. Options may follow the files.
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(&output, b"what was here before").unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o640)).unwrap();
+    let replaced = Command::new(MALMAL)
+        .arg("sanitize")
+        .args([&input, &output])
+        .args(["--policy", "strict", "--require-sandbox"])
+        .status()
+        .unwrap();
+    if sandbox_available(&dir) {
+        assert_eq!(replaced.code(), Some(0));
+    } else {
+        assert_eq!(run(&input, &output).0, Some(0));
+    }
+    assert_eq!(fs::read(&output).unwrap(), rebuilt);
+    let mode = fs::metadata(&output).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o640);
+    let left_behind = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .any(|name| name.ends_with(".tmp"));
+    assert!(!left_behind);
+
+    // A device is written to, not replaced.
+    assert_eq!(run(&input, Path::new("/dev/null")).0, Some(0));
+    assert!(!fs::metadata("/dev/null").unwrap().is_file());
 
     // Standard input to standard output.
     let mut child = Command::new(MALMAL)

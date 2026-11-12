@@ -6,6 +6,7 @@ use std::time::Duration;
 use malmal::{FileType, HashList, Limits, Policy, Scanner};
 
 use crate::sandbox::Mode;
+use crate::watchdog::Watchdog;
 
 // The literals start on the quote's own line: a `"\` continuation would strip
 // the leading spaces of the first line and misalign it from the rest.
@@ -19,6 +20,8 @@ pub const HELP: &str = "  --policy <NAME>      default or strict [default: defau
                        Passwords to try on encrypted PDFs, one per line
   --max-size <BYTES>   Largest file analyzed in full [default: 67108864]
   --scan-timeout <S>   Seconds one scan may take [default: 10]
+  --hard-timeout <S>   Seconds after which a scan still running ends the
+                       process; 0 for never [default: six times --scan-timeout]
   --no-sandbox         Do not restrict the process
   --require-sandbox    Exit with an error if the sandbox cannot be applied";
 
@@ -32,6 +35,8 @@ pub const HELP: &str = "  --policy <NAME>      default or strict [default: defau
                        Passwords to try on encrypted PDFs, one per line
   --max-size <BYTES>   Largest file analyzed in full [default: 67108864]
   --scan-timeout <S>   Seconds one scan may take [default: 10]
+  --hard-timeout <S>   Seconds after which a scan still running ends the
+                       process; 0 for never [default: six times --scan-timeout]
   --yara <PATH>        YARA rule file, or directory of .yar/.yara files (repeatable)
   --no-sandbox         Do not restrict the process
   --require-sandbox    Exit with an error if the sandbox cannot be applied";
@@ -52,6 +57,8 @@ pub struct Common {
     pub hashlist: HashList,
     pub pdf_passwords: Vec<String>,
     pub limits: Limits,
+    /// Seconds given with `--hard-timeout`; 0 is never.
+    pub hard_timeout: Option<u64>,
     pub sandbox: Mode,
     #[cfg(feature = "yara")]
     pub yara_sources: Vec<String>,
@@ -65,6 +72,7 @@ impl Default for Common {
             hashlist: HashList::default(),
             pdf_passwords: Vec::new(),
             limits: Limits::default(),
+            hard_timeout: None,
             sandbox: Mode::BestEffort,
             #[cfg(feature = "yara")]
             yara_sources: Vec::new(),
@@ -131,11 +139,30 @@ impl Common {
                     .ok_or("--scan-timeout needs a positive number of seconds")?;
                 self.limits.max_duration = Duration::from_secs(seconds);
             }
+            "--hard-timeout" => {
+                let seconds = rest
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .ok_or("--hard-timeout needs a number of seconds")?;
+                self.hard_timeout = Some(seconds);
+            }
             "--no-sandbox" => self.sandbox = Mode::Off,
             "--require-sandbox" => self.sandbox = Mode::Require,
             _ => return Ok(false),
         }
         Ok(true)
+    }
+
+    /// The watchdog `--hard-timeout` asks for. The scan's own time limit is
+    /// checked between steps and so overrun a little by an honest file; the
+    /// default leaves room for that, and for rebuilding an image afterwards.
+    pub fn watchdog(&self, program: &'static str) -> Watchdog {
+        let limit = match self.hard_timeout {
+            Some(0) => None,
+            Some(seconds) => Some(Duration::from_secs(seconds)),
+            None => Some(self.limits.max_duration.saturating_mul(6)),
+        };
+        Watchdog::start(program, limit)
     }
 
     pub fn scanner(&self) -> Result<Scanner, String> {

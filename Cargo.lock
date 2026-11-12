@@ -1101,6 +1101,8 @@ dependencies = [
  "md-5 0.10.6",
  "memchr",
  "miniz_oxide 0.9.1",
+ "moxcms",
+ "png",
  "quick-xml",
  "serde",
  "sha2 0.10.9",

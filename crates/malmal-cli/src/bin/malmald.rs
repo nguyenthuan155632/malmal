@@ -269,7 +269,8 @@ fn main() -> ExitCode {
         }
     }
 
-    let service = Arc::new(Service::new(scanner));
+    let watchdog = args.common.watchdog("malmald");
+    let service = Arc::new(Service::new(scanner).watched_by(watchdog));
     let mut handles = Vec::new();
     for (protocol, listener, _) in &listeners {
         for _ in 0..args.workers {

@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 use malmal::{Report, ScanHints, Scanner, Severity, Verdict};
 use serde::Deserialize;
 
+use crate::watchdog::Watchdog;
+
 pub(crate) const MAX_HEADER_LEN: u64 = 16 << 10;
 const MAX_HTTP_HEADERS: usize = 64;
 const MAX_COMMAND_LEN: u64 = 1024;
@@ -102,6 +104,7 @@ impl Metrics {
 pub struct Service {
     scanner: Scanner,
     metrics: Metrics,
+    watchdog: Watchdog,
 }
 
 impl Service {
@@ -109,7 +112,14 @@ impl Service {
         Self {
             scanner,
             metrics: Metrics::default(),
+            watchdog: Watchdog::default(),
         }
+    }
+
+    /// End the process when a scan runs for as long as `watchdog` allows.
+    pub fn watched_by(mut self, watchdog: Watchdog) -> Self {
+        self.watchdog = watchdog;
+        self
     }
 
     pub fn metrics(&self) -> &Metrics {
@@ -124,6 +134,7 @@ impl Service {
     /// `None` when the scanner itself failed; the caller reports an error.
     pub(crate) fn scan(&self, body: &[u8], hints: ScanHints<'_>) -> Option<Report> {
         let started = Instant::now();
+        let _running = self.watchdog.watch();
         match catch_unwind(AssertUnwindSafe(|| self.scanner.scan_bytes(body, hints))) {
             Ok(report) => {
                 self.metrics.record(&report, started.elapsed());
@@ -148,6 +159,7 @@ impl Service {
         use malmal::cdr::{Error, Options};
 
         let started = Instant::now();
+        let _running = self.watchdog.watch();
         let options = Options::default();
         let run = || self.scanner.sanitize(body, hints, &options);
         let Ok(outcome) = catch_unwind(AssertUnwindSafe(run)) else {

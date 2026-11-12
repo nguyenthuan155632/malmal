@@ -5,9 +5,12 @@ use std::ffi::{CStr, CString, c_char, c_int};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
+use malmal::cdr::{Error, Options};
 use malmal::{HashList, Policy, ScanHints, Scanner};
 
+const MALMAL_CLEAN: c_int = 0;
 const MALMAL_ERROR: c_int = 3;
+const MALMAL_NOT_REBUILT: c_int = 4;
 
 /// Opaque to C.
 #[allow(non_camel_case_types)]
@@ -71,16 +74,9 @@ pub unsafe extern "C" fn malmal_scan(
         // SAFETY: the caller guarantees `report_json` is writable.
         unsafe { *report_json = ptr::null_mut() };
     }
-    if scanner.is_null() || (data.is_null() && len != 0) {
+    // SAFETY: the caller guarantees a live scanner and `len` readable bytes.
+    let Some((scanner, bytes)) = (unsafe { input(scanner, data, len) }) else {
         return MALMAL_ERROR;
-    }
-    // SAFETY: checked non-null above; the caller guarantees validity.
-    let scanner = unsafe { &(*scanner).0 };
-    let bytes: &[u8] = if len == 0 {
-        &[]
-    } else {
-        // SAFETY: the caller guarantees `len` readable bytes at `data`.
-        unsafe { std::slice::from_raw_parts(data, len) }
     };
     // SAFETY: the caller guarantees both are null or NUL-terminated.
     let (filename, content_type) = unsafe { (optional_str(filename), optional_str(content_type)) };
@@ -107,14 +103,140 @@ pub unsafe extern "C" fn malmal_scan(
 }
 
 /// # Safety
-/// `string` must be null or a report returned by `malmal_scan` that has not
-/// been freed.
+/// As for `malmal_scan`; `image`, `image_len` and `info_json` must each be
+/// null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn malmal_sanitize(
+    scanner: *const malmal_scanner,
+    data: *const u8,
+    len: usize,
+    filename: *const c_char,
+    content_type: *const c_char,
+    jpeg_quality: c_int,
+    image: *mut *mut u8,
+    image_len: *mut usize,
+    info_json: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the caller guarantees each is null or writable.
+    unsafe {
+        if !image.is_null() {
+            *image = ptr::null_mut();
+        }
+        if !image_len.is_null() {
+            *image_len = 0;
+        }
+        if !info_json.is_null() {
+            *info_json = ptr::null_mut();
+        }
+    }
+    // Without somewhere to put the image there is nothing to do.
+    if image.is_null() || image_len.is_null() {
+        return MALMAL_ERROR;
+    }
+    // SAFETY: the caller guarantees a live scanner and `len` readable bytes.
+    let Some((scanner, bytes)) = (unsafe { input(scanner, data, len) }) else {
+        return MALMAL_ERROR;
+    };
+    // SAFETY: the caller guarantees both are null or NUL-terminated.
+    let (filename, content_type) = unsafe { (optional_str(filename), optional_str(content_type)) };
+
+    let sanitized = catch_unwind(AssertUnwindSafe(|| {
+        let hints = ScanHints {
+            filename: filename.as_deref(),
+            content_type: content_type.as_deref(),
+        };
+        let mut options = Options::default();
+        if let Ok(quality @ 1..=100) = u8::try_from(jpeg_quality) {
+            options.jpeg_quality = quality;
+        }
+        let (status, rebuilt, info) = match scanner.sanitize(bytes, hints, &options) {
+            Ok(sanitized) => {
+                let info = serde_json::json!({
+                    "report": sanitized.report,
+                    "image": {
+                        "file_type": sanitized.image.file_type.as_str(),
+                        "width": sanitized.image.width,
+                        "height": sanitized.image.height,
+                        "frames": sanitized.image.frames,
+                    },
+                });
+                (MALMAL_CLEAN, Some(sanitized.image.data), info)
+            }
+            Err(Error::Rejected(report)) => {
+                let info = serde_json::json!({ "report": report });
+                (report.verdict as c_int, None, info)
+            }
+            Err(error) => {
+                let info = serde_json::json!({ "error": error.to_string() });
+                (MALMAL_NOT_REBUILT, None, info)
+            }
+        };
+        Some((status, rebuilt, CString::new(info.to_string()).ok()?))
+    }));
+    let Ok(Some((status, rebuilt, info))) = sanitized else {
+        return MALMAL_ERROR;
+    };
+    // SAFETY: `image` and `image_len` were checked non-null; the caller
+    // guarantees all three are writable.
+    unsafe {
+        if let Some(rebuilt) = rebuilt {
+            let rebuilt = Box::into_raw(rebuilt.into_boxed_slice());
+            *image_len = rebuilt.len();
+            *image = rebuilt.cast();
+        }
+        if !info_json.is_null() {
+            *info_json = info.into_raw();
+        }
+    }
+    status
+}
+
+/// # Safety
+/// `string` must be null or a string returned by `malmal_scan` or
+/// `malmal_sanitize` that has not been freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn malmal_string_free(string: *mut c_char) {
     if !string.is_null() {
-        // SAFETY: the pointer came from CString::into_raw in malmal_scan.
+        // SAFETY: the pointer came from CString::into_raw in this library.
         drop(unsafe { CString::from_raw(string) });
     }
+}
+
+/// # Safety
+/// `bytes` must be null or an image returned by `malmal_sanitize` that has
+/// not been freed, and `len` the length returned with it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn malmal_bytes_free(bytes: *mut u8, len: usize) {
+    if !bytes.is_null() {
+        // SAFETY: the pointer and length are those of the boxed slice
+        // leaked in malmal_sanitize.
+        drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(bytes, len)) });
+    }
+}
+
+/// The scanner and the file a call was given, or `None` if they are not
+/// usable.
+///
+/// # Safety
+/// `scanner` must be null or a live pointer from `malmal_scanner_new`;
+/// `data` must be null or point to `len` readable bytes.
+unsafe fn input<'a>(
+    scanner: *const malmal_scanner,
+    data: *const u8,
+    len: usize,
+) -> Option<(&'a Scanner, &'a [u8])> {
+    if scanner.is_null() || (data.is_null() && len != 0) {
+        return None;
+    }
+    // SAFETY: checked non-null above; the caller guarantees validity.
+    let scanner = unsafe { &(*scanner).0 };
+    let bytes: &[u8] = if len == 0 {
+        &[]
+    } else {
+        // SAFETY: the caller guarantees `len` readable bytes at `data`.
+        unsafe { std::slice::from_raw_parts(data, len) }
+    };
+    Some((scanner, bytes))
 }
 
 /// # Safety
@@ -177,6 +299,90 @@ mod tests {
         };
         assert_eq!(verdict, 1);
         unsafe { malmal_scanner_free(scanner) };
+    }
+
+    /// One transparent pixel, with a comment a rebuilt file does not keep.
+    const PNG: &[u8] =
+        b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89\
+        \0\0\0\x18tEXtComment\0taken on holiday\xde\x76\xb6\x04\
+        \0\0\0\x10IDAT\x78\x01\x01\x05\0\xfa\xff\0\0\0\0\0\0\x05\0\x01\x64\x78\x95\x38\
+        \0\0\0\0IEND\xae\x42\x60\x82";
+
+    fn sanitize(scanner: *const malmal_scanner, data: &[u8]) -> (c_int, Vec<u8>, String) {
+        let (mut image, mut image_len, mut json) = (ptr::null_mut(), 0, ptr::null_mut());
+        let status = unsafe {
+            malmal_sanitize(
+                scanner,
+                data.as_ptr(),
+                data.len(),
+                ptr::null(),
+                ptr::null(),
+                0,
+                &mut image,
+                &mut image_len,
+                &mut json,
+            )
+        };
+        let rebuilt = if image.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(image, image_len) }.to_vec()
+        };
+        let info = unsafe { CStr::from_ptr(json) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        unsafe {
+            malmal_bytes_free(image, image_len);
+            malmal_string_free(json);
+        }
+        (status, rebuilt, info)
+    }
+
+    #[test]
+    fn rebuilds_through_the_c_interface() {
+        let scanner = unsafe { malmal_scanner_new(0, ptr::null(), 0) };
+
+        let (status, rebuilt, info) = sanitize(scanner, PNG);
+        assert_eq!(status, MALMAL_CLEAN, "{info}");
+        assert!(rebuilt.starts_with(b"\x89PNG"));
+        assert!(!rebuilt.windows(7).any(|window| window == b"holiday"));
+        assert!(info.contains(r#""file_type":"png""#), "{info}");
+        assert!(info.contains(r#""verdict":"clean""#), "{info}");
+
+        let (status, rebuilt, info) = sanitize(scanner, b"\x7fELF\x02\x01\x01\0");
+        assert_eq!(status, 2);
+        assert!(rebuilt.is_empty());
+        assert!(info.contains("type.executable"), "{info}");
+
+        // Clean, as far as a scan can tell, and not an image.
+        let pdf = b"%PDF-1.7\n1 0 obj\n<< >>\nendobj\ntrailer\n<< >>\n%%EOF\n";
+        let (status, rebuilt, info) = sanitize(scanner, pdf);
+        assert_eq!(status, MALMAL_NOT_REBUILT, "{info}");
+        assert!(rebuilt.is_empty());
+        assert!(info.contains("error"), "{info}");
+
+        // Nowhere to put the image.
+        let mut json = ptr::dangling_mut::<c_char>();
+        let status = unsafe {
+            malmal_sanitize(
+                scanner,
+                PNG.as_ptr(),
+                PNG.len(),
+                ptr::null(),
+                ptr::null(),
+                90,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut json,
+            )
+        };
+        assert_eq!(status, MALMAL_ERROR);
+        assert!(json.is_null());
+        unsafe {
+            malmal_bytes_free(ptr::null_mut(), 0);
+            malmal_scanner_free(scanner);
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -26,8 +26,8 @@ Usage: malmal scan [OPTIONS] <FILE>...
 scan      Scans each FILE; `-` reads standard input.
 sanitize  Scans INPUT and, if it is a clean raster image, writes it anew
           from its pixels to OUTPUT; `-` is standard input or output.
-          Unless the exit status is 0, OUTPUT is left as it was, or
-          empty if it did not exist.
+          OUTPUT is replaced whole when the exit status is 0, and left
+          as it was otherwise.
 
 Options:
   --json               scan: print one JSON object per file
@@ -48,13 +48,35 @@ struct Args {
     jpeg_quality: u8,
     common: Common,
     files: Vec<String>,
+    /// Where among the arguments the last of `files` is.
+    last_file_at: usize,
+}
+
+/// Arguments, counted as they are taken.
+struct Counted<I> {
+    arguments: I,
+    taken: usize,
+}
+
+impl<I: Iterator<Item = String>> Iterator for Counted<I> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<String> {
+        let argument = self.arguments.next()?;
+        self.taken += 1;
+        Some(argument)
+    }
 }
 
 fn usage() -> String {
     format!("{USAGE}\n{}\n{EXIT_STATUS}", options::HELP)
 }
 
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
+fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
+    let mut args = Counted {
+        arguments: args,
+        taken: 0,
+    };
     let sanitize = match args.next().as_deref() {
         Some("scan") => false,
         Some("sanitize") if cfg!(feature = "cdr") => true,
@@ -67,11 +89,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         jpeg_quality: 90,
         common: Common::default(),
         files: Vec::new(),
+        last_file_at: 0,
     };
     let mut options_done = false;
     while let Some(arg) = args.next() {
         if options_done || !arg.starts_with('-') || arg == "-" {
             parsed.files.push(arg);
+            parsed.last_file_at = args.taken - 1;
         } else if arg == "--" {
             options_done = true;
         } else if arg == "--json" && !sanitize {
@@ -127,55 +151,128 @@ fn describe(path: &str, report: &Report) -> String {
     out
 }
 
-/// Scan `input` and write the rebuilt image to `output`. Everything a person
-/// reads goes to standard error, which is never the image.
+/// The file at `path`, or standard input for `-`, up to one byte past the
+/// size limit, which is how the scanner knows the file is too large.
+fn read(path: &str, scanner: &malmal::Scanner) -> io::Result<Vec<u8>> {
+    let limit = scanner.limits().max_file_size.saturating_add(1);
+    let mut data = Vec::new();
+    if path == "-" {
+        io::stdin().lock().take(limit).read_to_end(&mut data)?;
+    } else {
+        File::open(path)?.take(limit).read_to_end(&mut data)?;
+    }
+    Ok(data)
+}
+
+/// `sanitize` into a file. The sandbox lets a process neither rename nor
+/// remove a file, so the image is rebuilt by a second, sandboxed process
+/// that writes it to its standard output. This one only moves bytes: into
+/// a temporary file beside `output`, which takes the place of `output` once
+/// the image is whole, so that `output` is never a part of one.
+#[cfg(feature = "cdr")]
+fn sanitize_into_file(arguments: &[String], output_at: usize) -> ExitCode {
+    use std::fs;
+    use std::process::{Command, Stdio};
+
+    let output = Path::new(&arguments[output_at]);
+    let fail = |subject: &Path, error: io::Error| {
+        eprintln!("malmal: {}: {error}", subject.display());
+        ExitCode::from(EXIT_ERROR)
+    };
+    let mut command = match std::env::current_exe() {
+        Ok(program) => Command::new(program),
+        Err(error) => return fail(Path::new("malmal"), error),
+    };
+    command.args(&arguments[..output_at]).arg("-");
+    command.args(&arguments[output_at + 1..]);
+    let code = |status: std::process::ExitStatus| {
+        // Ended by a signal, there is no status to pass on.
+        let code = status.code().and_then(|code| u8::try_from(code).ok());
+        ExitCode::from(code.unwrap_or(EXIT_ERROR))
+    };
+
+    // A device or a pipe is written to, not replaced.
+    let existing = fs::metadata(output).ok();
+    if existing.as_ref().is_some_and(|found| !found.is_file()) {
+        let opened = File::options().write(true).open(output);
+        return match opened.and_then(|file| command.stdout(file).status()) {
+            Ok(status) => code(status),
+            Err(error) => fail(output, error),
+        };
+    }
+
+    let mut name = output.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.tmp", std::process::id()));
+    let temporary = output.with_file_name(name);
+    let mut file = match File::options()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+    {
+        Ok(file) => file,
+        Err(error) => return fail(output, error),
+    };
+    let discard = |result: ExitCode| {
+        let _ = fs::remove_file(&temporary);
+        result
+    };
+    let mut child = match command.stdout(Stdio::piped()).spawn() {
+        Ok(child) => child,
+        Err(error) => return discard(fail(Path::new("malmal"), error)),
+    };
+    let mut image = child.stdout.take().expect("the output is a pipe");
+    let copied = io::copy(&mut image, &mut file)
+        .and_then(|_| match &existing {
+            // The new file is to be read by whoever could read the old one.
+            Some(replaced) => file.set_permissions(replaced.permissions()),
+            None => Ok(()),
+        })
+        .and_then(|()| file.sync_all());
+    // Closed, so that a child still writing ends instead of waiting.
+    drop(image);
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => return discard(fail(Path::new("malmal"), error)),
+    };
+    if !status.success() {
+        return discard(code(status));
+    }
+    match copied.and_then(|()| fs::rename(&temporary, output)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => discard(fail(output, error)),
+    }
+}
+
+/// Scan `input` and write the rebuilt image to standard output. Everything
+/// a person reads goes to standard error, which is never the image.
 #[cfg(feature = "cdr")]
 fn sanitize(args: &Args, scanner: &malmal::Scanner) -> ExitCode {
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     use malmal::cdr::{Error, Options};
 
-    let (input, output) = (&args.files[0], &args.files[1]);
+    let input = &args.files[0];
     let fail = |message: String| {
         eprintln!("malmal: {message}");
         ExitCode::from(EXIT_ERROR)
     };
-    // Opened before the sandbox closes the file system, and not truncated:
-    // the file keeps its contents until there is something to replace them.
-    let target = if output == "-" {
-        None
-    } else {
-        let opened = File::options()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(output);
-        match opened {
-            Ok(file) => Some(file),
-            Err(error) => return fail(format!("{output}: {error}")),
-        }
-    };
+    let watchdog = args.common.watchdog("malmal");
     let readable: Vec<&Path> = vec![Path::new(input)];
     if let Err(message) = sandbox::enter(args.common.sandbox, &readable, options::MEMORY_LIMIT) {
         return fail(message);
     }
 
-    let limit = scanner.limits().max_file_size.saturating_add(1);
-    let mut data = Vec::new();
-    let read = if input == "-" {
-        io::stdin().lock().take(limit).read_to_end(&mut data)
-    } else {
-        File::open(input).and_then(|file| file.take(limit).read_to_end(&mut data))
+    let data = match read(input, scanner) {
+        Ok(data) => data,
+        Err(error) => return fail(format!("{input}: {error}")),
     };
-    if let Err(error) = read {
-        return fail(format!("{input}: {error}"));
-    }
     let hints = ScanHints {
         filename: (input != "-").then_some(input.as_str()),
         content_type: None,
     };
     let mut options = Options::default();
     options.jpeg_quality = args.jpeg_quality;
+    let running = watchdog.watch();
     let sanitized = match scanner.sanitize(&data, hints, &options) {
         Ok(sanitized) => sanitized,
         Err(Error::Rejected(report)) => {
@@ -184,16 +281,10 @@ fn sanitize(args: &Args, scanner: &malmal::Scanner) -> ExitCode {
         }
         Err(error) => return fail(format!("{input}: {error}")),
     };
+    drop(running);
     let image = &sanitized.image;
-    let written = match target {
-        Some(mut file) => file
-            .set_len(0)
-            .and_then(|()| file.write_all(&image.data))
-            .and_then(|()| file.sync_all()),
-        None => io::stdout().lock().write_all(&image.data),
-    };
-    if let Err(error) = written {
-        return fail(format!("{output}: {error}"));
+    if let Err(error) = io::stdout().lock().write_all(&image.data) {
+        return fail(format!("standard output: {error}"));
     }
     eprintln!(
         "{input}: rebuilt as {} ({}x{}, {} frame{}, {} bytes)",
@@ -224,7 +315,7 @@ fn main() -> ExitCode {
         println!("malmal {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
-    let args = match parse_args(raw.into_iter()) {
+    let args = match parse_args(raw.iter().cloned()) {
         Ok(args) => args,
         Err(message) => {
             eprintln!("malmal: {message}\n\n{}", usage());
@@ -232,6 +323,10 @@ fn main() -> ExitCode {
         }
     };
 
+    #[cfg(feature = "cdr")]
+    if args.sanitize && args.files[1] != "-" {
+        return sanitize_into_file(&raw, args.last_file_at);
+    }
     let scanner = match args.common.scanner() {
         Ok(scanner) => scanner,
         Err(message) => {
@@ -243,6 +338,7 @@ fn main() -> ExitCode {
     if args.sanitize {
         return sanitize(&args, &scanner);
     }
+    let watchdog = args.common.watchdog("malmal");
     // From here on, nothing but the files to scan can be opened.
     let readable: Vec<&Path> = args.files.iter().map(Path::new).collect();
     if let Err(message) = sandbox::enter(args.common.sandbox, &readable, options::MEMORY_LIMIT) {
@@ -252,15 +348,15 @@ fn main() -> ExitCode {
 
     let mut exit = 0;
     for path in &args.files {
-        let scanned = if path == "-" {
-            scanner.scan_reader(io::stdin().lock(), ScanHints::default())
-        } else {
-            let hints = ScanHints {
-                filename: Some(path),
-                content_type: None,
-            };
-            File::open(path).and_then(|file| scanner.scan_reader(file, hints))
+        let hints = ScanHints {
+            filename: (path != "-").then_some(path.as_str()),
+            content_type: None,
         };
+        // Waiting for the file is not scanning it.
+        let scanned = read(path, &scanner).map(|data| {
+            let _running = watchdog.watch();
+            scanner.scan_bytes(&data, hints)
+        });
         match scanned {
             Ok(report) => {
                 print_report(path, &report, args.json);

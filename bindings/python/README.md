@@ -14,9 +14,31 @@ if not report.clean:
 
 Anything but `report.clean`, including a `malmal.ScanError`, means the file is not accepted.
 
+`sanitize` scans and then writes a clean image anew from its pixels, so that nothing but the
+picture is kept:
+
+```python
+try:
+    image = scanner.sanitize(data, filename="a.png")
+except malmal.SanitizeError:       # Rejected (with .report) or NotRebuilt
+    reject()
+else:
+    store(image.data, image.file_type)
+```
+
 ## Installing
 
-The package needs `libmalmal_ffi`, which is built from the Rust sources:
+A wheel from the [releases](https://github.com/nguyenthuan155632/malmal/releases) carries
+the library, for x86-64 and ARM64 Linux with glibc 2.17 or newer:
+
+```bash
+pip install malmal-0.2.0-py3-none-manylinux2014_x86_64.whl
+```
+
+Such a wheel is built with `bindings/python/build_wheel.sh x86_64` (or `aarch64`), which
+needs `pip install cargo-zigbuild ziglang` and the Rust target for that machine.
+
+Anywhere else, the package needs `libmalmal_ffi`, which is built from the Rust sources:
 
 ```bash
 cargo build --release -p malmal-ffi

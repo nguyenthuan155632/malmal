@@ -6,3 +6,4 @@ pub mod icap;
 pub mod options;
 pub mod sandbox;
 pub mod serve;
+pub mod watchdog;

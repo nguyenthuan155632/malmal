@@ -10,6 +10,15 @@ including an exception, means the file is not accepted::
     report = scanner.scan(data, filename="a.png", content_type="image/png")
     if not report.clean:
         raise ValueError([finding["code"] for finding in report.findings])
+
+:meth:`Scanner.sanitize` goes one step further and writes a clean image
+anew from its pixels, so that nothing but the picture is kept::
+
+    try:
+        image = scanner.sanitize(data, filename="a.png")
+    except malmal.SanitizeError:
+        raise ValueError("not an image to keep")
+    store(image.data, image.file_type)
 """
 
 import ctypes
@@ -18,14 +27,42 @@ import json
 import os
 from dataclasses import dataclass, field
 
-__all__ = ["Report", "ScanError", "Scanner"]
+__all__ = [
+    "NotRebuilt",
+    "Rejected",
+    "Report",
+    "SanitizeError",
+    "Sanitized",
+    "ScanError",
+    "Scanner",
+]
 
-_VERDICTS = ("clean", "suspicious", "malicious")
+_CLEAN = 0
 _ERROR = 3
+_NOT_REBUILT = 4
 
 
 class ScanError(Exception):
     """The file was not scanned. Treat it as not accepted."""
+
+
+class SanitizeError(Exception):
+    """There is no rebuilt file, and the original is not to be kept in its
+    place."""
+
+
+class Rejected(SanitizeError):
+    """The scan did not come back clean; ``report`` says why."""
+
+    def __init__(self, report):
+        codes = ", ".join(finding["code"] for finding in report.findings)
+        super().__init__("file is not clean: " + codes)
+        self.report = report
+
+
+class NotRebuilt(SanitizeError):
+    """The file is clean but is not an image that can be rebuilt, is too
+    large, or does not decode."""
 
 
 @dataclass(frozen=True)
@@ -42,6 +79,25 @@ class Report:
     @property
     def clean(self):
         return self.verdict == "clean"
+
+
+@dataclass(frozen=True)
+class Sanitized:
+    """An image written anew from the pixels of a clean upload."""
+
+    data: bytes
+    #: The type of ``data``, which is not always the type of the upload.
+    file_type: str
+    width: int
+    height: int
+    frames: int
+    #: The report on the upload.
+    report: Report
+
+
+def _report(fields):
+    known = {name: fields[name] for name in Report.__dataclass_fields__ if name in fields}
+    return Report(**known)
 
 
 def _load(path):
@@ -79,7 +135,28 @@ def _load(path):
     ]
     library.malmal_string_free.restype = None
     library.malmal_string_free.argtypes = [ctypes.c_void_p]
+    library.malmal_sanitize.restype = ctypes.c_int
+    library.malmal_sanitize.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    library.malmal_bytes_free.restype = None
+    library.malmal_bytes_free.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
     return library
+
+
+def _claims(filename, content_type):
+    return [
+        None if text is None else text.replace("\0", "").encode()
+        for text in (filename, content_type)
+    ]
 
 
 class Scanner:
@@ -107,10 +184,7 @@ class Scanner:
         if not self._handle:
             raise ScanError("the scanner is closed")
         data = bytes(data)
-        encoded = [
-            None if text is None else text.replace("\0", "").encode()
-            for text in (filename, content_type)
-        ]
+        encoded = _claims(filename, content_type)
         report = ctypes.c_void_p()
         verdict = self._library.malmal_scan(
             self._handle, data, len(data), encoded[0], encoded[1], ctypes.byref(report)
@@ -121,8 +195,47 @@ class Scanner:
             fields = json.loads(ctypes.string_at(report.value))
         finally:
             self._library.malmal_string_free(report)
-        known = {name: fields[name] for name in Report.__dataclass_fields__ if name in fields}
-        return Report(**known)
+        return _report(fields)
+
+    def sanitize(self, data, filename=None, content_type=None, jpeg_quality=90):
+        """Scan ``data`` and, if it is a clean raster image, write it anew
+        from its pixels. Returns a :class:`Sanitized`, whose ``data`` is the
+        file to keep in place of the upload.
+
+        Raises :class:`Rejected` if the scan did not come back clean,
+        :class:`NotRebuilt` if there is no image to rebuild, and
+        :class:`ScanError` if the file could not be scanned. In every case
+        the upload is not to be kept."""
+        if not self._handle:
+            raise ScanError("the scanner is closed")
+        data = bytes(data)
+        encoded = _claims(filename, content_type)
+        image, length, info = ctypes.c_void_p(), ctypes.c_size_t(), ctypes.c_void_p()
+        status = self._library.malmal_sanitize(
+            self._handle,
+            data,
+            len(data),
+            encoded[0],
+            encoded[1],
+            int(jpeg_quality),
+            ctypes.byref(image),
+            ctypes.byref(length),
+            ctypes.byref(info),
+        )
+        try:
+            if status == _ERROR or not info.value:
+                raise ScanError("the scanner failed; the file was not scanned")
+            fields = json.loads(ctypes.string_at(info.value))
+            if status == _NOT_REBUILT:
+                raise NotRebuilt(fields.get("error", "the image was not rebuilt"))
+            report = _report(fields["report"])
+            if status != _CLEAN or not image.value:
+                raise Rejected(report)
+            rebuilt = ctypes.string_at(image.value, length.value)
+        finally:
+            self._library.malmal_bytes_free(image, length)
+            self._library.malmal_string_free(info)
+        return Sanitized(data=rebuilt, report=report, **fields["image"])
 
     def close(self):
         if self._handle:

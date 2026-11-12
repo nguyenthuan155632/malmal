@@ -244,8 +244,8 @@ The report has the fields of `malmal::Report`:
 `/sanitize` takes the same request and answers with the image written anew from its pixels,
 its type in `Content-Type` (a BMP, TIFF or ICO comes back as `image/png`). Anything but
 `200` means there is no file to keep: `422` with `{"ok": false, "error": ..., "report": {...}}`
-when the scan was not clean or the image could not be decoded, `415` when the file is not
-an image that can be rebuilt.
+when the scan was not clean, or without the report when the image could not be decoded or
+took too long, and `415` when the file is not an image that can be rebuilt.
 
 ```bash
 curl --fail --data-binary @upload.jpg -o stored.jpg http://127.0.0.1:8080/sanitize
@@ -331,6 +331,15 @@ every request; `--timeout` is how long an idle connection is kept. The time limi
 between steps of the analysis, so it bounds a scan without cutting it off at an exact moment.
 A file over the size limit is refused outright by the daemon rather than scanned in part.
 
+A step that never ends never reaches that check, and a thread cannot be stopped from
+outside. `--hard-timeout <S>` is the answer to that: when a scan or a rebuild has run for
+that many seconds, the daemon prints a line and exits with status 3. Every connection it
+was serving is cut, which no client can take for a clean verdict, and the supervisor
+starts it again (`Restart=on-failure` under systemd, a restart policy in a container).
+The default is six times `--scan-timeout`, one minute as shipped; `0` turns it off, which
+leaves a stuck worker stuck. `malmal scan` and `malmal sanitize` take the same option and
+exit the same way. The time a client takes to send its file does not count.
+
 ## From C
 
 ```c
@@ -340,6 +349,26 @@ int verdict = malmal_scan(scanner, data, len, "a.png", "image/png", &report);
 malmal_string_free(report);
 malmal_scanner_free(scanner);
 ```
+
+`malmal_sanitize` scans and rebuilds in one call:
+
+```c
+uint8_t *image = NULL;
+size_t image_len = 0;
+char *info = NULL;
+int status = malmal_sanitize(scanner, data, len, "a.png", "image/png", 0,
+                             &image, &image_len, &info);
+if (status == MALMAL_CLEAN) {
+  /* Store image[0..image_len] in place of the upload. */
+}
+malmal_bytes_free(image, image_len);
+malmal_string_free(info);
+```
+
+Any other status means there is nothing to store: the scan was not clean
+(`MALMAL_SUSPICIOUS`, `MALMAL_MALICIOUS`), the file is not an image that can be rebuilt
+(`MALMAL_NOT_REBUILT`), or the call failed (`MALMAL_ERROR`). `info` says which type the new
+file has, or why there is none.
 
 The header is `crates/malmal-ffi/include/malmal.h`, the full example
 `crates/malmal-ffi/examples/scan.c`.
@@ -357,8 +386,23 @@ if not report.clean:
     reject([finding["code"] for finding in report.findings])
 ```
 
-A `malmal.ScanError` means the file was not scanned. Building the library and installing
-the package are described in `bindings/python/README.md`.
+A `malmal.ScanError` means the file was not scanned. `Scanner.sanitize` returns the rebuilt
+image, and raises when there is none:
+
+```python
+try:
+    image = scanner.sanitize(data, filename="a.png", content_type="image/png")
+except malmal.Rejected as rejected:       # the scan did not come back clean
+    reject([finding["code"] for finding in rejected.report.findings])
+except malmal.NotRebuilt as problem:      # clean, but not an image that can be rebuilt
+    reject(str(problem))
+else:
+    store(image.data, image.file_type)    # "png" for an uploaded BMP, TIFF or ICO
+```
+
+Both exceptions are a `malmal.SanitizeError`. The wheels attached to a release carry the
+library for x86-64 and ARM64 Linux; building one, or using the package from a checkout, is
+described in `bindings/python/README.md`.
 
 ## In a container
 
