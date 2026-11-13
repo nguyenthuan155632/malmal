@@ -420,6 +420,31 @@ mod tests {
     }
 
     #[test]
+    fn rebuilds_documents_and_checks_what_it_rebuilt() {
+        let scanner = unsafe { malmal_scanner_new(0, ptr::null(), 0) };
+
+        let svg = include_bytes!("../../../tests/corpus/clean/square.svg");
+        let (status, rebuilt, info) = sanitize(scanner, svg);
+        assert_eq!(status, MALMAL_CLEAN, "{info}");
+        assert!(rebuilt.starts_with(b"<?xml"));
+        assert!(info.contains(r#""file_type":"svg""#), "{info}");
+
+        let pdf = include_bytes!("../../../tests/corpus/clean/page.pdf");
+        let (status, rebuilt, info) = sanitize(scanner, pdf);
+        assert_eq!(status, MALMAL_CLEAN, "{info}");
+        assert!(rebuilt.starts_with(b"%PDF-1.7"));
+        assert!(info.contains(r#""file_type":"pdf""#), "{info}");
+
+        // A picture whose pixels are a PDF: the report is on the new file.
+        let polyglot = include_bytes!("../../../tests/corpus/clean/pixels-spell-pdf.png");
+        let (status, rebuilt, info) = sanitize(scanner, polyglot);
+        assert_eq!(status, 2, "{info}");
+        assert!(rebuilt.is_empty());
+        assert!(info.contains("image.polyglot"), "{info}");
+        unsafe { malmal_scanner_free(scanner) };
+    }
+
+    #[test]
     fn supplied_passwords_open_encrypted_documents() {
         // Its user password is "secret".
         let pdf = include_bytes!("../../../tests/corpus/malicious/password-javascript.pdf");

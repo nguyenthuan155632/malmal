@@ -58,25 +58,27 @@ int malmal_scan(const malmal_scanner *scanner, const uint8_t *data, size_t len,
                 char **report_json);
 
 /*
- * Scan a file as malmal_scan does and, if it is a clean raster image, write
- * it anew from its pixels, so that nothing but the picture is kept.
- * `jpeg_quality` is the quality of a rebuilt JPEG, 1 to 100; anything else
- * selects the default of 90.
+ * Scan a file as malmal_scan does and, if it is clean and of a type that can
+ * be, write it anew: an image from its pixels, an SVG from what draws in it,
+ * a PDF as pictures of its pages. `jpeg_quality` is the quality of a rebuilt
+ * JPEG, 1 to 100; anything else selects the default of 90.
  *
  * Returns MALMAL_CLEAN when there is a new file: `*image` and `*image_len`
  * receive it, to be stored in place of the upload and released with
  * malmal_bytes_free. Its type is not always that of the input.
  * Any other result leaves `*image` NULL, and the upload is not to be stored:
- * MALMAL_SUSPICIOUS or MALMAL_MALICIOUS if the scan did not come back clean,
- * MALMAL_NOT_REBUILT if the file is not an image that can be rebuilt, is too
+ * MALMAL_SUSPICIOUS or MALMAL_MALICIOUS if the scan of the upload, or of the
+ * file made from it, did not come back clean,
+ * MALMAL_NOT_REBUILT if the file is not of a type that can be rebuilt, is too
  * large or does not decode, and MALMAL_ERROR as for malmal_scan, or if
  * `image` or `image_len` is NULL.
  *
  * If `info_json` is not NULL it receives a NUL-terminated JSON object (NULL
  * on MALMAL_ERROR), to be released with malmal_string_free:
  *   {"report": {...}, "image": {"file_type": "png", "width": 1,
- *                               "height": 1, "frames": 1}}   new file
- *   {"report": {...}}                                         not clean
+ *                               "height": 1, "frames": 1}}   new file;
+ *       width and height are 0 for an SVG or a PDF, frames its pages
+ *   {"report": {...}}                not clean; the report that was not
  *   {"error": "..."}                                          not rebuilt
  */
 int malmal_sanitize(const malmal_scanner *scanner, const uint8_t *data,

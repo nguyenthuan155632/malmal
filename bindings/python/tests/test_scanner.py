@@ -72,6 +72,35 @@ class ScannerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             malmal.Scanner(pdf_passwords=["two\nlines"])
 
+    def test_sanitize_documents(self):
+        corpus = os.path.join(os.path.dirname(__file__), "../../../tests/corpus")
+
+        def read(name):
+            with open(os.path.join(corpus, name), "rb") as file:
+                return file.read()
+
+        svg = (
+            b"<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'>"
+            b"<rect width='4' height='4'/></svg>"
+        )
+        with malmal.Scanner() as scanner:
+            # The scan sees the handler and that is the end of it.
+            with self.assertRaises(malmal.Rejected):
+                scanner.sanitize(svg, filename="a.svg")
+            drawing = scanner.sanitize(read("clean/square.svg"), filename="a.svg")
+            self.assertEqual((drawing.file_type, drawing.width, drawing.frames), ("svg", 0, 1))
+            self.assertIn(b"<rect", drawing.data)
+
+            pages = scanner.sanitize(read("clean/page.pdf"), filename="a.pdf")
+            self.assertEqual((pages.file_type, pages.width, pages.frames), ("pdf", 0, 1))
+            self.assertTrue(pages.data.startswith(b"%PDF-1.7"))
+            self.assertTrue(scanner.scan(pages.data).clean)
+
+            # Clean to a scan; rebuilt, its pixels are a PDF. See the corpus test.
+            with self.assertRaises(malmal.Rejected) as raised:
+                scanner.sanitize(read("clean/pixels-spell-pdf.png"))
+            self.assertIn("image.polyglot", str(raised.exception))
+
     def test_closed_scanner(self):
         scanner = malmal.Scanner(strict=True)
         scanner.close()

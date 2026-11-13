@@ -61,7 +61,7 @@ class Rejected(SanitizeError):
 
 
 class NotRebuilt(SanitizeError):
-    """The file is clean but is not an image that can be rebuilt, is too
+    """The file is clean but is not of a type that can be rebuilt, is too
     large, or does not decode."""
 
 
@@ -83,13 +83,16 @@ class Report:
 
 @dataclass(frozen=True)
 class Sanitized:
-    """An image written anew from the pixels of a clean upload."""
+    """A file written anew from a clean upload: an image from its pixels,
+    an SVG from what draws in it, a PDF as pictures of its pages."""
 
     data: bytes
     #: The type of ``data``, which is not always the type of the upload.
     file_type: str
+    #: In pixels; 0 for an SVG or a PDF, which have no size in pixels.
     width: int
     height: int
+    #: Frames of an animation or pages of a PDF; otherwise 1.
     frames: int
     #: The report on the upload.
     report: Report
@@ -219,12 +222,13 @@ class Scanner:
         return _report(fields)
 
     def sanitize(self, data, filename=None, content_type=None, jpeg_quality=90):
-        """Scan ``data`` and, if it is a clean raster image, write it anew
-        from its pixels. Returns a :class:`Sanitized`, whose ``data`` is the
+        """Scan ``data`` and, if it is clean and of a type that can be,
+        write it anew. Returns a :class:`Sanitized`, whose ``data`` is the
         file to keep in place of the upload.
 
-        Raises :class:`Rejected` if the scan did not come back clean,
-        :class:`NotRebuilt` if there is no image to rebuild, and
+        Raises :class:`Rejected` if the scan of the upload, or of the file
+        made from it, did not come back clean; ``report`` is the one that
+        was not. Raises :class:`NotRebuilt` if there is nothing to rebuild, and
         :class:`ScanError` if the file could not be scanned. In every case
         the upload is not to be kept."""
         if not self._handle:
