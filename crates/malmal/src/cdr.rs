@@ -37,6 +37,8 @@
 //! | GIF | GIF, every frame |
 //! | WebP | lossless WebP, every frame of an animated one |
 //! | BMP, TIFF, ICO | PNG; of an icon, the largest image |
+//! | JPEG XL | PNG; of an animation, the first frame |
+//! | SVG, with the `cdr-svg` feature | SVG, filtered down to what draws a picture |
 //!
 //! An animation keeps its frame delays and the number of times it plays.
 //! Every other type is refused with [`Error::Unsupported`] rather than
@@ -67,6 +69,7 @@ use image::{
     AnimationDecoder, ColorType, Delay, DynamicImage, ExtendedColorType, Frame, ImageDecoder,
     ImageError, Rgba, RgbaImage,
 };
+use jxl_oxide::integration::JxlDecoder;
 use moxcms::{ColorProfile, DataColorSpace, Layout, TransformExecutor, TransformOptions};
 
 use zune_core::bytestream::ZCursor;
@@ -83,11 +86,19 @@ use crate::report::Report;
 pub struct Options {
     /// Quality of rebuilt JPEG files, 1 to 100.
     pub jpeg_quality: u8,
+    /// The types of file that are rebuilt; `None` is every type this build
+    /// can. A decoder for a type you do not take is one more thing a file
+    /// can be aimed at: name the ones you do, and the others are refused
+    /// with [`Error::Unsupported`] before any of them is run.
+    pub types: Option<Vec<FileType>>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { jpeg_quality: 90 }
+        Self {
+            jpeg_quality: 90,
+            types: None,
+        }
     }
 }
 
@@ -99,9 +110,9 @@ pub struct Rebuilt {
     pub data: Vec<u8>,
     /// Its type, which is not always the type of the input.
     pub file_type: FileType,
-    /// Width in pixels, after any rotation.
+    /// Width in pixels, after any rotation; 0 for an SVG, which has none.
     pub width: u32,
-    /// Height in pixels, after any rotation.
+    /// Height in pixels, after any rotation; 0 for an SVG.
     pub height: u32,
     /// Number of frames; 1 unless the image is animated.
     pub frames: u32,
@@ -218,8 +229,91 @@ pub fn rebuild(data: &[u8], limits: &Limits, options: &Options) -> Result<Rebuil
 
 fn rebuild_inner(data: &[u8], limits: &Limits, options: &Options) -> Result<Rebuilt, Error> {
     let file_type = detect::detect(data);
-    let unsupported = |reason| Error::Unsupported { file_type, reason };
     let deadline = Deadline(Instant::now().checked_add(limits.max_duration));
+    let wanted = |types: &Vec<FileType>| types.contains(&file_type);
+    if !options.types.as_ref().is_none_or(wanted) {
+        let reason = "not among the types to rebuild";
+        return Err(Error::Unsupported { file_type, reason });
+    }
+    match file_type {
+        #[cfg(feature = "cdr-svg")]
+        FileType::Svg => svg(data, limits, options, deadline),
+        _ => raster(data, file_type, limits, options, deadline),
+    }
+}
+
+/// An SVG with nothing in it but what draws: elements and attributes that
+/// are not on the filter's list are left out, scripts and links to other
+/// sites among them. A raster image carried inside is rebuilt like one that
+/// stands alone, or left out.
+#[cfg(feature = "cdr-svg")]
+fn svg(
+    data: &[u8],
+    limits: &Limits,
+    options: &Options,
+    deadline: Deadline,
+) -> Result<Rebuilt, Error> {
+    use svg_hush::data_url_filter::DataUrlFilterResult;
+
+    use crate::limits::Budget;
+    use crate::report::Severity;
+
+    let mut filter = svg_hush::Filter::new();
+    let budget = &mut Budget::new(limits);
+    let (limits, options) = (limits.clone(), options.clone());
+    filter.set_data_url_filter(move |url| {
+        let Ok((image, _)) = url.decode_to_vec() else {
+            return DataUrlFilterResult::Drop;
+        };
+        // By what it is, not by what the URL calls it.
+        let (file_type, mime_type) = match detect::detect(&image) {
+            FileType::Jpeg => (FileType::Jpeg, "image/jpeg"),
+            FileType::Png => (FileType::Png, "image/png"),
+            FileType::Gif => (FileType::Gif, "image/gif"),
+            FileType::Webp => (FileType::Webp, "image/webp"),
+            _ => return DataUrlFilterResult::Drop,
+        };
+        match raster(&image, file_type, &limits, &options, deadline) {
+            Ok(rebuilt) if rebuilt.file_type == file_type => DataUrlFilterResult::Rewrite {
+                mime_type: mime_type.into(),
+                data: rebuilt.data,
+            },
+            _ => DataUrlFilterResult::Drop,
+        }
+    });
+    let mut filtered = Vec::new();
+    filter
+        .filter(data, &mut filtered)
+        .map_err(|error| Error::Decode(error.to_string()))?;
+    deadline.check()?;
+    // The filter and this crate's analyzer are two readings of one format.
+    // Where the second still objects to what the first let through, they
+    // disagree about the file, and nobody should have to pick a side.
+    let mut left = Vec::new();
+    crate::svg::analyze(&filtered, budget, &mut left);
+    if left.iter().any(|finding| finding.severity > Severity::Info) {
+        return Err(Error::Decode(
+            "active content is left after filtering".into(),
+        ));
+    }
+    Ok(Rebuilt {
+        data: filtered,
+        file_type: FileType::Svg,
+        width: 0,
+        height: 0,
+        frames: 1,
+    })
+}
+
+/// A raster image written anew from its pixels.
+fn raster(
+    data: &[u8],
+    file_type: FileType,
+    limits: &Limits,
+    options: &Options,
+    deadline: Deadline,
+) -> Result<Rebuilt, Error> {
+    let unsupported = |reason| Error::Unsupported { file_type, reason };
     let input = Cursor::new(data);
     match file_type {
         FileType::Jpeg => {
@@ -278,7 +372,14 @@ fn rebuild_inner(data: &[u8], limits: &Limits, options: &Options) -> Result<Rebu
             deadline,
             Output::Png,
         ),
-        _ => Err(unsupported("not a raster image this module decodes")),
+        // There is no encoder for it here; a PNG keeps every pixel.
+        FileType::Jxl => still(
+            JxlDecoder::new(input).map_err(decode_error)?,
+            limits,
+            deadline,
+            Output::Png,
+        ),
+        _ => Err(unsupported("not a type this build rebuilds")),
     }
 }
 
@@ -1280,6 +1381,88 @@ mod tests {
         assert_eq!(rebuilt.to_rgba8().get_pixel(1, 1), &pixel);
     }
 
+    #[cfg(feature = "cdr-svg")]
+    #[test]
+    fn svg_keeps_what_draws_and_nothing_else() {
+        use base64::Engine;
+
+        let mut png = encoded(&picture().into(), ImageFormat::Png);
+        png.extend_from_slice(PAYLOAD);
+        let embedded = base64::engine::general_purpose::STANDARD.encode(&png);
+        let svg = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+                 width="48" height="32" onload="alert(1)">
+              <script>alert(document.cookie)</script>
+              <rect width="10" height="10" fill="#f00" onclick="alert(2)"/>
+              <a xlink:href="https://example.com/phish"><circle r="4"/></a>
+              <image href="https://tracker.example/pixel.png" width="1" height="1"/>
+              <image xlink:href="data:image/png;base64,{embedded}" width="48" height="32"/>
+              <image href="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==" width="1" height="1"/>
+              <foreignObject><body xmlns="http://www.w3.org/1999/xhtml"><iframe src="//evil"/></body></foreignObject>
+            </svg>"##
+        );
+        let rebuilt = run(svg.as_bytes()).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Svg);
+        let text = String::from_utf8(rebuilt.data.clone()).unwrap();
+        for gone in [
+            "script",
+            "alert",
+            "onload",
+            "onclick",
+            "example",
+            "tracker",
+            "foreignObject",
+            "iframe",
+            "text/html",
+        ] {
+            assert!(!text.contains(gone), "{gone} in {text}");
+        }
+        assert!(text.contains("<rect") && text.contains("<circle"), "{text}");
+        assert!(scans_clean(&rebuilt.data), "{text}");
+
+        // The picture inside is one rebuilt from its pixels.
+        let start = text.find("data:image/png;base64,").expect(&text) + 22;
+        let end = start + text[start..].find('"').unwrap();
+        let inner = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(&text[start..end])
+            .unwrap();
+        assert!(!contains(&inner, PAYLOAD));
+        assert_eq!(
+            image::load_from_memory(&inner).unwrap().to_rgb8(),
+            picture()
+        );
+
+        assert!(matches!(run(b"<svg"), Err(Error::Decode(_))));
+    }
+
+    #[test]
+    fn rebuilds_only_the_types_asked_for() {
+        let png = encoded(&picture().into(), ImageFormat::Png);
+        let gif = encoded(&picture().into(), ImageFormat::Gif);
+        let options = Options {
+            types: Some(vec![FileType::Png]),
+            ..Options::default()
+        };
+        assert!(rebuild(&png, &Limits::default(), &options).is_ok());
+        let refused = rebuild(&gif, &Limits::default(), &options);
+        assert!(
+            matches!(refused, Err(Error::Unsupported { .. })),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn jpeg_xl_comes_back_as_png() {
+        let clean = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/clean");
+        for name in ["photo.jxl", "photo-container.jxl"] {
+            let data = std::fs::read(format!("{clean}/{name}")).unwrap();
+            let rebuilt = run(&data).unwrap();
+            assert_eq!(rebuilt.file_type, FileType::Png, "{name}");
+            assert_eq!((rebuilt.width, rebuilt.height, rebuilt.frames), (64, 48, 1));
+            assert!(scans_clean(&rebuilt.data), "{name}");
+        }
+    }
+
     /// The samples are white, the first ink, and black. Their profile makes
     /// the first ink red, which mixing the inks by arithmetic does not.
     #[test]
@@ -1288,7 +1471,10 @@ mod tests {
         // The two ways a JPEG stores four inks.
         for name in ["cmyk-profile.jpg", "ycck-profile.jpg"] {
             let data = std::fs::read(format!("{clean}/{name}")).unwrap();
-            let options = Options { jpeg_quality: 100 };
+            let options = Options {
+                jpeg_quality: 100,
+                ..Options::default()
+            };
             let rebuilt = rebuild(&data, &Limits::default(), &options).unwrap();
             assert_eq!(rebuilt.file_type, FileType::Jpeg);
             assert_eq!((rebuilt.width, rebuilt.height), (24, 8), "{name}");
@@ -1375,11 +1561,7 @@ mod tests {
 
     #[test]
     fn refuses_what_it_cannot_rebuild_whole() {
-        for data in [
-            &b"%PDF-1.7\n"[..],
-            b"<svg xmlns='http://www.w3.org/2000/svg'/>",
-            b"",
-        ] {
+        for data in [&b"%PDF-1.7\n"[..], b"%!PS-Adobe-3.0\nshowpage\n", b""] {
             assert!(matches!(run(data), Err(Error::Unsupported { .. })));
         }
         let png = encoded(&picture().into(), ImageFormat::Png);

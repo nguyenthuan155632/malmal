@@ -40,6 +40,8 @@ yara-x = { version = "1.23.0", default-features = false, optional = true, featur
     "math-module",
     "string-module",
 ] }
+jxl-oxide = { version = "0.12", default-features = false, features = ["image"], optional = true }
+svg-hush = { version = "0.9", optional = true }
 
 [features]
 # YARA rule matching. Off by default: it adds a WebAssembly runtime and
@@ -48,11 +50,25 @@ yara = ["dep:yara-x"]
 # Rebuilding raster images from their pixels (`malmal::cdr`). Off by
 # default: it adds the decoders and encoders of the `image` crate, which
 # already depends on the others.
-cdr = ["dep:image", "dep:moxcms", "dep:png", "dep:zune-core", "dep:zune-jpeg"]
+cdr = [
+    "dep:image",
+    "dep:jxl-oxide",
+    "dep:moxcms",
+    "dep:png",
+    "dep:zune-core",
+    "dep:zune-jpeg",
+]
+svg-hush = ["dep:svg-hush"]
+
+# With `cdr`, also filtering SVG files down to what draws a picture.
+cdr-svg = ["cdr", "dep:svg-hush"]
 
 [lints.rust]
 # Set by cargo-fuzz.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)", "cfg(docsrs)"] }
+
+[dev-dependencies]
+base64 = "0.22"
 
 [package.metadata.docs.rs]
 all-features = true
