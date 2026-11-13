@@ -475,8 +475,26 @@ fn daemon_rebuilds_over_http() {
     let (head, body) = post(ELF);
     assert!(head.starts_with("HTTP/1.1 422 "), "{head}");
     assert!(String::from_utf8_lossy(&body).contains("type.executable"));
-    let (head, _) = post(b"<svg xmlns='http://www.w3.org/2000/svg'/>");
+    // Clean, and not something that can be rebuilt.
+    let corpus = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/clean");
+    let (head, _) = post(&fs::read(format!("{corpus}/line.eps")).unwrap());
     assert!(head.starts_with("HTTP/1.1 415 "), "{head}");
+
+    #[cfg(feature = "cdr-svg")]
+    {
+        let svg = b"<svg xmlns='http://www.w3.org/2000/svg'><rect width='1' height='1'/></svg>";
+        let (head, body) = post(svg);
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(head.contains("Content-Type: image/svg+xml\r\n"), "{head}");
+        assert!(String::from_utf8_lossy(&body).contains("<rect"));
+    }
+    #[cfg(feature = "cdr-pdf")]
+    {
+        let (head, body) = post(&fs::read(format!("{corpus}/page.pdf")).unwrap());
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(head.contains("Content-Type: application/pdf\r\n"), "{head}");
+        assert!(body.starts_with(b"%PDF-1.7"));
+    }
 }
 
 #[test]

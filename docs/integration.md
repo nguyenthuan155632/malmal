@@ -162,8 +162,12 @@ async fn main() -> std::io::Result<()> {
 malmal = { version = "0.2", features = ["cdr"] }
 ```
 
-`Scanner::sanitize` scans and, when the file is a clean raster image, returns a new file
-written from its pixels. Store that one; the upload itself is not kept.
+`Scanner::sanitize` scans and, when the file is clean and of a type that can be rebuilt,
+returns a new file. Store that one; the upload itself is not kept. A raster image is
+written from its pixels. Two more features add the document types: `cdr-svg` filters an
+SVG down to what draws, and `cdr-pdf` draws each page of a PDF and writes a PDF of the
+drawings. `Options::types` names the types to rebuild when you take only some; the
+decoders for the others are then never run.
 
 ```rust
 use malmal::cdr::{Error, Options};

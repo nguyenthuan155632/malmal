@@ -39,6 +39,7 @@
 //! | BMP, TIFF, ICO | PNG; of an icon, the largest image |
 //! | JPEG XL | PNG; of an animation, the first frame |
 //! | SVG, with the `cdr-svg` feature | SVG, filtered down to what draws a picture |
+//! | PDF, with the `cdr-pdf` feature | PDF in which every page is a picture of the page |
 //!
 //! An animation keeps its frame delays and the number of times it plays.
 //! Every other type is refused with [`Error::Unsupported`] rather than
@@ -91,6 +92,8 @@ pub struct Options {
     /// can be aimed at: name the ones you do, and the others are refused
     /// with [`Error::Unsupported`] before any of them is run.
     pub types: Option<Vec<FileType>>,
+    /// Dots per inch at which the pages of a PDF are drawn, 36 to 600.
+    pub pdf_dpi: u16,
 }
 
 impl Default for Options {
@@ -98,6 +101,7 @@ impl Default for Options {
         Self {
             jpeg_quality: 90,
             types: None,
+            pdf_dpi: 150,
         }
     }
 }
@@ -110,11 +114,12 @@ pub struct Rebuilt {
     pub data: Vec<u8>,
     /// Its type, which is not always the type of the input.
     pub file_type: FileType,
-    /// Width in pixels, after any rotation; 0 for an SVG, which has none.
+    /// Width in pixels, after any rotation; 0 for an SVG or a PDF, which
+    /// have none.
     pub width: u32,
-    /// Height in pixels, after any rotation; 0 for an SVG.
+    /// Height in pixels, after any rotation; 0 for an SVG or a PDF.
     pub height: u32,
-    /// Number of frames; 1 unless the image is animated.
+    /// Number of frames of an animation or pages of a PDF; otherwise 1.
     pub frames: u32,
 }
 
@@ -238,7 +243,192 @@ fn rebuild_inner(data: &[u8], limits: &Limits, options: &Options) -> Result<Rebu
     match file_type {
         #[cfg(feature = "cdr-svg")]
         FileType::Svg => svg(data, limits, options, deadline),
+        #[cfg(feature = "cdr-pdf")]
+        FileType::Pdf => pdf(data, limits, options, deadline),
         _ => raster(data, file_type, limits, options, deadline),
+    }
+}
+
+/// A PDF whose pages are pictures of the pages of `data`, and nothing else:
+/// each page is drawn and the drawing is what the new file holds. Text can
+/// no longer be selected or searched, links and forms are gone, and so is
+/// everything else a PDF can carry.
+#[cfg(feature = "cdr-pdf")]
+fn pdf(
+    data: &[u8],
+    limits: &Limits,
+    options: &Options,
+    deadline: Deadline,
+) -> Result<Rebuilt, Error> {
+    use hayro::hayro_interpret::InterpreterSettings;
+    use hayro::hayro_syntax::Pdf;
+    use hayro::vello_cpu::color::palette::css::WHITE;
+    use hayro::{PixmapSettings, RenderCache, RenderSettings, render};
+
+    let document =
+        Pdf::new(data.to_vec()).map_err(|_| Error::Decode("the document cannot be read".into()))?;
+    let scale = f32::from(options.pdf_dpi.clamp(36, 600)) / 72.0;
+    let pixmap_settings = PixmapSettings {
+        x_scale: scale,
+        y_scale: scale,
+        bg_color: WHITE,
+    };
+    let (interpreter, render_settings) =
+        (InterpreterSettings::default(), RenderSettings::default());
+    let cache = RenderCache::new();
+
+    let mut written = PagesPdf::default();
+    for page in document.pages().iter() {
+        deadline.check()?;
+        // In points, of which there are 72 to the inch.
+        let (width, height) = page.render_dimensions();
+        let pixels = |points: f32| (points * scale) as u64;
+        let area = pixels(width).saturating_mul(pixels(height));
+        if !(1..=u64::from(u16::MAX)).contains(&pixels(width))
+            || !(1..=u64::from(u16::MAX)).contains(&pixels(height))
+            || area > limits.max_pixels
+            // The drawing and the copy of it without its alpha channel.
+            || area.saturating_mul(7) > limits.max_decompressed
+        {
+            return Err(Error::TooLarge);
+        }
+        let drawn = render(
+            page,
+            &cache,
+            &interpreter,
+            &render_settings,
+            &pixmap_settings,
+        );
+        // Opaque, on the white it was drawn on.
+        let colours: Vec<u8> = drawn
+            .data_as_u8_slice()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect();
+        written.page(width, height, drawn.width(), drawn.height(), &colours);
+        if written.len() as u64 > limits.max_decompressed {
+            return Err(Error::TooLarge);
+        }
+    }
+    let pages = written.pages();
+    if pages == 0 {
+        return Err(Error::Decode("the document has no pages".into()));
+    }
+    Ok(Rebuilt {
+        data: written.finish(),
+        file_type: FileType::Pdf,
+        width: 0,
+        height: 0,
+        frames: pages,
+    })
+}
+
+/// A PDF being written of which every page is one picture. Objects 1 and 2
+/// are the catalogue and the list of pages; each page then takes three:
+/// itself, the line that paints its picture, and the picture.
+#[cfg(feature = "cdr-pdf")]
+#[derive(Default)]
+struct PagesPdf {
+    data: Vec<u8>,
+    /// Where each object after the first two starts.
+    offsets: Vec<usize>,
+}
+
+#[cfg(feature = "cdr-pdf")]
+impl PagesPdf {
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn pages(&self) -> u32 {
+        (self.offsets.len() / 3) as u32
+    }
+
+    fn object(&mut self, dictionary: &str, stream: Option<&[u8]>) {
+        if self.data.is_empty() {
+            // The second line tells a reader that the file is binary.
+            self.data
+                .extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
+        }
+        self.offsets.push(self.data.len());
+        let number = self.offsets.len() + 2;
+        let head = format!("{number} 0 obj\n<< {dictionary} >>\n");
+        self.data.extend_from_slice(head.as_bytes());
+        if let Some(stream) = stream {
+            self.data.extend_from_slice(b"stream\n");
+            self.data.extend_from_slice(stream);
+            self.data.extend_from_slice(b"\nendstream\n");
+        }
+        self.data.extend_from_slice(b"endobj\n");
+    }
+
+    /// Add a page `width` by `height` points that shows `colours`, three
+    /// bytes to a pixel, over all of it.
+    fn page(&mut self, width: f32, height: f32, wide: u16, high: u16, colours: &[u8]) {
+        let first = self.offsets.len() + 3;
+        self.object(
+            &format!(
+                "/Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] \
+                 /Resources << /XObject << /P {} 0 R >> >> /Contents {} 0 R",
+                first + 2,
+                first + 1
+            ),
+            None,
+        );
+        let paint = format!("q {width} 0 0 {height} 0 0 cm /P Do Q");
+        self.object(&format!("/Length {}", paint.len()), Some(paint.as_bytes()));
+
+        // A page of black on white needs one channel, not three.
+        let grey = colours
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .all(|pixel| pixel[0] == pixel[1] && pixel[1] == pixel[2]);
+        let (space, samples) = if grey {
+            ("/DeviceGray", colours.iter().step_by(3).copied().collect())
+        } else {
+            ("/DeviceRGB", colours.to_vec())
+        };
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&samples, 6);
+        self.object(
+            &format!(
+                "/Type /XObject /Subtype /Image /Width {wide} /Height {high} \
+                 /ColorSpace {space} /BitsPerComponent 8 /Filter /FlateDecode /Length {}",
+                packed.len()
+            ),
+            Some(&packed),
+        );
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        let pages = self.pages();
+        let kids: Vec<String> = (0..pages)
+            .map(|page| format!("{} 0 R", 3 + page * 3))
+            .collect();
+        let catalogue = self.data.len();
+        self.data
+            .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let list = self.data.len();
+        let entry = format!(
+            "2 0 obj\n<< /Type /Pages /Count {pages} /Kids [{}] >>\nendobj\n",
+            kids.join(" ")
+        );
+        self.data.extend_from_slice(entry.as_bytes());
+
+        // The table of where every object is, which a reader starts from.
+        let table = self.data.len();
+        let mut tail = format!("xref\n0 {}\n0000000000 65535 f \n", self.offsets.len() + 3);
+        for offset in [catalogue, list].iter().chain(&self.offsets) {
+            tail += &format!("{offset:010} 00000 n \n");
+        }
+        tail += &format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{table}\n%%EOF\n",
+            self.offsets.len() + 3
+        );
+        self.data.extend_from_slice(tail.as_bytes());
+        self.data
     }
 }
 
@@ -1435,6 +1625,56 @@ mod tests {
         assert!(matches!(run(b"<svg"), Err(Error::Decode(_))));
     }
 
+    #[cfg(feature = "cdr-pdf")]
+    #[test]
+    fn pdf_pages_come_back_as_pictures() {
+        let corpus = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus");
+        let read = |name: &str| std::fs::read(format!("{corpus}/{name}")).unwrap();
+
+        let rebuilt = run(&read("clean/page.pdf")).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Pdf);
+        assert_eq!((rebuilt.width, rebuilt.height, rebuilt.frames), (0, 0, 1));
+        assert!(rebuilt.data.starts_with(b"%PDF-1.7\n"));
+        assert!(rebuilt.data.ends_with(b"%%EOF\n"));
+        assert!(scans_clean(&rebuilt.data));
+        // It is a document a reader takes: this one, to begin with.
+        let again = run(&rebuilt.data).unwrap();
+        assert_eq!(again.frames, 1);
+
+        // Twice the dots each way is four times the picture.
+        let size = |dpi| {
+            let options = Options {
+                pdf_dpi: dpi,
+                ..Options::default()
+            };
+            let rebuilt = rebuild(&read("clean/page.pdf"), &Limits::default(), &options);
+            let data = rebuilt.unwrap().data;
+            let width = data.windows(7).position(|w| w == b"/Width ").unwrap() + 7;
+            let digits: String = data[width..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .map(|&byte| byte as char)
+                .collect();
+            digits.parse::<u32>().unwrap()
+        };
+        assert_eq!(size(144), size(72) * 2);
+
+        // What a page does is not in a picture of it.
+        let script = read("malicious/javascript.pdf");
+        assert!(contains(&script, b"/JavaScript"));
+        let rebuilt = run(&script).unwrap();
+        assert!(!contains(&rebuilt.data, b"JavaScript"));
+        assert!(scans_clean(&rebuilt.data));
+
+        let small = Limits {
+            max_pixels: 100,
+            ..Limits::default()
+        };
+        let refused = rebuild(&read("clean/page.pdf"), &small, &Options::default());
+        assert!(matches!(refused, Err(Error::TooLarge)), "{refused:?}");
+        assert!(matches!(run(b"%PDF-1.7\nnothing"), Err(Error::Decode(_))));
+    }
+
     #[test]
     fn rebuilds_only_the_types_asked_for() {
         let png = encoded(&picture().into(), ImageFormat::Png);
@@ -1561,7 +1801,11 @@ mod tests {
 
     #[test]
     fn refuses_what_it_cannot_rebuild_whole() {
-        for data in [&b"%PDF-1.7\n"[..], b"%!PS-Adobe-3.0\nshowpage\n", b""] {
+        for data in [
+            &b"\x7fELF\x02\x01\x01\0"[..],
+            b"%!PS-Adobe-3.0\nshowpage\n",
+            b"",
+        ] {
             assert!(matches!(run(data), Err(Error::Unsupported { .. })));
         }
         let png = encoded(&picture().into(), ImageFormat::Png);

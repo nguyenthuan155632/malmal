@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-malmal = { path = "../crates/malmal", features = ["cdr"] }
+malmal = { path = "../crates/malmal", features = ["cdr", "cdr-svg", "cdr-pdf"] }
 
 # Not a member of the main workspace: fuzzing needs a nightly toolchain.
 [workspace]

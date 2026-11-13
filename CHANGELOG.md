@@ -25,6 +25,10 @@
   Animations keep their frames, delays and loop count; RGB, grey and CMYK colour profiles
   are applied, so that the new file, which has none, shows the same colours. `malmal sanitize` puts the
   new file in place of the old one in a single step, or leaves the old one alone.
+- Rebuilding beyond raster images: JPEG XL (as PNG); SVG with the `cdr-svg` feature,
+  filtered through an allowlist and checked again by the SVG analyzer; PDF with the
+  `cdr-pdf` feature, as pictures of its pages, at `--pdf-dpi`. `cdr::Options::types`
+  names the types that are rebuilt.
 - `malmal_sanitize` in the C interface and `Scanner.sanitize` in the Python binding;
   `malmal_scanner_new_with_passwords` and `Scanner(pdf_passwords=...)` for encrypted PDFs.
 - `malmald --connections`. Every connection has its own thread, and `--workers` now counts
@@ -49,8 +53,8 @@
 - `malmald --socket` is no longer required on its own: one of `--socket`, `--http`,
   `--clamd` or `--icap` is.
 - New dependencies: `md-5` and `aes`, for PDF decryption; `brotli-decompressor`, for JPEG XL
-  metadata; `image`, `png`, `moxcms`, `zune-jpeg` and `zune-core`, only with the `cdr`
-  feature.
+  metadata; `image`, `png`, `moxcms`, `zune-jpeg`, `zune-core` and `jxl-oxide`, only with
+  the `cdr` feature; `svg-hush` with `cdr-svg`; `hayro` with `cdr-pdf`.
 
 ### Behaviour to check when upgrading
 

@@ -155,7 +155,8 @@ fn rebuilt_images_are_clean() {
             assert_eq!(report.detected_type, image.file_type, "{name}");
             // A raster image has a size in pixels; a document has none.
             let sized = image.width > 0 && image.height > 0;
-            assert!(sized != (image.file_type == FileType::Svg), "{name}");
+            let document = matches!(image.file_type, FileType::Svg | FileType::Pdf);
+            assert!(sized != document, "{name}");
             assert!(image.frames > 0, "{name}");
             rebuilt_types.push(image.file_type);
         }

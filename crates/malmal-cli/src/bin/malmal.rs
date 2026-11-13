@@ -24,14 +24,17 @@ Usage: malmal scan [OPTIONS] <FILE>...
        malmal sanitize [OPTIONS] <INPUT> <OUTPUT>
 
 scan      Scans each FILE; `-` reads standard input.
-sanitize  Scans INPUT and, if it is a clean raster image, writes it anew
-          from its pixels to OUTPUT; `-` is standard input or output.
-          OUTPUT is replaced whole when the exit status is 0, and left
-          as it was otherwise.
+sanitize  Scans INPUT and, if it is clean and of a type that can be, writes
+          it anew to OUTPUT: an image from its pixels, an SVG from what
+          draws in it, a PDF as pictures of its pages. `-` is standard
+          input or output. OUTPUT is replaced whole when the exit status
+          is 0, and left as it was otherwise.
 
 Options:
   --json               scan: print one JSON object per file
-  --jpeg-quality <N>   sanitize: quality of a rebuilt JPEG, 1-100 [default: 90]";
+  --jpeg-quality <N>   sanitize: quality of a rebuilt JPEG, 1-100 [default: 90]
+  --pdf-dpi <N>        sanitize: dots per inch of a rebuilt PDF's pages,
+                       36-600 [default: 150]";
 
 const EXIT_STATUS: &str = "  -h, --help           Print this help
   -V, --version        Print version
@@ -46,6 +49,7 @@ struct Args {
     sanitize: bool,
     json: bool,
     jpeg_quality: u8,
+    pdf_dpi: u16,
     common: Common,
     files: Vec<String>,
     /// Where among the arguments the last of `files` is.
@@ -87,6 +91,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
         sanitize,
         json: false,
         jpeg_quality: 90,
+        pdf_dpi: 150,
         common: Common::default(),
         files: Vec::new(),
         last_file_at: 0,
@@ -106,6 +111,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
                 .and_then(|value| value.parse().ok())
                 .filter(|quality| (1..=100).contains(quality))
                 .ok_or("--jpeg-quality needs a number from 1 to 100")?;
+        } else if arg == "--pdf-dpi" && sanitize {
+            parsed.pdf_dpi = args
+                .next()
+                .and_then(|value| value.parse().ok())
+                .filter(|dpi| (36..=600).contains(dpi))
+                .ok_or("--pdf-dpi needs a number from 36 to 600")?;
         } else if !parsed.common.parse(&arg, &mut args)? {
             return Err(format!("unknown option {arg:?}"));
         }
@@ -272,6 +283,7 @@ fn sanitize(args: &Args, scanner: &malmal::Scanner) -> ExitCode {
     };
     let mut options = Options::default();
     options.jpeg_quality = args.jpeg_quality;
+    options.pdf_dpi = args.pdf_dpi;
     let running = watchdog.watch();
     let sanitized = match scanner.sanitize(&data, hints, &options) {
         Ok(sanitized) => sanitized,
@@ -286,13 +298,19 @@ fn sanitize(args: &Args, scanner: &malmal::Scanner) -> ExitCode {
     if let Err(error) = io::stdout().lock().write_all(&image.data) {
         return fail(format!("standard output: {error}"));
     }
+    // A document has pages, if anything; a picture has a size and frames.
+    let plural = if image.frames == 1 { "" } else { "s" };
+    let shape = match image.file_type {
+        malmal::FileType::Pdf => format!("{} page{plural}, ", image.frames),
+        _ if image.width == 0 => String::new(),
+        _ => format!(
+            "{}x{}, {} frame{plural}, ",
+            image.width, image.height, image.frames
+        ),
+    };
     eprintln!(
-        "{input}: rebuilt as {} ({}x{}, {} frame{}, {} bytes)",
+        "{input}: rebuilt as {} ({shape}{} bytes)",
         image.file_type.as_str(),
-        image.width,
-        image.height,
-        image.frames,
-        if image.frames == 1 { "" } else { "s" },
         image.data.len()
     );
     ExitCode::SUCCESS

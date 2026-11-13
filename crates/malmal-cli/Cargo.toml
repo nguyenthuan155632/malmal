@@ -35,10 +35,12 @@ bin-dir = "malmal-v{ version }-{ target }/bin/{ bin }"
 pkg-fmt = "tgz"
 
 [features]
-default = ["cdr", "cdr-svg"]
+default = ["cdr", "cdr-svg", "cdr-pdf"]
 # Adds `malmal sanitize` and the daemon's `POST /sanitize`.
 cdr = ["malmal/cdr"]
 # Lets them take SVG files too.
 cdr-svg = ["cdr", "malmal/cdr-svg"]
+# And PDF files, which come back as pictures of their pages.
+cdr-pdf = ["cdr", "malmal/cdr-pdf"]
 # Adds the --yara option.
 yara = ["malmal/yara"]

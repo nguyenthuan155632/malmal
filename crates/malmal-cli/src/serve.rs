@@ -559,6 +559,7 @@ fn sanitize(service: &Service, body: &[u8], hints: ScanHints<'_>) -> Option<Resp
                 FileType::Gif => "image/gif",
                 FileType::Webp => "image/webp",
                 FileType::Svg => "image/svg+xml",
+                FileType::Pdf => "application/pdf",
                 _ => "application/octet-stream",
             },
             body: sanitized.image.data,

@@ -331,7 +331,25 @@ Done after the first release, from the list of known limits and what a deploymen
       over one another here, since the `image` crate's decoder refuses them. Checked
       against Pillow.
 
-Not done: HEIC/AVIF/JPEG XL (no pure-Rust decoder to depend on).
+- [x] JPEG XL through `jxl-oxide`, written as PNG.
+- [x] SVG (`cdr-svg`) through Cloudflare's `svg-hush`, an allowlist filter. Embedded raster
+      images are rebuilt. The corpus showed the filter keeping an `<animate to="javascript:">`
+      whose target it had removed: inert, but the analyzer objects, so the result is run
+      through the analyzer and refused when it does. 300 SVG files from a desktop system
+      pass, and 60 of them render pixel for pixel as before.
+- [x] PDF (`cdr-pdf`), the Dangerzone way: `hayro` draws each page and a small writer here
+      puts the drawings in a new PDF. Text is no longer text.
+- [x] `Options::types`: the types to rebuild, so that unused decoders are never run.
+
+Not done:
+
+- AVIF. `zenavif` and `rav1d-safe`, the decoders in safe Rust, are AGPL-3.0, which this
+  project cannot link. `avif-decode` is BSD but builds `rav1d` with its hand-written
+  assembly on x86-64 (it needs `nasm`, and cannot be told not to), and `rav1d` has no
+  safe API of its own.
+- HEIC: no HEVC decoder in Rust.
+- A rebuilt PDF that keeps its text, which is the difference between this and a real
+  sanitizer for PDF.
 
 ### M12 — A time limit that holds
 

@@ -42,6 +42,7 @@ yara-x = { version = "1.23.0", default-features = false, optional = true, featur
 ] }
 jxl-oxide = { version = "0.12", default-features = false, features = ["image"], optional = true }
 svg-hush = { version = "0.9", optional = true }
+hayro = { version = "0.9", optional = true }
 
 [features]
 # YARA rule matching. Off by default: it adds a WebAssembly runtime and
@@ -62,6 +63,13 @@ svg-hush = ["dep:svg-hush"]
 
 # With `cdr`, also filtering SVG files down to what draws a picture.
 cdr-svg = ["cdr", "dep:svg-hush"]
+zenavif = []
+avif-decode = []
+hayro = ["dep:hayro"]
+
+# With `cdr`, also rendering each page of a PDF and writing a new one that
+# holds nothing but the pictures of the pages.
+cdr-pdf = ["cdr", "dep:hayro"]
 
 [lints.rust]
 # Set by cargo-fuzz.

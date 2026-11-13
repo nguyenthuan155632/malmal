@@ -20,7 +20,7 @@ clean. It is one layer of defense, not the only one.
 | Reject bad uploads in a Rust service | the `malmal` crate | [In a Rust service](#scan-uploads-in-a-rust-service) |
 | Reject bad uploads from any other language | `malmald --http` or `--socket` | [From any language](#scan-uploads-from-any-language) |
 | Do the same from Python or C without a daemon | the binding, the C library | [Python](#from-python), [C](#from-c) |
-| Keep the picture and nothing else of an image | `malmal sanitize`, `POST /sanitize` | [Rebuild images](#keep-only-the-picture-of-an-image) |
+| Keep the picture and nothing else of an image, an SVG or a PDF | `malmal sanitize`, `POST /sanitize` | [Rebuild files](#keep-only-the-picture-of-an-image) |
 | Replace ClamAV where software already calls `clamd` | `malmald --clamd` | [ClamAV clients](#serve-software-that-already-talks-to-clamav) |
 | Scan what passes through a proxy | `malmald --icap` | [Behind a proxy](#scan-what-passes-through-a-proxy) |
 
@@ -235,7 +235,23 @@ otherwise `stored.jpg` is left as it was, or absent. `-` is standard input or ou
 | GIF | GIF with every frame |
 | WebP | lossless WebP, with every frame of an animated one |
 | BMP, TIFF, ICO | PNG |
+| JPEG XL | PNG |
+| SVG | SVG, filtered down to what draws a picture |
+| PDF | PDF in which every page is a picture of the page, at `--pdf-dpi` (150) |
 | anything else | refused |
+
+An image is the easy case. The other two are documents, and are handled differently:
+
+- **SVG** goes through an allowlist ([svg-hush](https://github.com/cloudflare/svg-hush)):
+  elements and attributes that do not draw are left out, scripts, event handlers,
+  `foreignObject` and links to other sites among them. A raster image embedded in it is
+  rebuilt like one that stands alone. The result then has to pass malmal's own SVG
+  analyzer, and is refused if the two disagree about it.
+- **PDF** is drawn page by page ([hayro](https://github.com/LaurenzV/hayro)) and the new
+  file holds the drawings. What a page *does* is not in a picture of it, but neither is
+  its text: it can no longer be selected, searched or read aloud, links and forms are
+  gone, and the file is larger, some ten times for a text document. hayro calls itself
+  experimental; pages using features it lacks may not look the same.
 
 The same from a service:
 
@@ -520,8 +536,12 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
 - **Over ICAP a request body is judged as a file** unless it is a form. The endpoint is
   tested against the protocol as specified and behind Squid 6, not behind other proxies.
 - **Rebuilding keeps the pixels**, so data encoded in them survives, and it relies on the
-  `image` crate's decoders. HEIC, AVIF, JPEG XL and PSD are scanned but not rebuilt. An
-  animated PNG with 16 bits a channel comes out with 8.
+  `image` crate's decoders. HEIC, AVIF and PSD are scanned but not rebuilt: the decoders
+  for the first two that are written in safe Rust are under the AGPL, and the one that is
+  not brings hand-written assembly with it. An animated PNG with 16 bits a channel comes
+  out with 8, and of an animated JPEG XL only the first frame.
+- **A rebuilt PDF is a picture book.** Its pages look the same and do nothing; the text
+  in them is no longer text. A PDF that needs a password is not rebuilt.
 - **The time limit is checked between steps** of the analysis, and between the frames of
   an image being rebuilt; it bounds the work without cutting it off at an exact moment.
   The library cannot stop a step that does not end. The commands can: past
