@@ -184,7 +184,7 @@ pub unsafe extern "C" fn malmal_sanitize(
                 });
                 (MALMAL_CLEAN, Some(sanitized.image.data), info)
             }
-            Err(Error::Rejected(report)) => {
+            Err(Error::Rejected(report) | Error::Unclean(report)) => {
                 let info = serde_json::json!({ "report": report });
                 (report.verdict as c_int, None, info)
             }

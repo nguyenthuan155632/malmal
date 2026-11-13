@@ -140,18 +140,27 @@ fn rebuilt_images_are_clean() {
             if scanner.scan_bytes(&data, ScanHints::default()).verdict != Verdict::Clean {
                 assert!(matches!(sanitized, Err(Error::Rejected(_))), "{name}");
             }
+            // And whatever it hands back is clean, as scanned again.
+            if let Ok(sanitized) = &sanitized {
+                let again = scanner.scan_bytes(&sanitized.image.data, ScanHints::default());
+                assert_eq!(again.verdict, Verdict::Clean, "{name}");
+            }
             // Without the gate, a rebuild still leaves nothing but pixels.
             // Hand-built samples that no decoder accepts are skipped.
             let Ok(image) = cdr::rebuild(&data, &Limits::default(), &Options::default()) else {
                 continue;
             };
+            // What a scan can still object to is what the pixels themselves
+            // spell, which is why `sanitize` scans what it rebuilt.
             let report = scanner.scan_bytes(&image.data, ScanHints::default());
-            assert_eq!(
-                report.verdict,
-                Verdict::Clean,
-                "{name}: {:?}",
-                report.findings
-            );
+            let in_pixels = |code: &str| code == "image.polyglot" || code.starts_with("payload.");
+            let other: Vec<_> = report
+                .findings
+                .iter()
+                .filter(|finding| !in_pixels(finding.code))
+                .filter(|finding| finding.severity > malmal::Severity::Info)
+                .collect();
+            assert!(other.is_empty(), "{name}: {other:?}");
             assert_eq!(report.detected_type, image.file_type, "{name}");
             // A raster image has a size in pixels; a document has none.
             let sized = image.width > 0 && image.height > 0;
@@ -166,5 +175,37 @@ fn rebuilt_images_are_clean() {
             rebuilt_types.contains(&expected),
             "no {expected:?} was rebuilt"
         );
+    }
+}
+
+/// A picture whose pixels are the bytes of a PDF with a script in it. In the
+/// upload they are compressed and nothing shows; a PNG written from them
+/// stores them as they are, and is a PDF as well.
+#[cfg(feature = "cdr")]
+#[test]
+fn a_file_spelled_in_pixels_is_not_handed_back() {
+    use malmal::Limits;
+    use malmal::cdr::{self, Error, Options};
+
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/corpus/clean/pixels-spell-pdf.png");
+    let upload = fs::read(path).unwrap();
+    let scanner = Scanner::builder().build();
+    let header = |data: &[u8]| data.windows(5).any(|window| window == b"%PDF-");
+    assert_eq!(
+        scanner.scan_bytes(&upload, ScanHints::default()).verdict,
+        Verdict::Clean
+    );
+    assert!(!header(&upload));
+
+    let rebuilt = cdr::rebuild(&upload, &Limits::default(), &Options::default()).unwrap();
+    assert!(header(&rebuilt.data));
+
+    match scanner.sanitize(&upload, ScanHints::default(), &Options::default()) {
+        Err(Error::Unclean(report)) => {
+            assert_eq!(report.verdict, Verdict::Malicious);
+            assert!(report.findings.iter().any(|f| f.code == "image.polyglot"));
+        }
+        other => panic!("{other:?}"),
     }
 }

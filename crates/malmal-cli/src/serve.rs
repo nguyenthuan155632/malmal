@@ -233,7 +233,9 @@ impl Service {
                 self.metrics.record(&sanitized.report, started.elapsed());
                 self.metrics.rebuilt.fetch_add(1, Ordering::Relaxed);
             }
-            Err(Error::Rejected(report)) => self.metrics.record(report, started.elapsed()),
+            Err(Error::Rejected(report) | Error::Unclean(report)) => {
+                self.metrics.record(report, started.elapsed())
+            }
             // Scanned and clean, but not rebuilt; the scan is not counted twice.
             Err(_) => self.metrics.reject(),
         }
@@ -567,6 +569,14 @@ fn sanitize(service: &Service, body: &[u8], hints: ScanHints<'_>) -> Option<Resp
         Err(Error::Rejected(report)) => Response::json(
             "422 Unprocessable Content",
             serde_json::json!({ "ok": false, "error": "file is not clean", "report": report }),
+        ),
+        Err(Error::Unclean(report)) => Response::json(
+            "422 Unprocessable Content",
+            serde_json::json!({
+                "ok": false,
+                "error": "the rebuilt file is not clean",
+                "report": report,
+            }),
         ),
         Err(error @ Error::Unsupported { .. }) => {
             Response::error("415 Unsupported Media Type", &error.to_string())

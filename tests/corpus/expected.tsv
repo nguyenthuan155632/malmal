@@ -18,6 +18,7 @@ corpus/clean/pixel.gif	Clean
 corpus/clean/pixel.jpg	Clean	
 corpus/clean/pixel.png	Clean	
 corpus/clean/pixel.psd	Clean	
+corpus/clean/pixels-spell-pdf.png	Clean	
 corpus/clean/square.svg	Clean	
 corpus/clean/ycck-profile.jpg	Clean	
 corpus/malicious/elf-after-image.avif	Malicious	image.polyglot,image.trailing_data

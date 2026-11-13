@@ -535,7 +535,11 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
   `name.dangerous_extension` cannot be reported over it.
 - **Over ICAP a request body is judged as a file** unless it is a form. The endpoint is
   tested against the protocol as specified and behind Squid 6, not behind other proxies.
-- **Rebuilding keeps the pixels**, so data encoded in them survives, and it relies on the
+- **Rebuilding keeps the pixels**, so data encoded in them survives. That includes the
+  bytes of another file: a picture can be drawn whose pixels, written into a new PNG,
+  make it a PDF as well, with nothing to see in the upload. `sanitize` therefore scans
+  what it has rebuilt and refuses it when that scan is not clean; a caller of
+  `malmal::cdr::rebuild` has to do so itself. Rebuilding relies on the
   `image` crate's decoders. HEIC, AVIF and PSD are scanned but not rebuilt: the decoders
   for the first two that are written in safe Rust are under the AGPL, and the one that is
   not brings hand-written assembly with it. An animated PNG with 16 bits a channel comes

@@ -29,6 +29,10 @@
   filtered through an allowlist and checked again by the SVG analyzer; PDF with the
   `cdr-pdf` feature, as pictures of its pages, at `--pdf-dpi`. `cdr::Options::types`
   names the types that are rebuilt.
+- `Scanner::sanitize` scans the file it has rebuilt and refuses it when that scan is not
+  clean (`cdr::Error::Unclean`). Found by fuzzing: pixels that spell a PDF, hidden by the
+  compression of the upload, came out of the PNG encoder as they were, and the rebuilt
+  file was an image and a PDF with a script at once.
 - `malmal_sanitize` in the C interface and `Scanner.sanitize` in the Python binding;
   `malmal_scanner_new_with_passwords` and `Scanner(pdf_passwords=...)` for encrypted PDFs.
 - `malmald --connections`. Every connection has its own thread, and `--workers` now counts

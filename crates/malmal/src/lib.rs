@@ -170,10 +170,16 @@ impl Scanner {
         &self.limits
     }
 
-    /// Scan a file and, if it is a clean raster image, write it anew from
-    /// its pixels. The result is the file to store in place of the upload;
-    /// an error means there is nothing to store. See [`cdr`] for what is
+    /// Scan a file and, if it is clean and of a type that can be, write it
+    /// anew. The result is the file to store in place of the upload; an
+    /// error means there is nothing to store. See [`cdr`] for what is
     /// rebuilt and how.
+    ///
+    /// The new file is scanned as well. Pixels are kept, and a picture can
+    /// be drawn whose pixels, written out, spell another file: one that
+    /// was hidden by the compression of the upload and is not by that of
+    /// the new file. Such a result is refused with
+    /// [`cdr::Error::Unclean`].
     #[cfg(feature = "cdr")]
     #[cfg_attr(docsrs, doc(cfg(feature = "cdr")))]
     pub fn sanitize(
@@ -187,6 +193,10 @@ impl Scanner {
             return Err(cdr::Error::Rejected(Box::new(report)));
         }
         let image = cdr::rebuild(data, &self.limits, options)?;
+        let rebuilt = self.scan_bytes(&image.data, ScanHints::default());
+        if rebuilt.verdict != Verdict::Clean {
+            return Err(cdr::Error::Unclean(Box::new(rebuilt)));
+        }
         Ok(cdr::Sanitized { report, image })
     }
 

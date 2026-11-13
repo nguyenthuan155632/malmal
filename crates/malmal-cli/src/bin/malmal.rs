@@ -291,6 +291,10 @@ fn sanitize(args: &Args, scanner: &malmal::Scanner) -> ExitCode {
             eprint!("{}", describe(input, &report));
             return ExitCode::from(report.verdict as u8);
         }
+        Err(Error::Unclean(report)) => {
+            eprint!("{}", describe(&format!("{input}, rebuilt"), &report));
+            return ExitCode::from(report.verdict as u8);
+        }
         Err(error) => return fail(format!("{input}: {error}")),
     };
     drop(running);

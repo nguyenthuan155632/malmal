@@ -52,6 +52,12 @@
 //! fit its image, or cannot be read, is dropped as it is.
 //!
 //! What it does not do: pixels are kept, so anything encoded in them is too.
+//! That includes the bytes of another file. Where a format writes pixels
+//! that do not compress as they are, a picture can be drawn that comes out
+//! of [`rebuild`] as an image and, say, a PDF at once, though nothing of
+//! the kind could be seen in the file it was drawn in.
+//! [`Scanner::sanitize`](crate::Scanner::sanitize) scans what it has
+//! rebuilt for that reason; after calling [`rebuild`] yourself, do the same.
 
 use std::fmt;
 use std::io::Cursor;
@@ -140,6 +146,10 @@ pub struct Sanitized {
 pub enum Error {
     /// The scan did not come back clean.
     Rejected(Box<Report>),
+    /// The file was clean and was rebuilt, and the new file is not: the
+    /// report is the one on the new file. Its pixels spell something a
+    /// scan objects to, or it is of a type the policy does not accept.
+    Unclean(Box<Report>),
     /// The file is not an image this module rebuilds.
     Unsupported {
         /// What the file is.
@@ -163,6 +173,10 @@ impl fmt::Display for Error {
             Self::Rejected(report) => {
                 let codes: Vec<&str> = report.findings.iter().map(|f| f.code).collect();
                 write!(f, "file is not clean: {}", codes.join(", "))
+            }
+            Self::Unclean(report) => {
+                let codes: Vec<&str> = report.findings.iter().map(|f| f.code).collect();
+                write!(f, "the rebuilt file is not clean: {}", codes.join(", "))
             }
             Self::Unsupported { file_type, reason } => {
                 write!(f, "{} cannot be rebuilt: {reason}", file_type.as_str())
