@@ -1705,6 +1705,17 @@ mod tests {
         );
     }
 
+    /// Found by fuzzing: 51 bytes on which the JPEG XL decoder indexes past
+    /// the end of a list. A scan finds nothing in them.
+    #[test]
+    fn a_panic_in_a_decoder_is_an_error() {
+        let clean = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/clean");
+        let data = std::fs::read(format!("{clean}/decoder-panic.jxl")).unwrap();
+        assert!(scans_clean(&data));
+        let rebuilt = run(&data);
+        assert!(matches!(rebuilt, Err(Error::Decode(_))), "{rebuilt:?}");
+    }
+
     #[test]
     fn jpeg_xl_comes_back_as_png() {
         let clean = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/clean");
