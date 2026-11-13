@@ -27,8 +27,10 @@
   new file in place of the old one in a single step, or leaves the old one alone.
 - Rebuilding beyond raster images: JPEG XL (as PNG); SVG with the `cdr-svg` feature,
   filtered through an allowlist and checked again by the SVG analyzer; PDF with the
-  `cdr-pdf` feature, as pictures of its pages, at `--pdf-dpi`. `cdr::Options::types`
-  names the types that are rebuilt.
+  `cdr-pdf` feature, as pictures of its pages, at `--pdf-dpi`, optionally as JPEG
+  (`--pdf-jpeg`), and opened with the passwords supplied for scanning. `malmal-cli` and
+  `malmal-ffi` enable `cdr-svg` by default and `cdr-pdf` on request.
+  `cdr::Options::types` names the types that are rebuilt.
 - `Scanner::sanitize` scans the file it has rebuilt and refuses it when that scan is not
   clean (`cdr::Error::Unclean`). Found by fuzzing: pixels that spell a PDF, hidden by the
   compression of the upload, came out of the PNG encoder as they were, and the rebuilt

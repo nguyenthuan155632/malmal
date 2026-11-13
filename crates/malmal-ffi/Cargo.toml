@@ -17,5 +17,10 @@ doc = false
 test = true
 
 [dependencies]
-malmal = { path = "../malmal", version = "0.2.0", features = ["cdr", "cdr-svg", "cdr-pdf"] }
+malmal = { path = "../malmal", version = "0.2.0", features = ["cdr", "cdr-svg"] }
 serde_json.workspace = true
+
+[features]
+# Lets malmal_sanitize take PDF files, which come back as pictures of their
+# pages. See the `cdr-pdf` feature of `malmal`.
+cdr-pdf = ["malmal/cdr-pdf"]

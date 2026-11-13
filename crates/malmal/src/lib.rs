@@ -192,7 +192,7 @@ impl Scanner {
         if report.verdict != Verdict::Clean {
             return Err(cdr::Error::Rejected(Box::new(report)));
         }
-        let image = cdr::rebuild(data, &self.limits, options)?;
+        let image = cdr::rebuild_with(data, &self.limits, options, &self.pdf_passwords.0)?;
         let rebuilt = self.scan_bytes(&image.data, ScanHints::default());
         if rebuilt.verdict != Verdict::Clean {
             return Err(cdr::Error::Unclean(Box::new(rebuilt)));

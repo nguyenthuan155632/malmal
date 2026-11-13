@@ -237,7 +237,7 @@ otherwise `stored.jpg` is left as it was, or absent. `-` is standard input or ou
 | BMP, TIFF, ICO | PNG |
 | JPEG XL | PNG |
 | SVG | SVG, filtered down to what draws a picture |
-| PDF | PDF in which every page is a picture of the page, at `--pdf-dpi` (150) |
+| PDF, in a build with `cdr-pdf` | PDF in which every page is a picture of the page, at `--pdf-dpi` (150) |
 | anything else | refused |
 
 An image is the easy case. The other two are documents, and are handled differently:
@@ -250,8 +250,20 @@ An image is the easy case. The other two are documents, and are handled differen
 - **PDF** is drawn page by page ([hayro](https://github.com/LaurenzV/hayro)) and the new
   file holds the drawings. What a page *does* is not in a picture of it, but neither is
   its text: it can no longer be selected, searched or read aloud, links and forms are
-  gone, and the file is larger, some ten times for a text document. hayro calls itself
-  experimental; pages using features it lacks may not look the same.
+  gone, and the file is larger, some ten times for a text document. `--pdf-jpeg` keeps a
+  page as a JPEG where that is smaller, which it is for photographs and scans and is not
+  for text. A PDF that one of `--pdf-passwords` opens is rebuilt too, and comes back
+  needing none. hayro calls itself experimental; pages using features it lacks may not
+  look the same.
+
+  Because it changes what a document is, this is not in the released binaries, the
+  container or the Python wheels. Build it in:
+
+  ```bash
+  cargo install malmal-cli --features cdr-pdf
+  ```
+
+  It doubles the size of the binaries, to about 10 MB.
 
 The same from a service:
 

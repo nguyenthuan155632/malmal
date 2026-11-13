@@ -100,6 +100,22 @@ pub struct Options {
     pub types: Option<Vec<FileType>>,
     /// Dots per inch at which the pages of a PDF are drawn, 36 to 600.
     pub pdf_dpi: u16,
+    /// How the picture of each page is kept in a rebuilt PDF.
+    pub pdf_pages: PageImage,
+}
+
+/// How the picture of a page is kept in a rebuilt PDF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum PageImage {
+    /// Every pixel as it was drawn. Text stays sharp; a page of text takes
+    /// some hundred kilobytes, a photograph several megabytes.
+    #[default]
+    Lossless,
+    /// As a JPEG at [`Options::jpeg_quality`] where that is the smaller of
+    /// the two, which it is for photographs and scans, by far, and is not
+    /// for pages of text.
+    Jpeg,
 }
 
 impl Default for Options {
@@ -108,6 +124,7 @@ impl Default for Options {
             jpeg_quality: 90,
             types: None,
             pdf_dpi: 150,
+            pdf_pages: PageImage::Lossless,
         }
     }
 }
@@ -240,13 +257,30 @@ impl Deadline {
 /// of an animation and before a file is written, so one large frame can run
 /// past it; then the answer is [`Error::TimedOut`].
 pub fn rebuild(data: &[u8], limits: &Limits, options: &Options) -> Result<Rebuilt, Error> {
+    rebuild_with(data, limits, options, &[])
+}
+
+/// [`rebuild`], with passwords to try on a PDF that needs one.
+pub(crate) fn rebuild_with(
+    data: &[u8],
+    limits: &Limits,
+    options: &Options,
+    passwords: &[Vec<u8>],
+) -> Result<Rebuilt, Error> {
     // The codecs are not this crate's; a bug in one must not take the
     // caller down with it.
-    catch_unwind(AssertUnwindSafe(|| rebuild_inner(data, limits, options)))
+    let run = || rebuild_inner(data, limits, options, passwords);
+    catch_unwind(AssertUnwindSafe(run))
         .unwrap_or_else(|_| Err(Error::Decode("the decoder failed".into())))
 }
 
-fn rebuild_inner(data: &[u8], limits: &Limits, options: &Options) -> Result<Rebuilt, Error> {
+#[cfg_attr(not(feature = "cdr-pdf"), allow(unused_variables))]
+fn rebuild_inner(
+    data: &[u8],
+    limits: &Limits,
+    options: &Options,
+    passwords: &[Vec<u8>],
+) -> Result<Rebuilt, Error> {
     let file_type = detect::detect(data);
     let deadline = Deadline(Instant::now().checked_add(limits.max_duration));
     let wanted = |types: &Vec<FileType>| types.contains(&file_type);
@@ -258,7 +292,7 @@ fn rebuild_inner(data: &[u8], limits: &Limits, options: &Options) -> Result<Rebu
         #[cfg(feature = "cdr-svg")]
         FileType::Svg => svg(data, limits, options, deadline),
         #[cfg(feature = "cdr-pdf")]
-        FileType::Pdf => pdf(data, limits, options, deadline),
+        FileType::Pdf => pdf(data, limits, options, passwords, deadline),
         _ => raster(data, file_type, limits, options, deadline),
     }
 }
@@ -266,12 +300,14 @@ fn rebuild_inner(data: &[u8], limits: &Limits, options: &Options) -> Result<Rebu
 /// A PDF whose pages are pictures of the pages of `data`, and nothing else:
 /// each page is drawn and the drawing is what the new file holds. Text can
 /// no longer be selected or searched, links and forms are gone, and so is
-/// everything else a PDF can carry.
+/// everything else a PDF can carry. A document that one of `passwords`
+/// opens comes back as one that needs none.
 #[cfg(feature = "cdr-pdf")]
 fn pdf(
     data: &[u8],
     limits: &Limits,
     options: &Options,
+    passwords: &[Vec<u8>],
     deadline: Deadline,
 ) -> Result<Rebuilt, Error> {
     use hayro::hayro_interpret::InterpreterSettings;
@@ -279,8 +315,16 @@ fn pdf(
     use hayro::vello_cpu::color::palette::css::WHITE;
     use hayro::{PixmapSettings, RenderCache, RenderSettings, render};
 
-    let document =
-        Pdf::new(data.to_vec()).map_err(|_| Error::Decode("the document cannot be read".into()))?;
+    // The empty password first, which is the one most encrypted documents
+    // have; the renderer takes passwords as text.
+    let data = hayro::hayro_syntax::PdfData::from(data.to_vec());
+    let open = |password: &str| Pdf::new_with_password(data.clone(), password).ok();
+    let mut supplied = passwords
+        .iter()
+        .filter_map(|password| std::str::from_utf8(password).ok());
+    let document = open("")
+        .or_else(|| supplied.find_map(open))
+        .ok_or_else(|| Error::Decode("the document cannot be read".into()))?;
     let scale = f32::from(options.pdf_dpi.clamp(36, 600)) / 72.0;
     let pixmap_settings = PixmapSettings {
         x_scale: scale,
@@ -321,7 +365,8 @@ fn pdf(
             .iter()
             .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
             .collect();
-        written.page(width, height, drawn.width(), drawn.height(), &colours);
+        let jpeg = (options.pdf_pages == PageImage::Jpeg).then_some(options.jpeg_quality);
+        written.page(width, height, drawn.width(), drawn.height(), &colours, jpeg)?;
         if written.len() as u64 > limits.max_decompressed {
             return Err(Error::TooLarge);
         }
@@ -379,8 +424,17 @@ impl PagesPdf {
     }
 
     /// Add a page `width` by `height` points that shows `colours`, three
-    /// bytes to a pixel, over all of it.
-    fn page(&mut self, width: f32, height: f32, wide: u16, high: u16, colours: &[u8]) {
+    /// bytes to a pixel, over all of it: pixel for pixel, or as a JPEG of
+    /// the quality given if that comes out smaller.
+    fn page(
+        &mut self,
+        width: f32,
+        height: f32,
+        wide: u16,
+        high: u16,
+        colours: &[u8],
+        jpeg: Option<u8>,
+    ) -> Result<(), Error> {
         let first = self.offsets.len() + 3;
         self.object(
             &format!(
@@ -405,15 +459,31 @@ impl PagesPdf {
         } else {
             ("/DeviceRGB", colours.to_vec())
         };
-        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&samples, 6);
+        let mut filter = "/FlateDecode";
+        let mut packed = miniz_oxide::deflate::compress_to_vec_zlib(&samples, 6);
+        if let Some(quality) = jpeg {
+            let kind = if grey {
+                ExtendedColorType::L8
+            } else {
+                ExtendedColorType::Rgb8
+            };
+            let mut lossy = Vec::new();
+            JpegEncoder::new_with_quality(&mut lossy, quality.clamp(1, 100))
+                .encode(&samples, wide.into(), high.into(), kind)
+                .map_err(encode_error)?;
+            if lossy.len() < packed.len() {
+                (filter, packed) = ("/DCTDecode", lossy);
+            }
+        }
         self.object(
             &format!(
                 "/Type /XObject /Subtype /Image /Width {wide} /Height {high} \
-                 /ColorSpace {space} /BitsPerComponent 8 /Filter /FlateDecode /Length {}",
+                 /ColorSpace {space} /BitsPerComponent 8 /Filter {filter} /Length {}",
                 packed.len()
             ),
             Some(&packed),
         );
+        Ok(())
     }
 
     fn finish(mut self) -> Vec<u8> {
@@ -1687,6 +1757,73 @@ mod tests {
         let refused = rebuild(&read("clean/page.pdf"), &small, &Options::default());
         assert!(matches!(refused, Err(Error::TooLarge)), "{refused:?}");
         assert!(matches!(run(b"%PDF-1.7\nnothing"), Err(Error::Decode(_))));
+    }
+
+    #[cfg(feature = "cdr-pdf")]
+    #[test]
+    fn pdf_pages_can_be_kept_as_jpeg() {
+        let corpus = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus");
+        let data = std::fs::read(format!("{corpus}/clean/page.pdf")).unwrap();
+        let options = Options {
+            pdf_pages: PageImage::Jpeg,
+            ..Options::default()
+        };
+        // A blank page is smaller pixel for pixel, and stays that way.
+        let rebuilt = rebuild(&data, &Limits::default(), &options).unwrap();
+        assert!(contains(&rebuilt.data, b"/Filter /FlateDecode"));
+
+        // A photograph is not: shades that run into one another, with grain.
+        let photograph: Vec<u8> = (0..120u32 * 80)
+            .flat_map(|i| {
+                let (x, y) = (i % 120, i / 120);
+                let grain = i.wrapping_mul(2_654_435_761) >> 29;
+                [x + y + grain, 2 * x + grain, 255 - y - grain].map(|shade| shade as u8)
+            })
+            .collect();
+        let page = |jpeg| {
+            let mut written = PagesPdf::default();
+            written
+                .page(120.0, 80.0, 120, 80, &photograph, jpeg)
+                .unwrap();
+            written.finish()
+        };
+        let (lossless, lossy) = (page(None), page(Some(75)));
+        assert!(contains(&lossless, b"/Filter /FlateDecode"));
+        assert!(contains(&lossy, b"/Filter /DCTDecode /Length"));
+        assert!(lossy.len() < lossless.len());
+        // A reader takes both: this one draws them again.
+        for written in [lossless, lossy] {
+            assert!(scans_clean(&written));
+            assert_eq!(run(&written).unwrap().frames, 1);
+        }
+    }
+
+    #[cfg(feature = "cdr-pdf")]
+    #[test]
+    fn a_supplied_password_opens_a_pdf_for_rebuilding() {
+        // Its user password is "secret", its owner password "owner".
+        let data = include_bytes!("../tests/data/password-page.pdf");
+        assert!(matches!(run(data), Err(Error::Decode(_))));
+        for password in ["secret", "owner"] {
+            let passwords = [b"wrong".to_vec(), vec![0xFF, 0xFE], password.into()];
+            let rebuilt =
+                rebuild_with(data, &Limits::default(), &Options::default(), &passwords).unwrap();
+            assert_eq!((rebuilt.file_type, rebuilt.frames), (FileType::Pdf, 1));
+            // What comes back needs no password, and shows the page.
+            assert!(!contains(&rebuilt.data, b"/Encrypt"));
+            assert!(scans_clean(&rebuilt.data));
+            assert_eq!(run(&rebuilt.data).unwrap().frames, 1);
+        }
+
+        // Through the scanner: without the password it is not clean, so it
+        // is not rebuilt; with it, it is both.
+        let closed = crate::Scanner::builder().build();
+        let hints = crate::ScanHints::default();
+        let refused = closed.sanitize(data, hints, &Options::default());
+        assert!(matches!(refused, Err(Error::Rejected(_))), "{refused:?}");
+        let opened = crate::Scanner::builder().pdf_passwords(["secret"]).build();
+        let sanitized = opened.sanitize(data, hints, &Options::default()).unwrap();
+        assert_eq!(sanitized.image.file_type, FileType::Pdf);
     }
 
     #[test]

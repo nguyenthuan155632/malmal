@@ -340,6 +340,12 @@ Done after the first release, from the list of known limits and what a deploymen
 - [x] PDF (`cdr-pdf`), the Dangerzone way: `hayro` draws each page and a small writer here
       puts the drawings in a new PDF. Text is no longer text.
 - [x] `Options::types`: the types to rebuild, so that unused decoders are never run.
+- [x] `cdr-pdf` is opt-in for the commands and the C library: it turns a document into
+      pictures, doubles the binaries, and rests on a renderer that calls itself
+      experimental. Pages can be kept as JPEG where that is smaller (it is for scans, not
+      for text), and the passwords given for scanning open a PDF for rebuilding.
+- [x] Fuzzing the new decoders turned up three panics in `jxl-oxide`, all caught and
+      answered as errors. One is reported upstream with a fix; see `tests/corpus/clean/decoder-panic.jxl`.
 
 Not done:
 

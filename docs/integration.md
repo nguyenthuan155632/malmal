@@ -166,8 +166,9 @@ malmal = { version = "0.2", features = ["cdr"] }
 returns a new file. Store that one; the upload itself is not kept. A raster image is
 written from its pixels. Two more features add the document types: `cdr-svg` filters an
 SVG down to what draws, and `cdr-pdf` draws each page of a PDF and writes a PDF of the
-drawings. `Options::types` names the types to rebuild when you take only some; the
-decoders for the others are then never run.
+drawings, in which text is no longer text. The commands and the C library are built with
+the first and, unless asked, without the second. `Options::types` names the types to
+rebuild when you take only some; the decoders for the others are then never run.
 
 ```rust
 use malmal::cdr::{Error, Options};

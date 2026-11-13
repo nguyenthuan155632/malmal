@@ -48,6 +48,17 @@ jobs:
           MALMAL_LIBRARY: ${{ github.workspace }}/target/release/libmalmal_ffi.so
           PYTHONPATH: bindings/python
 
+  # The feature that is off by default: rebuilding PDF files.
+  pdf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: >
+          cargo test -p malmal -p malmal-cli -p malmal-ffi
+          --features malmal/cdr-pdf,malmal-cli/cdr-pdf,malmal-ffi/cdr-pdf
+
   yara:
     runs-on: ubuntu-latest
     steps:

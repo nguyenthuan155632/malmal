@@ -91,10 +91,15 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual((drawing.file_type, drawing.width, drawing.frames), ("svg", 0, 1))
             self.assertIn(b"<rect", drawing.data)
 
-            pages = scanner.sanitize(read("clean/page.pdf"), filename="a.pdf")
-            self.assertEqual((pages.file_type, pages.width, pages.frames), ("pdf", 0, 1))
-            self.assertTrue(pages.data.startswith(b"%PDF-1.7"))
-            self.assertTrue(scanner.scan(pages.data).clean)
+            # Only a library built with the `cdr-pdf` feature takes these.
+            try:
+                pages = scanner.sanitize(read("clean/page.pdf"), filename="a.pdf")
+            except malmal.NotRebuilt as refused:
+                self.assertIn("not a type this build rebuilds", str(refused))
+            else:
+                self.assertEqual((pages.file_type, pages.width, pages.frames), ("pdf", 0, 1))
+                self.assertTrue(pages.data.startswith(b"%PDF-1.7"))
+                self.assertTrue(scanner.scan(pages.data).clean)
 
             # Clean to a scan; rebuilt, its pixels are a PDF. See the corpus test.
             with self.assertRaises(malmal.Rejected) as raised:

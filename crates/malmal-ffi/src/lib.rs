@@ -431,9 +431,13 @@ mod tests {
 
         let pdf = include_bytes!("../../../tests/corpus/clean/page.pdf");
         let (status, rebuilt, info) = sanitize(scanner, pdf);
-        assert_eq!(status, MALMAL_CLEAN, "{info}");
-        assert!(rebuilt.starts_with(b"%PDF-1.7"));
-        assert!(info.contains(r#""file_type":"pdf""#), "{info}");
+        if cfg!(feature = "cdr-pdf") {
+            assert_eq!(status, MALMAL_CLEAN, "{info}");
+            assert!(rebuilt.starts_with(b"%PDF-1.7"));
+            assert!(info.contains(r#""file_type":"pdf""#), "{info}");
+        } else {
+            assert_eq!(status, MALMAL_NOT_REBUILT, "{info}");
+        }
 
         // A picture whose pixels are a PDF: the report is on the new file.
         let polyglot = include_bytes!("../../../tests/corpus/clean/pixels-spell-pdf.png");
