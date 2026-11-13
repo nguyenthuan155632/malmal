@@ -345,7 +345,8 @@ Done after the first release, from the list of known limits and what a deploymen
       experimental. Pages can be kept as JPEG where that is smaller (it is for scans, not
       for text), and the passwords given for scanning open a PDF for rebuilding.
 - [x] Fuzzing the new decoders turned up three panics in `jxl-oxide`, all caught and
-      answered as errors. One is reported upstream with a fix; see `tests/corpus/clean/decoder-panic.jxl`.
+      answered as errors. One is reported upstream with a fix
+      (tirr-c/jxl-oxide#514); see `tests/corpus/clean/decoder-panic.jxl`.
 
 Not done:
 
