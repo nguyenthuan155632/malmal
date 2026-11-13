@@ -299,8 +299,12 @@ and forwards it only if the daemon lets it through. With Squid:
 ```
 icap_enable on
 icap_service malmal_req reqmod_precache icap://127.0.0.1:1344/scan bypass=off
-acl uploads urlpath_regex ^/upload
+icap_service malmal_resp respmod_precache icap://127.0.0.1:1344/scan bypass=off
+# Uploads on the way in, files on the way out.
+acl uploads method POST PUT
+acl downloads urlpath_regex -i \.(png|jpe?g|gif|webp|pdf)$
 adaptation_access malmal_req allow uploads
+adaptation_access malmal_resp allow downloads
 ```
 
 `bypass=off` is what keeps this fail-closed: with it, Squid refuses the request when the
@@ -310,19 +314,34 @@ What is judged is a file, not an HTTP message:
 
 - every part of a `multipart/form-data` request that has a file name is scanned, with that
   name and the part's `Content-Type` as the claims; the other fields are not looked at;
-- a URL-encoded form passes, as does a message without a body;
+- a URL-encoded form passes if its body is made of form fields, as does a message without
+  a body. A body sent under that name that is not one, a script or an executable, say, is
+  scanned as a file;
 - any other body is scanned as the file itself. A `PUT` is named by its URL, a response by
   its `Content-Disposition`.
 
-So send it the URLs that take uploads, as the `acl` above does, not every request: a JSON
-API call is not a file the scanner knows and would be blocked as `type.unknown`.
+So send it the requests that carry uploads and the responses that carry files, as the
+`acl` lines above do, not everything: a JSON API call or an HTML page is not a file the
+scanner knows and would be blocked as `type.unknown`.
 
 A clean message is answered `204`, or echoed when the proxy did not send `Allow: 204`.
 Anything else is replaced by a `403 Forbidden` response, with the reason in
 `X-Infection-Found: Type=0; Resolution=2; Threat=Malmal.Malicious.pdf.javascript;`, or in
-`X-Block-Reason` when the body was too large or could not be taken apart. Previews are
-supported. The endpoint follows the RFC and is tested against it; it has not yet been run
-behind a particular proxy, so try it on yours before relying on it.
+`X-Block-Reason` when the body was too large or could not be taken apart. Those are ICAP
+headers: the proxy sees them and can log them, the client gets the `403` alone. Previews
+are supported.
+
+The endpoint is tested against the RFC and has been run behind Squid 6 with the
+configuration above: uploads raw, by `PUT` and in forms, downloads, bodies over the size
+limit, and some hundreds of requests at once. Other proxies have not been tried.
+
+### Connections and workers
+
+Every connection has a thread of its own, up to `--connections` (256); beyond that they
+wait to be accepted. `--workers` (4) is the number of requests worked on at once, across
+all endpoints, and is what bounds memory and processors: each can hold a file of
+`--max-size`. A connection kept open between requests holds no worker, so clients that
+keep theirs, as proxies and HTTP clients do, do not keep others waiting.
 
 ### Limits and timeouts
 

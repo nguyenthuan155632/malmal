@@ -494,6 +494,10 @@ impl Canvas {
     /// much memory it may use.
     fn of(decoder: &mut impl ImageDecoder, limits: &Limits) -> Result<Self, Error> {
         let (width, height) = decoder.dimensions();
+        // Some decoders take such a file and make frames of their own size.
+        if width == 0 || height == 0 {
+            return Err(Error::Decode("image has a zero dimension".into()));
+        }
         if width as u64 * height as u64 > limits.max_pixels
             || decoder.total_bytes() > limits.max_decompressed
         {
@@ -1344,6 +1348,29 @@ mod tests {
         let png = encoded(&picture().into(), ImageFormat::Png);
         let rebuilt = rebuild(&png, &none, &Options::default());
         assert!(matches!(rebuilt, Err(Error::TimedOut)), "{rebuilt:?}");
+    }
+
+    /// Found by fuzzing: the decoder takes a GIF whose screen has no height,
+    /// and the file written from it had none either.
+    #[test]
+    fn refuses_an_image_without_area() {
+        let mut gif = Vec::new();
+        let frame = RgbaImage::from_pixel(6, 4, Rgba([9, 9, 9, 255]));
+        GifEncoder::new(&mut gif)
+            .encode_frame(Frame::from_parts(
+                frame,
+                0,
+                0,
+                Delay::from_numer_denom_ms(10, 1),
+            ))
+            .unwrap();
+        assert!(run(&gif).is_ok());
+        for dimension in [6, 8] {
+            let mut flat = gif.clone();
+            flat[dimension..dimension + 2].fill(0);
+            let rebuilt = run(&flat);
+            assert!(matches!(rebuilt, Err(Error::Decode(_))), "{rebuilt:?}");
+        }
     }
 
     #[test]

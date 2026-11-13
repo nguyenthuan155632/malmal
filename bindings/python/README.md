@@ -13,6 +13,7 @@ if not report.clean:
 ```
 
 Anything but `report.clean`, including a `malmal.ScanError`, means the file is not accepted.
+`Scanner(pdf_passwords=["..."])` supplies passwords to try on encrypted PDFs.
 
 `sanitize` scans and then writes a clean image anew from its pixels, so that nothing but the
 picture is kept:

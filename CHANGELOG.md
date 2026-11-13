@@ -22,10 +22,14 @@
 - The `cdr` feature: `Scanner::sanitize` and `malmal::cdr::rebuild` decode a clean raster
   image and write a new file from its pixels. `malmal sanitize INPUT OUTPUT` and the
   daemon's `POST /sanitize` do the same; `malmal-cli` enables the feature by default.
-  Animations keep their frames, delays and loop count; an RGB colour profile is applied,
-  so that the new file, which has none, shows the same colours. `malmal sanitize` puts the
+  Animations keep their frames, delays and loop count; RGB, grey and CMYK colour profiles
+  are applied, so that the new file, which has none, shows the same colours. `malmal sanitize` puts the
   new file in place of the old one in a single step, or leaves the old one alone.
-- `malmal_sanitize` in the C interface and `Scanner.sanitize` in the Python binding.
+- `malmal_sanitize` in the C interface and `Scanner.sanitize` in the Python binding;
+  `malmal_scanner_new_with_passwords` and `Scanner(pdf_passwords=...)` for encrypted PDFs.
+- `malmald --connections`. Every connection has its own thread, and `--workers` now counts
+  the requests worked on at once across all endpoints, not the connections on each: a
+  client that keeps its connection open no longer holds a worker while idle.
 - `--hard-timeout`: a scan still running after it ends the process, where the scan's own
   time limit, checked between steps, could be waited for in vain.
 - `malmald --icap`: ICAP `REQMOD` and `RESPMOD` for proxies. Multipart forms are taken
@@ -45,7 +49,8 @@
 - `malmald --socket` is no longer required on its own: one of `--socket`, `--http`,
   `--clamd` or `--icap` is.
 - New dependencies: `md-5` and `aes`, for PDF decryption; `brotli-decompressor`, for JPEG XL
-  metadata; `image`, `png` and `moxcms`, only with the `cdr` feature.
+  metadata; `image`, `png`, `moxcms`, `zune-jpeg` and `zune-core`, only with the `cdr`
+  feature.
 
 ### Behaviour to check when upgrading
 

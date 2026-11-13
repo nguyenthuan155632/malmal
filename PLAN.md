@@ -285,8 +285,14 @@ Done after the first release, from the list of known limits and what a deploymen
 - [x] PDF passwords supplied by the caller, tried as user and as owner password, checked
       against files written by qpdf for every revision.
 - [x] Brotli metadata in JPEG XL is decompressed and searched (`brotli-decompressor`).
-- [x] `malmald --icap`: `OPTIONS`, `REQMOD`, `RESPMOD`, previews, multipart forms. Not yet
-      run against Squid or c-icap.
+- [x] `malmald --icap`: `OPTIONS`, `REQMOD`, `RESPMOD`, previews, multipart forms. Run
+      behind Squid 6, which is what showed the three things below.
+- [x] A body called a URL-encoded form passes unscanned only if it is one.
+- [x] An oversized body is read to its end before it is refused, so the proxy gets the
+      reply rather than a closed connection.
+- [x] A thread per connection, with `--workers` bounding the requests in work and
+      `--connections` the connections: a proxy's idle connections used to hold every
+      worker until they timed out.
 
 ### M10 — Distribution
 
@@ -318,8 +324,14 @@ Done after the first release, from the list of known limits and what a deploymen
 - [x] `malmal sanitize` writes through a second, sandboxed process and renames the result
       into place, so the output is whole or untouched.
 
-Not done: HEIC/AVIF/JPEG XL (no pure-Rust decoder to depend on), animated PNG at 16 bits,
-CMYK and grey colour profiles.
+- [x] Grey profiles on grey images, and CMYK profiles on CMYK JPEGs in both forms the inks
+      are stored in (`zune-jpeg` for the inks as stored, `moxcms` for the conversion).
+      Checked against ImageMagick with real profiles.
+- [x] Animated PNG at 16 bits a channel: the frames are read with the `png` crate and laid
+      over one another here, since the `image` crate's decoder refuses them. Checked
+      against Pillow.
+
+Not done: HEIC/AVIF/JPEG XL (no pure-Rust decoder to depend on).
 
 ### M12 — A time limit that holds
 

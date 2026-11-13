@@ -159,9 +159,10 @@ file was written; it then takes the place of `stored.jpg` in one step, and other
 | BMP, TIFF, ICO | PNG |
 
 An animation keeps its frame delays and its loop count. Every other type is refused. The
-new file carries no colour profile, so it is read as sRGB: the pixels of an image with an
-RGB profile are converted to sRGB first, which keeps its colours as far as sRGB can show
-them, and any other profile is dropped. A lossy WebP grows when it is stored losslessly.
+new file carries no colour profile, so it is read as sRGB: the pixels of an image with a
+profile are converted to sRGB first, which keeps its colours as far as sRGB can show them.
+That covers RGB and grey profiles, and the CMYK profile of a CMYK JPEG; a profile that does
+not fit its image is dropped. A lossy WebP grows when it is stored losslessly.
 
 From Rust it is `Scanner::sanitize` and `malmal::cdr::rebuild`, behind the `cdr` feature;
 over HTTP it is `POST /sanitize`; from C and Python, `malmal_sanitize` and
@@ -189,7 +190,9 @@ curl --data-binary @upload.pdf 'http://127.0.0.1:8080/scan?filename=upload.pdf'
 
 The reply is `{"ok": true, "report": {...}}`; anything else means the file was not scanned.
 The daemon has no authentication: bind it to the loopback interface or a Unix socket.
-`--max-size` and `--scan-timeout` set the limits for every request. A scan still running
+`--workers` is the number of requests worked on at once and `--connections` the number of
+connections kept open; an idle connection holds no worker. `--max-size` and
+`--scan-timeout` set the limits for every request. A scan still running
 after `--hard-timeout` (six times the scan timeout unless given) ends the daemon, for its
 supervisor to start again; see [Limits and timeouts](docs/integration.md#limits-and-timeouts).
 The protocols, the metrics and client examples are in
@@ -297,10 +300,9 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
   `name.dangerous_extension` cannot be reported over it.
 - **Over ICAP a request body is judged as a file** unless it is a form: route only upload
   URLs to it, or JSON API calls are blocked as `type.unknown`. The ICAP endpoint is tested
-  against the protocol as specified, not yet against a particular proxy.
+  against the protocol as specified and behind Squid 6, not behind other proxies.
 - **Rebuilding keeps the pixels**, so data encoded in them survives, and it relies on the
-  `image` crate's decoders. An animated PNG with 16 bits a channel is refused, and CMYK
-  and grey colour profiles are dropped rather than applied.
+  `image` crate's decoders. An animated PNG with 16 bits a channel comes out with 8.
 - **The time limit is checked between steps** of the analysis, and between the frames of
   an image being rebuilt; it bounds the work without cutting it off at an exact moment.
   The library cannot stop a step that does not end. The commands can: past
