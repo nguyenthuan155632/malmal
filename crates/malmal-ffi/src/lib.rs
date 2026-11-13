@@ -24,11 +24,27 @@ pub unsafe extern "C" fn malmal_scanner_new(
     hashlist: *const c_char,
     hashlist_len: usize,
 ) -> *mut malmal_scanner {
-    let text: &[u8] = if hashlist.is_null() {
-        &[]
-    } else {
-        // SAFETY: the caller guarantees `hashlist_len` readable bytes.
-        unsafe { std::slice::from_raw_parts(hashlist.cast(), hashlist_len) }
+    // SAFETY: the caller's guarantee is the one asked for there.
+    unsafe { malmal_scanner_new_with_passwords(strict, hashlist, hashlist_len, ptr::null(), 0) }
+}
+
+/// # Safety
+/// `hashlist` must be null or point to `hashlist_len` readable bytes, and
+/// `pdf_passwords` null or to `pdf_passwords_len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn malmal_scanner_new_with_passwords(
+    strict: c_int,
+    hashlist: *const c_char,
+    hashlist_len: usize,
+    pdf_passwords: *const c_char,
+    pdf_passwords_len: usize,
+) -> *mut malmal_scanner {
+    // SAFETY: the caller guarantees each is null or as long as it says.
+    let (text, passwords) = unsafe {
+        (
+            lines(hashlist, hashlist_len),
+            lines(pdf_passwords, pdf_passwords_len),
+        )
     };
     let built = catch_unwind(|| {
         let hashlist = HashList::parse(std::str::from_utf8(text).ok()?).ok()?;
@@ -37,7 +53,13 @@ pub unsafe extern "C" fn malmal_scanner_new(
         } else {
             Policy::default()
         };
-        Some(Scanner::builder().policy(policy).hashlist(hashlist).build())
+        // One to a line; a password is bytes, not necessarily text.
+        let passwords = passwords
+            .split(|&byte| byte == b'\n')
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .filter(|line| !line.is_empty());
+        let builder = Scanner::builder().policy(policy).hashlist(hashlist);
+        Some(builder.pdf_passwords(passwords).build())
     });
     match built {
         Ok(Some(scanner)) => Box::into_raw(Box::new(malmal_scanner(scanner))),
@@ -214,6 +236,18 @@ pub unsafe extern "C" fn malmal_bytes_free(bytes: *mut u8, len: usize) {
     }
 }
 
+/// The text an optional argument points to; none is empty.
+///
+/// # Safety
+/// `text` must be null or point to `len` readable bytes.
+unsafe fn lines<'a>(text: *const c_char, len: usize) -> &'a [u8] {
+    if text.is_null() || len == 0 {
+        return &[];
+    }
+    // SAFETY: the caller guarantees `len` readable bytes.
+    unsafe { std::slice::from_raw_parts(text.cast(), len) }
+}
+
 /// The scanner and the file a call was given, or `None` if they are not
 /// usable.
 ///
@@ -382,6 +416,33 @@ mod tests {
         unsafe {
             malmal_bytes_free(ptr::null_mut(), 0);
             malmal_scanner_free(scanner);
+        }
+    }
+
+    #[test]
+    fn supplied_passwords_open_encrypted_documents() {
+        // Its user password is "secret".
+        let pdf = include_bytes!("../../../tests/corpus/malicious/password-javascript.pdf");
+        let closed = unsafe { malmal_scanner_new(0, ptr::null(), 0) };
+        let (_, report) = scan(closed, pdf, c"a.pdf");
+        assert!(report.contains("cannot be inspected"), "{report}");
+
+        let passwords = "wrong\r\n\nsecret\n";
+        let opened = unsafe {
+            malmal_scanner_new_with_passwords(
+                0,
+                ptr::null(),
+                0,
+                passwords.as_ptr().cast(),
+                passwords.len(),
+            )
+        };
+        let (verdict, report) = scan(opened, pdf, c"a.pdf");
+        assert_eq!(verdict, 2);
+        assert!(report.contains("a supplied password"), "{report}");
+        unsafe {
+            malmal_scanner_free(closed);
+            malmal_scanner_free(opened);
         }
     }
 

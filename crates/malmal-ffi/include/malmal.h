@@ -31,6 +31,18 @@ enum {
 malmal_scanner *malmal_scanner_new(int strict, const char *hashlist,
                                    size_t hashlist_len);
 
+/*
+ * As malmal_scanner_new, with passwords to try on encrypted PDFs, each as
+ * user and as owner password: `pdf_passwords` is `pdf_passwords_len` bytes,
+ * one password per line, or NULL for none. A document one of them opens is
+ * decrypted and inspected like any other.
+ */
+malmal_scanner *malmal_scanner_new_with_passwords(int strict,
+                                                  const char *hashlist,
+                                                  size_t hashlist_len,
+                                                  const char *pdf_passwords,
+                                                  size_t pdf_passwords_len);
+
 void malmal_scanner_free(malmal_scanner *scanner);
 
 /*

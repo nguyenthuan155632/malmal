@@ -120,8 +120,14 @@ def _load(path):
             "libmalmal_ffi was not found; build it with `cargo build --release "
             "-p malmal-ffi` and set MALMAL_LIBRARY to its path"
         )
-    library.malmal_scanner_new.restype = ctypes.c_void_p
-    library.malmal_scanner_new.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t]
+    library.malmal_scanner_new_with_passwords.restype = ctypes.c_void_p
+    library.malmal_scanner_new_with_passwords.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
     library.malmal_scanner_free.restype = None
     library.malmal_scanner_free.argtypes = [ctypes.c_void_p]
     library.malmal_scan.restype = ctypes.c_int
@@ -166,13 +172,28 @@ class Scanner:
     ``strict`` selects the strict policy. ``hashlist`` is an optional
     SHA-256 blocklist as text, one hex digest per line. ``library`` is the
     path of ``libmalmal_ffi``, when it is not found otherwise.
+    ``pdf_passwords`` are passwords (``str`` or ``bytes``) to try on
+    encrypted PDFs, each as user and as owner password.
     """
 
-    def __init__(self, strict=False, hashlist=None, library=None):
+    def __init__(self, strict=False, hashlist=None, library=None, pdf_passwords=()):
+        # Before anything is loaded: `close` runs even when this raises.
+        self._handle = None
+        passwords = [
+            password.encode() if isinstance(password, str) else bytes(password)
+            for password in pdf_passwords
+        ]
+        if any(b"\n" in password for password in passwords):
+            raise ValueError("a password cannot contain a line break")
+        passwords = b"\n".join(passwords)
         self._library = _load(library)
         blocklist = hashlist.encode() if isinstance(hashlist, str) else hashlist
-        self._handle = self._library.malmal_scanner_new(
-            int(strict), blocklist, len(blocklist) if blocklist else 0
+        self._handle = self._library.malmal_scanner_new_with_passwords(
+            int(strict),
+            blocklist,
+            len(blocklist) if blocklist else 0,
+            passwords,
+            len(passwords),
         )
         if not self._handle:
             raise ValueError("the hash list does not parse")

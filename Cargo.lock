@@ -1107,6 +1107,8 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "yara-x",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

@@ -1,6 +1,8 @@
+corpus/clean/animation-16bit.png	Clean	
 corpus/clean/animation.png	Clean	
 corpus/clean/animation.webp	Clean	
 corpus/clean/big.tif	Clean	
+corpus/clean/cmyk-profile.jpg	Clean	
 corpus/clean/encrypted-empty-password.pdf	Clean	pdf.encrypted
 corpus/clean/encrypted-rc4.pdf	Clean	pdf.encrypted
 corpus/clean/icon.ico	Clean	
@@ -17,6 +19,7 @@ corpus/clean/pixel.jpg	Clean
 corpus/clean/pixel.png	Clean	
 corpus/clean/pixel.psd	Clean	
 corpus/clean/square.svg	Clean	
+corpus/clean/ycck-profile.jpg	Clean	
 corpus/malicious/elf-after-image.avif	Malicious	image.polyglot,image.trailing_data
 corpus/malicious/embedded-executable.pdf	Malicious	pdf.embedded_file,type.executable
 corpus/malicious/encrypted-javascript.pdf	Malicious	pdf.encrypted,pdf.javascript,pdf.open_action
@@ -29,6 +32,7 @@ corpus/malicious/launch-in-objstm.pdf	Malicious	pdf.launch
 corpus/malicious/obfuscated-href.svg	Malicious	svg.javascript_uri
 corpus/malicious/obfuscated-javascript.pdf	Malicious	pdf.javascript,pdf.obfuscated_name
 corpus/malicious/onload.svg	Malicious	svg.event_handler
+corpus/malicious/password-javascript.pdf	Malicious	pdf.encrypted,pdf.javascript,pdf.open_action
 corpus/malicious/pdf-polyglot.jpg	Malicious	image.polyglot
 corpus/malicious/php-after-image.heic	Malicious	image.malformed,payload.php
 corpus/malicious/php-after-image.jxl	Malicious	payload.php

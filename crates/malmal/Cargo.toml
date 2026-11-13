@@ -30,6 +30,8 @@ png = { version = "0.18.1", optional = true }
 quick-xml = { version = "0.42.0", default-features = false }
 serde.workspace = true
 sha2.workspace = true
+zune-core = { version = "0.5.3", optional = true, default-features = false }
+zune-jpeg = { version = "0.5.15", optional = true }
 yara-x = { version = "1.23.0", default-features = false, optional = true, features = [
     "constant-folding",
     "exact-atoms",
@@ -45,8 +47,8 @@ yara-x = { version = "1.23.0", default-features = false, optional = true, featur
 yara = ["dep:yara-x"]
 # Rebuilding raster images from their pixels (`malmal::cdr`). Off by
 # default: it adds the decoders and encoders of the `image` crate, which
-# already depends on the other two.
-cdr = ["dep:image", "dep:moxcms", "dep:png"]
+# already depends on the others.
+cdr = ["dep:image", "dep:moxcms", "dep:png", "dep:zune-core", "dep:zune-jpeg"]
 
 [lints.rust]
 # Set by cargo-fuzz.

@@ -1,4 +1,5 @@
 import hashlib
+import os
 import struct
 import threading
 import unittest
@@ -54,6 +55,22 @@ class ScannerTest(unittest.TestCase):
             self.assertIn("hash.blocklisted", codes)
         with self.assertRaises(ValueError):
             malmal.Scanner(hashlist="not a digest")
+
+    def test_pdf_passwords(self):
+        corpus = os.path.join(os.path.dirname(__file__), "../../../tests/corpus/malicious")
+        with open(os.path.join(corpus, "password-javascript.pdf"), "rb") as file:
+            pdf = file.read()
+
+        def encrypted(scanner):
+            findings = scanner.scan(pdf).findings
+            return next(f["severity"] for f in findings if f["code"] == "pdf.encrypted")
+
+        with malmal.Scanner() as scanner:
+            self.assertEqual(encrypted(scanner), "medium")
+        with malmal.Scanner(pdf_passwords=["wrong", b"secret"]) as scanner:
+            self.assertEqual(encrypted(scanner), "info")
+        with self.assertRaises(ValueError):
+            malmal.Scanner(pdf_passwords=["two\nlines"])
 
     def test_closed_scanner(self):
         scanner = malmal.Scanner(strict=True)

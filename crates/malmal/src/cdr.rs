@@ -43,8 +43,10 @@
 //! rebuilt in part.
 //!
 //! The new file has no colour profile, so it is read as sRGB. The pixels of
-//! an image with an RGB profile are converted to sRGB to keep their colours,
-//! as far as sRGB can show them; any other profile is dropped as it is.
+//! an image with a profile are converted to keep their colours, as far as
+//! sRGB can show them: an RGB image with an RGB profile, a grey one with a
+//! grey profile, a CMYK JPEG with a CMYK profile. A profile that does not
+//! fit its image, or cannot be read, is dropped as it is.
 //!
 //! What it does not do: pixels are kept, so anything encoded in them is too.
 
@@ -62,9 +64,14 @@ use image::codecs::tiff::TiffDecoder;
 use image::codecs::webp::{WebPDecoder, WebPEncoder};
 use image::metadata::{LoopCount, Orientation};
 use image::{
-    AnimationDecoder, DynamicImage, ExtendedColorType, Frame, ImageDecoder, ImageError, RgbaImage,
+    AnimationDecoder, ColorType, Delay, DynamicImage, ExtendedColorType, Frame, ImageDecoder,
+    ImageError, Rgba, RgbaImage,
 };
 use moxcms::{ColorProfile, DataColorSpace, Layout, TransformExecutor, TransformOptions};
+
+use zune_core::bytestream::ZCursor;
+use zune_core::colorspace::ColorSpace;
+use zune_core::options::DecoderOptions;
 
 use crate::detect::{self, FileType};
 use crate::limits::Limits;
@@ -216,9 +223,12 @@ fn rebuild_inner(data: &[u8], limits: &Limits, options: &Options) -> Result<Rebu
     let input = Cursor::new(data);
     match file_type {
         FileType::Jpeg => {
-            let quality = options.jpeg_quality.clamp(1, 100);
+            let output = Output::Jpeg(options.jpeg_quality.clamp(1, 100));
+            if let Some(image) = cmyk_jpeg(data, limits)? {
+                return write(image, deadline, output);
+            }
             let decoder = JpegDecoder::new(input).map_err(decode_error)?;
-            still(decoder, limits, deadline, Output::Jpeg(quality))
+            still(decoder, limits, deadline, output)
         }
         FileType::Png => {
             let mut decoder = PngDecoder::new(input).map_err(decode_error)?;
@@ -226,6 +236,14 @@ fn rebuild_inner(data: &[u8], limits: &Limits, options: &Options) -> Result<Rebu
                 return still(decoder, limits, deadline, Output::Png);
             }
             let canvas = Canvas::of(&mut decoder, limits)?;
+            let deep = matches!(
+                decoder.color_type(),
+                ColorType::L16 | ColorType::La16 | ColorType::Rgb16 | ColorType::Rgba16
+            );
+            if deep {
+                let (frames, plays) = deep_apng(data, &canvas, limits, deadline)?;
+                return animated(frames, plays, canvas, deadline, Animated::Png);
+            }
             let decoder = decoder.apng().map_err(decode_error)?;
             animation(decoder, canvas, limits, deadline, Animated::Png)
         }
@@ -264,11 +282,13 @@ fn rebuild_inner(data: &[u8], limits: &Limits, options: &Options) -> Result<Rebu
     }
 }
 
-/// Turns the pixels of an image with an RGB colour profile into sRGB, which
-/// is what a file without a profile is taken to be.
+/// Turns the pixels of an image with a colour profile into sRGB, which is
+/// what a file without a profile is taken to be: colours for an RGB profile,
+/// shades of grey on the sRGB curve for a grey one.
 struct ToSrgb {
     profile: ColorProfile,
     srgb: ColorProfile,
+    grey: bool,
 }
 
 impl ToSrgb {
@@ -276,24 +296,36 @@ impl ToSrgb {
     const BATCH: usize = 1 << 16;
 
     /// `None` when there is nothing to convert: no profile, one that does
-    /// not parse or is not RGB, or one that describes sRGB itself.
+    /// not parse or is neither RGB nor grey, or one that describes sRGB
+    /// itself.
     fn new(icc: Option<Vec<u8>>) -> Option<Self> {
         let profile = ColorProfile::new_from_slice(&icc?).ok()?;
-        if profile.color_space != DataColorSpace::Rgb {
-            return None;
-        }
+        let srgb = ColorProfile::new_srgb();
+        let (srgb, grey) = match profile.color_space {
+            DataColorSpace::Rgb => (srgb, false),
+            DataColorSpace::Gray => {
+                let mut grey = ColorProfile::new_gray_with_gamma(2.2);
+                grey.gray_trc = srgb.red_trc;
+                (grey, true)
+            }
+            _ => return None,
+        };
         let colors = Self {
             profile,
-            srgb: ColorProfile::new_srgb(),
+            srgb,
+            grey,
         };
-        // Shades of grey and of each primary. A profile that moves none of
-        // them by more than rounding is sRGB, and the pixels stay as they
-        // are: a lossless image keeps every bit.
-        let probe: Vec<u8> = (0..=255)
-            .flat_map(|v| [v, v, v, v, 0, 0, 0, v, 0, 0, 0, v])
-            .collect();
+        // Shades of grey and, in colour, of each primary. A profile that
+        // moves none of them by more than rounding is sRGB, and the pixels
+        // stay as they are: a lossless image keeps every bit.
+        let (probe, layout): (Vec<u8>, _) = if grey {
+            ((0..=255).collect(), Layout::Gray)
+        } else {
+            let shades = (0..=255).flat_map(|v| [v, v, v, v, 0, 0, 0, v, 0, 0, 0, v]);
+            (shades.collect(), Layout::Rgb)
+        };
         let mut converted = probe.clone();
-        colors.eight(&mut converted, Layout::Rgb)?;
+        colors.eight(&mut converted, layout)?;
         let moved = |(a, b): (&u8, &u8)| a.abs_diff(*b) > 1;
         probe.iter().zip(&converted).any(moved).then_some(colors)
     }
@@ -321,7 +353,12 @@ impl ToSrgb {
         pixels: &mut [T],
         layout: Layout,
     ) -> Option<()> {
-        let channels = if layout == Layout::Rgba { 4 } else { 3 };
+        let channels = match layout {
+            Layout::Gray => 1,
+            Layout::GrayAlpha => 2,
+            Layout::Rgba => 4,
+            _ => 3,
+        };
         let mut converted = vec![T::default(); Self::BATCH * channels];
         for batch in pixels.chunks_mut(Self::BATCH * channels) {
             let converted = &mut converted[..batch.len()];
@@ -331,10 +368,24 @@ impl ToSrgb {
         Some(())
     }
 
-    /// Grey images are left alone: an RGB profile says nothing about them.
+    /// The frame of an animation, which is always in colour.
+    fn frame(&self, frame: &mut RgbaImage) {
+        if !self.grey {
+            // As for a still image, a profile that cannot be applied is dropped.
+            let _ = self.eight(frame, Layout::Rgba);
+        }
+    }
+
+    /// A profile for colour says nothing about a grey image, nor one for
+    /// grey about colours; the pixels are then kept as they are.
     fn image(&self, image: &mut DynamicImage) {
-        // A profile this cannot apply is one the pixels are kept without.
+        // So are those of a profile this cannot apply.
         let _ = match image {
+            _ if self.grey != !image.color().has_color() => None,
+            DynamicImage::ImageLuma8(pixels) => self.eight(pixels, Layout::Gray),
+            DynamicImage::ImageLumaA8(pixels) => self.eight(pixels, Layout::GrayAlpha),
+            DynamicImage::ImageLuma16(pixels) => self.sixteen(pixels, Layout::Gray),
+            DynamicImage::ImageLumaA16(pixels) => self.sixteen(pixels, Layout::GrayAlpha),
             DynamicImage::ImageRgb8(pixels) => self.eight(pixels, Layout::Rgb),
             DynamicImage::ImageRgba8(pixels) => self.eight(pixels, Layout::Rgba),
             DynamicImage::ImageRgb16(pixels) => self.sixteen(pixels, Layout::Rgb),
@@ -342,6 +393,93 @@ impl ToSrgb {
             _ => None,
         };
     }
+}
+
+/// The picture of a CMYK JPEG whose profile says what its inks look like,
+/// in sRGB. The decoder turns four inks into three colours by arithmetic,
+/// which is visibly off; the profile is what a printer goes by. `None` when
+/// the file is not such a JPEG, and is decoded like any other.
+fn cmyk_jpeg(data: &[u8], limits: &Limits) -> Result<Option<DynamicImage>, Error> {
+    let options = DecoderOptions::default()
+        .set_strict_mode(false)
+        .set_max_width(usize::MAX)
+        .set_max_height(usize::MAX);
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(data), options);
+    if decoder.decode_headers().is_err() {
+        return Ok(None);
+    }
+    let stored = match decoder.input_colorspace() {
+        Some(stored @ (ColorSpace::CMYK | ColorSpace::YCCK)) => stored,
+        _ => return Ok(None),
+    };
+    let profile = decoder.icc_profile();
+    let Some(profile) = profile.and_then(|icc| ColorProfile::new_from_slice(&icc).ok()) else {
+        return Ok(None);
+    };
+    if profile.color_space != DataColorSpace::Cmyk {
+        return Ok(None);
+    }
+    // Four channels in, whatever they are called.
+    let Ok(transform) = profile.create_transform_8bit(
+        Layout::Rgba,
+        &ColorProfile::new_srgb(),
+        Layout::Rgb,
+        TransformOptions::default(),
+    ) else {
+        return Ok(None);
+    };
+    let Some((width, height)) = decoder.dimensions() else {
+        return Ok(None);
+    };
+    // The inks and the colours made of them are both held for a while.
+    let pixels = width as u64 * height as u64;
+    if pixels > limits.max_pixels || pixels.saturating_mul(7) > limits.max_decompressed {
+        return Err(Error::TooLarge);
+    }
+
+    // As stored: asked for anything else, the decoder mixes the inks itself.
+    decoder.set_options(options.jpeg_set_out_colorspace(stored));
+    let mut inks = decoder
+        .decode()
+        .map_err(|error| Error::Decode(error.to_string()))?;
+    if inks.len() as u64 != pixels * 4 {
+        return Err(Error::Decode("image is not what its header says".into()));
+    }
+    // In the file, 255 is no ink at all; a profile counts the other way.
+    for ink in inks.as_chunks_mut::<4>().0 {
+        if stored == ColorSpace::YCCK {
+            // Three of the inks are stored the way colours are in a JPEG,
+            // and come out of that the right way up.
+            let [luma, blue, red] = [ink[0], ink[1], ink[2]].map(|sample| sample as f32);
+            let (blue, red) = (blue - 128.0, red - 128.0);
+            ink[0] = (luma + 1.402 * red).round() as u8;
+            ink[1] = (luma - 0.344_136 * blue - 0.714_136 * red).round() as u8;
+            ink[2] = (luma + 1.772 * blue).round() as u8;
+        } else {
+            for sample in &mut ink[..3] {
+                *sample = u8::MAX - *sample;
+            }
+        }
+        ink[3] = u8::MAX - ink[3];
+    }
+    let mut colours = vec![0; pixels as usize * 3];
+    let batches = inks
+        .chunks(ToSrgb::BATCH * 4)
+        .zip(colours.chunks_mut(ToSrgb::BATCH * 3));
+    for (inks, colours) in batches {
+        if transform.transform(inks, colours).is_err() {
+            return Ok(None);
+        }
+    }
+    let Some(picture) = image::RgbImage::from_raw(width as u32, height as u32, colours) else {
+        return Ok(None);
+    };
+    let mut image = DynamicImage::from(picture);
+    let orientation = decoder
+        .exif()
+        .and_then(|exif| Orientation::from_exif_chunk(exif));
+    image.apply_orientation(orientation.unwrap_or(Orientation::NoTransforms));
+    Ok(Some(image))
 }
 
 /// What is known of an image before its pixels are read.
@@ -386,8 +524,12 @@ fn still(
         colors.image(&mut image);
     }
     image.apply_orientation(orientation);
-    deadline.check()?;
+    write(image, deadline, output)
+}
 
+/// Write a still image in the format `output` names.
+fn write(image: DynamicImage, deadline: Deadline, output: Output) -> Result<Rebuilt, Error> {
+    deadline.check()?;
     let mut data = Vec::new();
     let file_type = match output {
         Output::Jpeg(quality) => {
@@ -446,28 +588,184 @@ fn animation<'a>(
     deadline: Deadline,
     output: Animated,
 ) -> Result<Rebuilt, Error> {
-    let Canvas { width, height, .. } = canvas;
     let plays = match decoder.loop_count() {
         LoopCount::Infinite => None,
         LoopCount::Finite(count) => Some(count.get()),
     };
     // Every frame is held as a full canvas until the file is written.
-    let frame_bytes = width as u64 * height as u64 * 4;
+    let frame_bytes = canvas.width as u64 * canvas.height as u64 * 4;
     let mut frames = Vec::new();
     for frame in decoder.into_frames() {
         deadline.check()?;
         if (frames.len() as u64 + 1).saturating_mul(frame_bytes) > limits.max_decompressed {
             return Err(Error::TooLarge);
         }
-        let mut frame = frame.map_err(decode_error)?;
-        if let Some(colors) = &canvas.colors {
-            // As for a still image, a profile that cannot be applied is dropped.
-            let _ = colors.eight(frame.buffer_mut(), Layout::Rgba);
-        }
-        frames.push(frame);
+        frames.push(frame.map_err(decode_error)?);
     }
+    animated(frames, plays, canvas, deadline, output)
+}
+
+/// The frames of an animated PNG with 16 bits a channel, at 8, and the
+/// number of times it plays. The `image` crate's decoder stops at these, so
+/// the `png` crate reads each frame and they are laid over one another
+/// here, as the APNG specification has it.
+fn deep_apng(
+    data: &[u8],
+    canvas: &Canvas,
+    limits: &Limits,
+    deadline: Deadline,
+) -> Result<(Vec<Frame>, Option<u32>), Error> {
+    use png::{BlendOp, DisposeOp, Transformations};
+
+    let failed = |error: png::DecodingError| Error::Decode(error.to_string());
+    let mut decoder = png::Decoder::new(Cursor::new(data));
+    // Eight bits and an alpha channel, whatever the file has.
+    decoder.set_transformations(
+        Transformations::EXPAND | Transformations::STRIP_16 | Transformations::ALPHA,
+    );
+    let mut reader = decoder.read_info().map_err(failed)?;
+    let info = reader.info();
+    let control = info
+        .animation_control()
+        .ok_or_else(|| Error::Decode("image is not animated".into()))?;
+    let (count, plays) = (control.num_frames, control.num_plays);
+    // A first image without frame control is shown by viewers that do not
+    // animate, and is no part of the animation.
+    let still_first = info.frame_control().is_none();
+
+    let (width, height) = (canvas.width, canvas.height);
+    let frame_bytes = width as u64 * height as u64 * 4;
+    let size = reader.output_buffer_size().ok_or(Error::TooLarge)?;
+    if size as u64 > limits.max_decompressed {
+        return Err(Error::TooLarge);
+    }
+    let mut buffer = vec![0; size];
+    if still_first {
+        reader.next_frame(&mut buffer).map_err(failed)?;
+    }
+
+    // What is shown now, and what was before the frame last drawn.
+    let mut current = RgbaImage::new(width, height);
+    let mut previous = current.clone();
+    let mut dispose = DisposeOp::Background;
+    let mut drawn: Option<(u32, u32, u32, u32)> = None;
+    let mut frames = Vec::new();
+    for _ in 0..count {
+        deadline.check()?;
+        // The two canvases, the buffer and the frames collected so far.
+        if (frames.len() as u64 + 3).saturating_mul(frame_bytes) > limits.max_decompressed {
+            return Err(Error::TooLarge);
+        }
+        // What becomes of the frame last drawn, before the next one is.
+        match (dispose, drawn) {
+            (DisposeOp::None, _) => previous.clone_from(&current),
+            (DisposeOp::Background, Some((left, top, wide, high))) => {
+                previous.clone_from(&current);
+                for y in top..top + high {
+                    for x in left..left + wide {
+                        current.put_pixel(x, y, Rgba([0; 4]));
+                    }
+                }
+            }
+            (DisposeOp::Background, None) => {}
+            (DisposeOp::Previous, Some((left, top, wide, high))) => {
+                for y in top..top + high {
+                    for x in left..left + wide {
+                        current.put_pixel(x, y, *previous.get_pixel(x, y));
+                    }
+                }
+            }
+            (DisposeOp::Previous, None) => {}
+        }
+
+        let read = reader.next_frame(&mut buffer).map_err(failed)?;
+        let info = reader.info();
+        let (left, top, wide, high, blend, delay) = match info.frame_control() {
+            Some(frame) => {
+                dispose = frame.dispose_op;
+                // A fraction of a second; no denominator means hundredths.
+                let per_second = match frame.delay_den {
+                    0 => 100,
+                    denominator => u32::from(denominator),
+                };
+                let delay = (u32::from(frame.delay_num) * 1000, per_second);
+                let place = (frame.x_offset, frame.y_offset, frame.width, frame.height);
+                (place.0, place.1, place.2, place.3, frame.blend_op, delay)
+            }
+            None => (0, 0, info.width, info.height, BlendOp::Source, (0, 1)),
+        };
+        let fits = |start: u32, length: u32, within: u32| {
+            start.checked_add(length).is_some_and(|end| end <= within)
+        };
+        let channels = match read.color_type {
+            png::ColorType::GrayscaleAlpha => 2,
+            png::ColorType::Rgba => 4,
+            _ => 0,
+        };
+        let rows = buffer.chunks(read.line_size.max(1));
+        if !fits(left, wide, width)
+            || !fits(top, high, height)
+            || channels == 0
+            || read.bit_depth != png::BitDepth::Eight
+            || read.line_size < wide as usize * channels
+            || buffer.len() / read.line_size.max(1) < high as usize
+        {
+            return Err(Error::Decode("a frame is not what the image says".into()));
+        }
+        drawn = Some((left, top, wide, high));
+        for (y, row) in (top..top + high).zip(rows) {
+            for (x, sample) in (left..left + wide).zip(row.chunks_exact(channels)) {
+                let pixel = match *sample {
+                    [grey, alpha] => Rgba([grey, grey, grey, alpha]),
+                    [red, green, blue, alpha] => Rgba([red, green, blue, alpha]),
+                    _ => unreachable!("two or four channels"),
+                };
+                match blend {
+                    BlendOp::Source => current.put_pixel(x, y, pixel),
+                    BlendOp::Over => over(current.get_pixel_mut(x, y), pixel),
+                }
+            }
+        }
+        let delay = Delay::from_numer_denom_ms(delay.0, delay.1);
+        frames.push(Frame::from_parts(current.clone(), 0, 0, delay));
+    }
+    // In the file, 0 plays is forever.
+    Ok((frames, (plays != 0).then_some(plays)))
+}
+
+/// Lay `top` over `under`, each as much as its alpha says.
+fn over(under: &mut Rgba<u8>, top: Rgba<u8>) {
+    let (top_alpha, under_alpha) = (u32::from(top[3]), u32::from(under[3]));
+    // What of `under` still shows, and of both together, out of 255 * 255.
+    let showing = under_alpha * (255 - top_alpha);
+    let alpha = top_alpha * 255 + showing;
+    if alpha == 0 {
+        *under = Rgba([0; 4]);
+        return;
+    }
+    for channel in 0..3 {
+        let mixed = u32::from(top[channel]) * top_alpha * 255 + u32::from(under[channel]) * showing;
+        under[channel] = ((mixed + alpha / 2) / alpha) as u8;
+    }
+    under[3] = ((alpha + 127) / 255) as u8;
+}
+
+/// Write the frames of an animation in the format `output` names.
+fn animated(
+    mut frames: Vec<Frame>,
+    plays: Option<u32>,
+    canvas: Canvas,
+    deadline: Deadline,
+    output: Animated,
+) -> Result<Rebuilt, Error> {
+    let Canvas { width, height, .. } = canvas;
     if frames.is_empty() {
         return Err(Error::Decode("image has no frames".into()));
+    }
+    if let Some(colors) = &canvas.colors {
+        for frame in &mut frames {
+            colors.frame(frame.buffer_mut());
+        }
     }
     let count = frames.len() as u32;
 
@@ -894,6 +1192,110 @@ mod tests {
         let decoder = WebPDecoder::new(Cursor::new(&rebuilt.data[..])).unwrap();
         assert!(decoder.has_animation());
         assert_eq!(played(decoder), (shades, None));
+    }
+
+    #[test]
+    fn deep_animated_png_is_laid_out_frame_by_frame() {
+        // Two frames at 16 bits: a red canvas, then a half-transparent blue
+        // square blended over its corner, removed again after its turn.
+        let mut data = Vec::new();
+        let mut encoder = ::png::Encoder::new(&mut data, 4, 4);
+        encoder.set_color(::png::ColorType::Rgba);
+        encoder.set_depth(::png::BitDepth::Sixteen);
+        encoder.set_animated(3, 5).unwrap();
+        let mut writer = encoder.write_header().unwrap();
+        let samples = |pixel: [u16; 4], count: usize| -> Vec<u8> {
+            let bytes = pixel.iter().flat_map(|sample| sample.to_be_bytes());
+            bytes.collect::<Vec<u8>>().repeat(count)
+        };
+        writer.set_frame_delay(1, 4).unwrap();
+        writer
+            .write_image_data(&samples([0xFFFF, 0, 0, 0xFFFF], 16))
+            .unwrap();
+        writer.set_frame_dimension(2, 2).unwrap();
+        writer.set_frame_position(1, 2).unwrap();
+        writer.set_blend_op(::png::BlendOp::Over).unwrap();
+        writer.set_dispose_op(::png::DisposeOp::Previous).unwrap();
+        writer
+            .write_image_data(&samples([0, 0, 0xFFFF, 0x8000], 4))
+            .unwrap();
+        writer.set_blend_op(::png::BlendOp::Source).unwrap();
+        writer.set_dispose_op(::png::DisposeOp::None).unwrap();
+        writer
+            .write_image_data(&samples([0, 0x1234, 0, 0x4000], 4))
+            .unwrap();
+        writer.finish().unwrap();
+        // The decoder this module otherwise uses does not take the file.
+        let refused = PngDecoder::new(Cursor::new(&data[..])).unwrap().apng();
+        assert!(refused.unwrap().into_frames().collect_frames().is_err());
+
+        let rebuilt = run(&data).unwrap();
+        assert_eq!((rebuilt.width, rebuilt.height, rebuilt.frames), (4, 4, 3));
+        assert!(scans_clean(&rebuilt.data));
+        let decoder = PngDecoder::new(Cursor::new(&rebuilt.data[..])).unwrap();
+        let (frames, plays) = played(decoder.apng().unwrap());
+        assert_eq!(plays, Some(5));
+        let red = Rgba([255, 0, 0, 255]);
+        assert!(frames[0].0.pixels().all(|pixel| *pixel == red));
+        assert_eq!(frames[0].1, 250);
+        // Blended over the red, inside the square only.
+        assert_eq!(frames[1].0.get_pixel(1, 2), &Rgba([127, 0, 128, 255]));
+        assert_eq!(frames[1].0.get_pixel(0, 2), &red);
+        // The square is gone and the next one replaces what is under it.
+        assert_eq!(frames[2].0.get_pixel(1, 2), &Rgba([0, 0x12, 0, 0x40]));
+        assert_eq!(frames[2].0.get_pixel(3, 3), &red);
+    }
+
+    #[test]
+    fn a_grey_profile_is_applied_to_grey_images_only() {
+        use image::ImageEncoder;
+
+        let dark = ColorProfile::new_gray_with_gamma(1.0).encode().unwrap();
+        let grey = image::GrayImage::from_pixel(3, 3, image::Luma([64]));
+        let mut data = Vec::new();
+        let mut encoder = PngEncoder::new(&mut data);
+        encoder.set_icc_profile(dark.clone()).unwrap();
+        encoder
+            .write_image(&grey, 3, 3, ExtendedColorType::L8)
+            .unwrap();
+        let rebuilt = image::load_from_memory(&run(&data).unwrap().data).unwrap();
+        // A quarter of the light, on the sRGB curve.
+        let image::Luma([shade]) = *rebuilt.to_luma8().get_pixel(1, 1);
+        assert!((135..=139).contains(&shade), "{shade}");
+
+        // The same profile on a colour image says nothing about it.
+        let pixel = Rgba([64, 64, 64, 255]);
+        let mut data = Vec::new();
+        let mut encoder = PngEncoder::new(&mut data);
+        encoder.set_icc_profile(dark).unwrap();
+        let colour = RgbaImage::from_pixel(3, 3, pixel);
+        encoder
+            .write_image(&colour, 3, 3, ExtendedColorType::Rgba8)
+            .unwrap();
+        let rebuilt = image::load_from_memory(&run(&data).unwrap().data).unwrap();
+        assert_eq!(rebuilt.to_rgba8().get_pixel(1, 1), &pixel);
+    }
+
+    /// The samples are white, the first ink, and black. Their profile makes
+    /// the first ink red, which mixing the inks by arithmetic does not.
+    #[test]
+    fn cmyk_inks_get_the_colours_of_their_profile() {
+        let clean = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/clean");
+        // The two ways a JPEG stores four inks.
+        for name in ["cmyk-profile.jpg", "ycck-profile.jpg"] {
+            let data = std::fs::read(format!("{clean}/{name}")).unwrap();
+            let options = Options { jpeg_quality: 100 };
+            let rebuilt = rebuild(&data, &Limits::default(), &options).unwrap();
+            assert_eq!(rebuilt.file_type, FileType::Jpeg);
+            assert_eq!((rebuilt.width, rebuilt.height), (24, 8), "{name}");
+            assert!(!contains(&rebuilt.data, b"acsp"));
+            let pixels = image::load_from_memory(&rebuilt.data).unwrap().to_rgb8();
+            for (x, expected) in [(3, [255, 255, 255]), (12, [255, 0, 0]), (20, [0, 0, 0])] {
+                let Rgb(found) = *pixels.get_pixel(x, 4);
+                let close = found.iter().zip(expected).all(|(a, b)| a.abs_diff(b) < 16);
+                assert!(close, "{name} at {x}: {found:?}");
+            }
+        }
     }
 
     /// A PNG of `pixel` carrying `profile`.

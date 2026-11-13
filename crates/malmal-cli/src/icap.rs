@@ -123,12 +123,21 @@ enum Chunks {
     End {
         complete: bool,
     },
-    TooLarge,
+    /// More than the limit. The body was read to its end all the same,
+    /// unless it went on for too long even for that.
+    TooLarge {
+        read_to_end: bool,
+    },
     Malformed,
 }
 
-/// Append chunks to `body` up to the terminating one.
+/// Append chunks to `body` up to the terminating one. Past `limit` bytes
+/// the chunks are read and dropped: a client still sending would not see a
+/// reply, only a connection closed on it.
 fn read_chunks(reader: &mut impl BufRead, body: &mut Vec<u8>, limit: u64) -> io::Result<Chunks> {
+    // How much of a body that is too large is waited for.
+    let patience = limit.saturating_mul(16);
+    let mut dropped = 0u64;
     loop {
         let Line::Text(line) = read_line(reader, MAX_CHUNK_LINE)? else {
             return Ok(Chunks::Malformed);
@@ -141,6 +150,9 @@ fn read_chunks(reader: &mut impl BufRead, body: &mut Vec<u8>, limit: u64) -> io:
             // Trailers, if any, up to the empty line.
             for _ in 0..MAX_HEADERS {
                 match read_line(reader, MAX_HEADER_LEN)? {
+                    Line::Text(line) if line.is_empty() && dropped > 0 => {
+                        return Ok(Chunks::TooLarge { read_to_end: true });
+                    }
                     Line::Text(line) if line.is_empty() => {
                         let complete = extension.trim().eq_ignore_ascii_case("ieof");
                         return Ok(Chunks::End { complete });
@@ -151,10 +163,15 @@ fn read_chunks(reader: &mut impl BufRead, body: &mut Vec<u8>, limit: u64) -> io:
             }
             return Ok(Chunks::Malformed);
         }
-        if body.len() as u64 + size > limit {
-            return Ok(Chunks::TooLarge);
-        }
-        if reader.by_ref().take(size).read_to_end(body)? as u64 != size {
+        if dropped > 0 || body.len() as u64 + size > limit {
+            dropped = dropped.saturating_add(size);
+            if dropped > patience {
+                return Ok(Chunks::TooLarge { read_to_end: false });
+            }
+            if io::copy(&mut reader.by_ref().take(size), &mut io::sink())? != size {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+        } else if reader.by_ref().take(size).read_to_end(body)? as u64 != size {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
         if !matches!(read_line(reader, MAX_CHUNK_LINE)?, Line::Text(line) if line.is_empty()) {
@@ -202,6 +219,14 @@ fn multipart<'a>(body: &'a [u8], boundary: &str) -> Option<Vec<Part<'a>>> {
     None
 }
 
+/// Whether `body` is made of what a form's fields are sent as: letters,
+/// digits, `%xx` escapes and the punctuation browsers leave alone. Markup,
+/// quotes, spaces and binary data are not.
+fn is_urlencoded(body: &[u8]) -> bool {
+    body.iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"%&=+-._~*!'()/:,@?".contains(byte))
+}
+
 /// Why a message is not let through.
 enum Blocked {
     Threat(String),
@@ -243,7 +268,10 @@ fn judge(service: &Service, request: bool, headers: &str, body: &[u8]) -> Result
             }
             Ok(())
         }
-        Some("application/x-www-form-urlencoded") if request => Ok(()),
+        // Fields, not a file, if that is what the body is and not only what
+        // it is called: a file sent under this name would otherwise pass
+        // unseen.
+        Some("application/x-www-form-urlencoded") if request && is_urlencoded(body) => Ok(()),
         _ if body.is_empty() => Ok(()),
         _ => {
             let declared =
@@ -295,20 +323,24 @@ impl Reply<'_> {
             Some(_) => encapsulated += &format!("{}-body={}", self.kind, self.head.len()),
             None => encapsulated += &format!("null-body={}", self.head.len()),
         }
-        write!(
-            writer,
+        // Everything before the body in one piece: the connection sends
+        // what it is given at once, and a reply is not worth five packets.
+        let mut start = format!(
             "ICAP/1.0 {}\r\nISTag: \"malmal-{version}\"\r\nService: malmal {version}\r\n\
              {}Encapsulated: {encapsulated}\r\n\r\n",
             self.status, self.headers,
-        )?;
-        writer.write_all(self.head)?;
-        if let Some(body) = self.body {
-            if !body.is_empty() {
-                write!(writer, "{:x}\r\n", body.len())?;
-                writer.write_all(body)?;
-                writer.write_all(b"\r\n")?;
-            }
-            writer.write_all(b"0\r\n\r\n")?;
+        )
+        .into_bytes();
+        start.extend_from_slice(self.head);
+        match self.body {
+            Some([]) => start.extend_from_slice(b"0\r\n\r\n"),
+            Some(body) => start.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes()),
+            None => {}
+        }
+        writer.write_all(&start)?;
+        if let Some(body) = self.body.filter(|body| !body.is_empty()) {
+            writer.write_all(body)?;
+            writer.write_all(b"\r\n0\r\n\r\n")?;
         }
         writer.flush()
     }
@@ -411,10 +443,15 @@ pub fn icap(
             }
             match outcome {
                 Chunks::End { .. } => {}
-                // The rest of the body cannot be skipped safely.
-                Chunks::TooLarge => {
+                Chunks::TooLarge { read_to_end } => {
                     service.metrics().reject();
-                    return block(writer, &Blocked::NotScanned("file exceeds the size limit"));
+                    let reason = Blocked::NotScanned("file exceeds the size limit");
+                    block(&mut writer, &reason)?;
+                    if read_to_end {
+                        continue;
+                    }
+                    // The rest of the body cannot be skipped safely.
+                    return Ok(());
                 }
                 Chunks::Malformed => return refuse(writer, "400 Bad Request"),
             }
@@ -560,6 +597,23 @@ mod tests {
     }
 
     #[test]
+    fn a_file_called_a_form_is_still_a_file() {
+        let service = service();
+        let urlencoded = "application/x-www-form-urlencoded";
+        for fields in [&b"name=J%C3%BCrgen+M&next=/home?a=1,2&mail=a@b.c"[..], b""] {
+            let reply = run(&service, &upload(ALLOW, urlencoded, fields));
+            assert!(reply.starts_with("ICAP/1.0 204"), "{reply}");
+        }
+        for file in [
+            &b"<?php system($_GET['c']); ?>"[..],
+            b"\x7fELF\x02\x01\x01\0",
+        ] {
+            let reply = run(&service, &upload(ALLOW, urlencoded, file));
+            assert!(reply.contains("HTTP/1.1 403 Forbidden"), "{reply}");
+        }
+    }
+
+    #[test]
     fn clean_messages_are_echoed_when_204_is_not_allowed() {
         let reply = run(&service(), &upload("", "image/gif", GIF));
         let head = "POST /upload HTTP/1.1\r\nContent-Type: image/gif\r\n\r\n";
@@ -667,6 +721,21 @@ mod tests {
             "{reply}"
         );
         assert!(reply.contains("HTTP/1.1 403 Forbidden"));
+        // The body was read to its end, so the connection carries on.
+        let mut input = upload(ALLOW, "image/gif", GIF);
+        input.extend(upload(ALLOW, "image/gif", b"GIF89a"));
+        let reply = run(&small, &input);
+        assert_eq!(reply.matches("ICAP/1.0 200 OK").count(), 2, "{reply}");
+        assert!(reply.contains("Threat=Malmal."), "{reply}");
+        // Unless there is no end to it in sight.
+        let mut endless = upload(ALLOW, "image/gif", &[0; 8]);
+        endless.truncate(endless.len() - 5);
+        endless.extend_from_slice(b"1000\r\n");
+        endless.extend_from_slice(&[0; 0x1000]);
+        endless.extend(upload(ALLOW, "image/gif", b"GIF89a"));
+        let reply = run(&small, &endless);
+        assert_eq!(reply.matches("ICAP/1.0").count(), 1, "{reply}");
+        assert!(reply.contains("X-Block-Reason: file exceeds the size limit"));
 
         let service = service();
         let status = |input: &[u8]| {
