@@ -1,92 +1,123 @@
 # malmal
 
-A Rust library that scans uploaded files before a backend processes them: raster images
-(JPEG, PNG, GIF, WebP, BMP, TIFF, PSD, HEIC, AVIF, JPEG XL, ICO), SVG, PDF, PostScript/EPS and
-Illustrator files. It does not compete with antivirus on
-signature count; it checks three things antivirus usually skips:
+Scans uploaded files before a backend processes them: raster images (JPEG, PNG, GIF, WebP,
+BMP, TIFF, PSD, HEIC, AVIF, JPEG XL, ICO), SVG, PDF, PostScript/EPS and Illustrator files.
+It does not compete with antivirus on signature count; it checks three things antivirus
+usually skips:
 
 1. **Is the file the type it claims to be** (content against extension and `Content-Type`).
 2. **Does the file carry active content** (scripts, actions, system commands, embedded files).
 3. **Is the file structurally sound** (trailing data, polyglots, decompression bombs, truncation).
 
 The rule throughout is fail-closed: a file that cannot be fully analyzed is never reported
-clean.
+clean. It is one layer of defense, not the only one.
 
-This is one layer of defense, not the only one. For raster images, decoding and re-encoding
-is still the most reliable measure; malmal decides which files get that far, and with the
-`cdr` feature does the re-encoding too (`malmal sanitize`, [Rebuilding images](#rebuilding-images)).
+## Which way in
 
-## Build
+| You want to | Use | Section |
+|---|---|---|
+| Check files by hand, in a script or in CI | `malmal scan` | [Check a file](#check-a-file-from-the-command-line) |
+| Reject bad uploads in a Rust service | the `malmal` crate | [In a Rust service](#scan-uploads-in-a-rust-service) |
+| Reject bad uploads from any other language | `malmald --http` or `--socket` | [From any language](#scan-uploads-from-any-language) |
+| Do the same from Python or C without a daemon | the binding, the C library | [Python](#from-python), [C](#from-c) |
+| Keep the picture and nothing else of an image | `malmal sanitize`, `POST /sanitize` | [Rebuild images](#keep-only-the-picture-of-an-image) |
+| Replace ClamAV where software already calls `clamd` | `malmald --clamd` | [ClamAV clients](#serve-software-that-already-talks-to-clamav) |
+| Scan what passes through a proxy | `malmald --icap` | [Behind a proxy](#scan-what-passes-through-a-proxy) |
 
-```bash
-cargo build --release --workspace --target x86_64-unknown-linux-musl
-```
+Then, whichever way in: [accept only some types](#accept-only-the-types-you-take),
+[open encrypted PDFs](#look-inside-encrypted-pdfs),
+[block known files and add rules](#block-known-files-and-add-your-own-rules),
+[decide what is rejected](#decide-what-is-rejected), and
+[run it in production](#run-it-in-production).
 
-The output is in `target/x86_64-unknown-linux-musl/release/`:
+## Install
 
-| File | What it is |
-|---|---|
-| `malmal` | CLI, fully statically linked |
-| `malmald` | Daemon (Unix socket, HTTP, ClamAV protocol, ICAP), fully statically linked |
-| `libmalmal_ffi.a` | Static library for C; the header is `crates/malmal-ffi/include/malmal.h` |
-
-Both binaries run on a bare Debian install with no extra packages.
-
-### macOS
-
-```bash
-cargo build --release --workspace
-```
-
-Leave out `--target`; the binaries land in `target/release/`. There is no sandbox on macOS,
-so `--require-sandbox` exits with an error, and the memory limit is not applied. The test
-suite has not been run on macOS.
-
-### Installing the commands
-
-Each release on GitHub carries the static binaries for x86-64 and ARM64 Linux, with the C
-library and its header, as `malmal-v<version>-<target>.tar.gz` and a `.sha256` next to it.
+**Prebuilt, for x86-64 and ARM64 Linux.** Each release on GitHub carries static binaries
+that run on a bare install with no extra packages, with the C library and its header, as
+`malmal-v<version>-<target>.tar.gz` and a `.sha256` next to it.
 [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) fetches the same archive:
 
 ```bash
 cargo binstall malmal-cli
 ```
 
-The released version also builds from crates.io, without cloning anything:
+**From crates.io**, built on your machine:
 
 ```bash
 cargo install malmal-cli
 ```
 
-### Container
-
-The image holds the two binaries and nothing else; it starts the daemon's HTTP endpoint.
+**As a container**, holding the two binaries and nothing else:
 
 ```bash
 docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/nguyenthuan155632/malmal
 ```
 
-```bash
-docker run --rm -v "$PWD:/files:ro" --entrypoint /usr/local/bin/malmal ghcr.io/nguyenthuan155632/malmal scan /files/upload.pdf
-```
-
-`docker build -t malmal .` builds the same image from a checkout.
-
-From a checkout, building does not put anything on your `PATH`. Either run the binary by
-path (`./target/release/malmal`), or install `malmal` and `malmald` into `~/.cargo/bin`:
+**From a checkout**, static binaries in `target/x86_64-unknown-linux-musl/release/`:
 
 ```bash
-cargo install --path crates/malmal-cli
+cargo build --release --workspace --target x86_64-unknown-linux-musl
 ```
 
-## Using it from Rust
+| File | What it is |
+|---|---|
+| `malmal` | The command: `scan` and `sanitize` |
+| `malmald` | The daemon: Unix socket, HTTP, ClamAV protocol, ICAP |
+| `libmalmal_ffi.a` | Static library for C; the header is `crates/malmal-ffi/include/malmal.h` |
+
+`cargo install --path crates/malmal-cli` puts the two commands in `~/.cargo/bin`, and
+`docker build -t malmal .` builds the image. On macOS leave out `--target`; there is no
+sandbox there, so `--require-sandbox` exits with an error, and the test suite has not been
+run on it.
+
+## Check a file from the command line
+
+```bash
+malmal scan upload.pdf
+```
+
+```
+upload.pdf: MALICIOUS (pdf)
+  [High] pdf.javascript: document contains JavaScript at offset 186
+```
+
+The exit status is the verdict of the worst file: `0` clean, `1` suspicious, `2`
+malicious, `3` error. That is all a script needs:
+
+```bash
+malmal scan "$file" || rm -- "$file"
+```
+
+Several files can be named at once, `-` reads standard input, and `--json` prints one
+object per file for a program to read:
+
+```bash
+malmal scan --json incoming/*
+```
+
+```json
+{"path":"incoming/a.pdf","report":{"declared_types":["pdf"],"detected_type":"pdf","findings":[
+  {"code":"pdf.javascript","message":"document contains JavaScript","offset":186,"severity":"high"}],
+ "sha256":"8e38c368...","size":285,"verdict":"malicious"}}
+```
+
+Every finding has a `code`, which is the stable part to match on. All of them, with their
+severity and what to do about each, are in [docs/findings.md](docs/findings.md).
+
+## Scan uploads in a Rust service
+
+```bash
+cargo add malmal
+```
 
 ```rust
-use malmal::{Policy, ScanHints, Scanner, Verdict};
+use malmal::{ScanHints, Scanner, Verdict};
 
-let scanner = Scanner::builder().policy(Policy::strict()).build();
+// Build once and share: a Scanner is Send + Sync.
+let scanner = Scanner::builder().build();
+
 let report = scanner.scan_bytes(&data, ScanHints {
-    filename: Some("logo.svg"),
+    filename: Some("logo.svg"),            // what the uploader claimed
     content_type: Some("image/svg+xml"),
 });
 if report.verdict != Verdict::Clean {
@@ -97,58 +128,105 @@ if report.verdict != Verdict::Clean {
 }
 ```
 
-A `Scanner` can be shared between threads. `scan_reader` reads from an `impl Read` and
-stops by itself at the size limit.
+`scan_bytes` never fails and never panics on hostile input; what could not be analyzed is
+a finding. `scan_reader` takes an `impl Read` and stops by itself at the size limit.
+Scanning is CPU work that can take up to the time limit, so in an async service run it on a
+blocking thread. Complete handlers for axum and actix-web are in
+[docs/integration.md](docs/integration.md#in-a-rust-service).
 
-- **`Policy`** decides the verdict: `default` treats High and above as `Malicious`, `strict`
-  treats Medium and above as `Malicious`. `with_override("svg.foreign_object", Severity::Info)`
-  changes the severity of one code; `with_allowed_types` narrows the accepted file types.
-- **`Limits`** caps file size (64 MB), decompressed data (256 MB), embedded-file depth (4),
-  time (10 seconds) and pixel count (2^28).
-- **`HashList`** is a SHA-256 blocklist that reads `sha256sum` output directly.
-- **`pdf_passwords`** on the builder are tried on encrypted PDFs, as user and as owner
-  password. A document one of them opens is decrypted and inspected like any other.
+What to do with the result:
 
-Every finding code, with its severity and what to do about it, is in
-[docs/findings.md](docs/findings.md). Examples for axum and actix-web are in
-[docs/integration.md](docs/integration.md).
+- Reject anything but `Verdict::Clean`. Log the findings and `report.sha256`; show the user
+  a generic message, not the findings.
+- Store the file under a name you generate, with the extension that belongs to
+  `report.detected_type`, never under the uploaded name.
+- For images, go one step further and [rebuild them](#keep-only-the-picture-of-an-image).
 
-## CLI
+## Scan uploads from any language
 
-```bash
-malmal scan --json --policy strict upload.pdf
-```
-
-`-` reads from stdin. Exit codes: 0 clean, 1 suspicious, 2 malicious, 3 error.
-
-`--types` replaces the accepted file types; anything else gets `type.not_allowed`. PostScript
-is accepted by default, so a service that only wants PDF-based Illustrator files and images
-refuses PostScript with:
+Run the daemon next to your service and hand it each upload:
 
 ```bash
-malmal scan --types jpeg,png,gif,webp,bmp,tiff,psd,heif,avif,jxl,ico,svg,pdf upload.ai
+malmald --http 127.0.0.1:8080 --socket /run/malmal.sock --require-sandbox
 ```
 
-`malmald` takes the same option. From Rust it is `Policy::with_allowed_types`.
+Over HTTP the request body is the file itself, not a form. The name and type the uploader
+claimed go in the query and in `Content-Type`:
 
-`--pdf-passwords FILE` names a file of passwords, one per line, to try on encrypted PDFs.
+```bash
+curl --data-binary @upload.pdf -H 'Content-Type: application/pdf' 'http://127.0.0.1:8080/scan?filename=upload.pdf'
+```
 
-Before it opens the first file, the process confines itself: Landlock allows reading only
-the files passed on the command line, seccomp blocks `execve`, sockets and other dangerous
-syscalls, and an rlimit caps memory. `--require-sandbox` turns a failure to confine into an
-error; `--no-sandbox` disables confinement. The sandbox exists on Linux only.
+The reply is `200` with `{"ok": true, "report": {...}}` whatever the verdict; the report
+is the object shown [above](#check-a-file-from-the-command-line). **Any other status means
+the file was not scanned**, and is to be treated as a rejection.
 
-## Rebuilding images
+On the Unix socket a request is one line of JSON, then the file, and the reply is one line
+of JSON. A connection can carry many requests:
+
+```python
+import json, socket
+
+def scan(data, name):
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.connect("/run/malmal.sock")
+        sock.sendall(json.dumps({"size": len(data), "filename": name}).encode() + b"\n" + data)
+        reply = json.loads(sock.makefile().readline())
+    if not reply.get("ok"):
+        raise RuntimeError(reply.get("error", "not scanned"))
+    return reply["report"]
+```
+
+The daemon has no authentication and no TLS: bind it to the loopback interface or a Unix
+socket, and let only the upload service reach it. Every endpoint, status code and metric
+is described in [docs/integration.md](docs/integration.md#as-a-daemon).
+
+### From Python
+
+Without a daemon, `bindings/python` loads the scanner as a library. It needs nothing but
+the standard library:
+
+```python
+import malmal
+
+scanner = malmal.Scanner()          # build once, share between threads
+report = scanner.scan(data, filename="a.png", content_type="image/png")
+if not report.clean:
+    reject([finding["code"] for finding in report.findings])
+```
+
+A `malmal.ScanError` means the file was not scanned. Each release has wheels for x86-64
+and ARM64 Linux that carry the library; installing one, or using the package from a
+checkout, is described in [bindings/python/README.md](bindings/python/README.md).
+
+### From C
+
+```c
+malmal_scanner *scanner = malmal_scanner_new(0, NULL, 0);
+char *report = NULL;
+int verdict = malmal_scan(scanner, data, len, "a.png", "image/png", &report);
+if (verdict != MALMAL_CLEAN) { /* reject; `report` is the JSON report */ }
+malmal_string_free(report);
+malmal_scanner_free(scanner);
+```
+
+Link `libmalmal_ffi.a` and include `malmal.h`; a scanner may be used from several threads
+at once. The full example is `crates/malmal-ffi/examples/scan.c`.
+
+## Keep only the picture of an image
+
+A scan says a file is clean as far as a scanner can tell. For raster images there is a
+stronger measure: decode the file and write a new one from the pixels. Metadata, colour
+profiles, comments, unknown chunks and anything appended are not carried over, because
+nothing but pixels is.
 
 ```bash
 malmal sanitize upload.jpg stored.jpg
 ```
 
-scans the file and, if it is a clean raster image, decodes it and writes a new file from
-the pixels. Metadata, colour profiles, comments, unknown chunks and anything appended are
-not carried over, because nothing but pixels is. The exit status is 0 only when the new
-file was written; it then takes the place of `stored.jpg` in one step, and otherwise
-`stored.jpg` is left as it was, or absent.
+scans the file first and rebuilds it only if it is clean. The exit status is `0` only when
+the new file was written; it then takes the place of `stored.jpg` in one step, and
+otherwise `stored.jpg` is left as it was, or absent. `-` is standard input or output.
 
 | Input | Output |
 |---|---|
@@ -157,89 +235,231 @@ file was written; it then takes the place of `stored.jpg` in one step, and other
 | GIF | GIF with every frame |
 | WebP | lossless WebP, with every frame of an animated one |
 | BMP, TIFF, ICO | PNG |
+| anything else | refused |
 
-An animation keeps its frame delays and its loop count. Every other type is refused. The
-new file carries no colour profile, so it is read as sRGB: the pixels of an image with a
-profile are converted to sRGB first, which keeps its colours as far as sRGB can show them.
-That covers RGB and grey profiles, and the CMYK profile of a CMYK JPEG; a profile that does
-not fit its image is dropped. A lossy WebP grows when it is stored losslessly.
-
-From Rust it is `Scanner::sanitize` and `malmal::cdr::rebuild`, behind the `cdr` feature;
-over HTTP it is `POST /sanitize`; from C and Python, `malmal_sanitize` and
-`Scanner.sanitize`. The decoders are those of the [`image`](https://crates.io/crates/image)
-crate.
-
-## Daemon
+The same from a service:
 
 ```bash
-malmald --socket /run/malmal.sock --http 127.0.0.1:8080 --workers 8 --require-sandbox
+curl --fail --data-binary @upload.jpg -o stored.jpg http://127.0.0.1:8080/sanitize
 ```
 
-`malmald` serves any combination of four endpoints:
+```rust
+// malmal = { version = "0.2", features = ["cdr"] }
+use malmal::cdr::{Error, Options};
 
-| Option | Protocol |
-|---|---|
-| `--socket <PATH>` | One JSON line, then the file, on a Unix socket |
-| `--http <ADDR>` | `POST /scan` with the file as the body; `POST /sanitize` for the rebuilt image; `GET /metrics` for Prometheus; `GET /healthz` |
-| `--clamd <ADDR>` | The `INSTREAM` command of ClamAV's daemon, for clients that already speak it |
-| `--icap <ADDR>` | ICAP (`REQMOD`, `RESPMOD`), for a proxy such as Squid to pass uploads and downloads through |
-
-```bash
-curl --data-binary @upload.pdf 'http://127.0.0.1:8080/scan?filename=upload.pdf'
+match scanner.sanitize(&data, hints, &Options::default()) {
+    Ok(sanitized) => store(&sanitized.image.data, sanitized.image.file_type),
+    Err(Error::Rejected(report)) => reject(&report.findings),
+    Err(other) => reject_with(other.to_string()),   // not an image, too large, undecodable
+}
 ```
-
-The reply is `{"ok": true, "report": {...}}`; anything else means the file was not scanned.
-The daemon has no authentication: bind it to the loopback interface or a Unix socket.
-`--workers` is the number of requests worked on at once and `--connections` the number of
-connections kept open; an idle connection holds no worker. `--max-size` and
-`--scan-timeout` set the limits for every request. A scan still running
-after `--hard-timeout` (six times the scan timeout unless given) ends the daemon, for its
-supervisor to start again; see [Limits and timeouts](docs/integration.md#limits-and-timeouts).
-The protocols, the metrics and client examples are in
-[docs/integration.md](docs/integration.md).
-
-## Using it from C
-
-```c
-malmal_scanner *scanner = malmal_scanner_new(0, NULL, 0);
-char *report = NULL;
-int verdict = malmal_scan(scanner, data, len, "a.png", "image/png", &report);
-malmal_string_free(report);
-malmal_scanner_free(scanner);
-```
-
-`malmal_sanitize` returns the rebuilt image. Full example:
-`crates/malmal-ffi/examples/scan.c`.
-
-## Using it from Python
-
-`bindings/python` wraps the C library with `ctypes`; it needs nothing but the standard
-library. The release workflow builds wheels for Linux that carry the library; building
-one yourself is described in [bindings/python/README.md](bindings/python/README.md).
 
 ```python
-import malmal
-
-scanner = malmal.Scanner()
-report = scanner.scan(data, filename="a.png", content_type="image/png")
-if not report.clean:
-    reject([finding["code"] for finding in report.findings])
-
-image = scanner.sanitize(data, filename="a.png")   # raises unless there is a new file
-store(image.data, image.file_type)
+try:
+    image = scanner.sanitize(data, filename="a.png")
+except malmal.SanitizeError:        # Rejected (with .report) or NotRebuilt
+    reject()
+else:
+    store(image.data, image.file_type)
 ```
 
-## YARA (optional)
+From C it is `malmal_sanitize`. In every form, anything but success means there is no
+file to keep, and the upload itself is not to be stored in its place.
+
+Worth knowing:
+
+- The type can change: a BMP, TIFF or ICO comes back as PNG. Store the file as the type
+  the result names.
+- An animation keeps its frame delays and its loop count.
+- The new file carries no colour profile, so it is read as sRGB. The pixels of an image
+  with a profile are converted to sRGB first, which keeps its colours as far as sRGB can
+  show them: RGB and grey profiles, and the CMYK profile of a CMYK JPEG.
+- A JPEG is compressed again, so it loses a little; a lossy WebP grows, because it is
+  stored losslessly.
+
+## Serve software that already talks to ClamAV
+
+Many applications can hand uploads to `clamd`. Point them at malmal instead:
+
+```bash
+malmald --clamd 127.0.0.1:3310
+```
+
+`PING`, `VERSION` and `INSTREAM` are answered, which is what such clients use. The
+protocol has only two answers and no way to name the file, so a suspicious file is
+answered `FOUND` like a malicious one (`stream: Malmal.Suspicious.pdf.encrypted FOUND`),
+and the file name and `Content-Type` are not checked against the content.
+
+## Scan what passes through a proxy
+
+A proxy that speaks ICAP hands each request or response to the daemon and forwards it
+only if the daemon lets it through. Nothing in the application changes.
+
+```bash
+malmald --icap 127.0.0.1:1344
+```
+
+With Squid:
+
+```
+icap_enable on
+icap_service malmal_req reqmod_precache icap://127.0.0.1:1344/scan bypass=off
+icap_service malmal_resp respmod_precache icap://127.0.0.1:1344/scan bypass=off
+# Uploads on the way in, files on the way out.
+acl uploads method POST PUT
+acl downloads urlpath_regex -i \.(png|jpe?g|gif|webp|pdf)$
+adaptation_access malmal_req allow uploads
+adaptation_access malmal_resp allow downloads
+```
+
+`bypass=off` keeps it fail-closed: Squid refuses the request when the daemon cannot be
+reached. Each file in a `multipart/form-data` upload is scanned on its own; any other
+body is scanned as the file itself. A message that is not clean is replaced by
+`403 Forbidden`.
+
+What is judged is a file, so send it uploads and downloads, as the `acl` lines do, and not
+every request: a JSON API call or an HTML page is not a file the scanner knows and would
+be blocked. The details are in [docs/integration.md](docs/integration.md#icap).
+
+## Accept only the types you take
+
+Every supported type is accepted by default, PostScript included. A service that wants
+images and PDFs only says so, and everything else is reported as `type.not_allowed`:
+
+```bash
+malmal scan --types jpeg,png,gif,webp,pdf upload.eps
+```
+
+`malmald` takes the same option. From Rust:
+
+```rust
+use malmal::{FileType, Policy, Scanner};
+
+let policy = Policy::default().with_allowed_types([FileType::Jpeg, FileType::Png, FileType::Pdf]);
+let scanner = Scanner::builder().policy(policy).build();
+```
+
+The names are `jpeg`, `png`, `gif`, `webp`, `bmp`, `tiff`, `psd`, `heif`, `avif`, `jxl`,
+`ico`, `svg`, `pdf` and `postscript`.
+
+## Look inside encrypted PDFs
+
+A PDF encrypted with an empty password, which every reader opens without asking, is
+always decrypted and inspected. One that needs a password cannot be, and is reported as
+`pdf.encrypted`, which makes it suspicious. If your users send documents with passwords
+you know, supply them, and those documents are inspected like any other:
+
+```bash
+malmal scan --pdf-passwords passwords.txt statement.pdf
+```
+
+The file holds one password per line; each is tried as user and as owner password.
+`malmald` takes the same option. From Rust it is
+`Scanner::builder().pdf_passwords(["..."])`, from Python
+`malmal.Scanner(pdf_passwords=["..."])`, from C `malmal_scanner_new_with_passwords`.
+
+## Block known files and add your own rules
+
+A SHA-256 blocklist rejects files you have seen before, whatever is in them. The file is
+one hex digest per line, and the output of `sha256sum` is read as it is:
+
+```bash
+sha256sum known-bad/* > blocklist.txt
+```
+
+```bash
+malmal scan --hashlist blocklist.txt upload.png
+```
+
+From Rust it is `HashList::parse` and `Scanner::builder().hashlist(...)`; from Python,
+`malmal.Scanner(hashlist=text)`.
+
+YARA rules are matched against every file, and against files embedded in PDFs, in a build
+with the `yara` feature:
 
 ```bash
 cargo build --release -p malmal-cli --features yara
+```
+
+```bash
 malmal scan --yara rules/ upload.jpg
 ```
 
-This feature is off by default because it pulls in a WebAssembly runtime and takes the
-binary to about 16 MB. The YARA build **does not build for musl**; it links
-dynamically against glibc, so build it on the Debian release that will run it. YARA's `pe`
-and `elf` modules are not enabled.
+The feature is off by default because it pulls in a WebAssembly runtime and takes the
+binary to about 16 MB. That build **does not build for musl**: it links dynamically
+against glibc, so build it on the release of the system that will run it. YARA's `pe` and
+`elf` modules are not enabled.
+
+## Decide what is rejected
+
+Every finding has a severity, and the policy turns the worst one into the verdict:
+
+| Policy | Low | Medium | High, Critical |
+|---|---|---|---|
+| `default` | suspicious | suspicious | malicious |
+| `strict` | suspicious | malicious | malicious |
+
+Info leaves a file clean. If you reject everything that is not clean, as recommended, the
+two differ only in what the report calls it; `strict` matters where suspicious files are
+quarantined and malicious ones dropped.
+
+```bash
+malmal scan --policy strict upload.pdf
+```
+
+To accept something the default policy flags, lower that one code rather than ignoring
+verdicts; to reject something it lets through, raise it. This is in the Rust API:
+
+```rust
+use malmal::{Policy, Severity};
+
+let policy = Policy::default()
+    .with_override("svg.foreign_object", Severity::Info)      // our editor writes these
+    .with_override("image.vendor_trailer", Severity::Medium); // no phone camera extras
+```
+
+## Run it in production
+
+**The sandbox.** Before it reads the first byte of a file, the process confines itself:
+Landlock allows reading only the files it was given, seccomp blocks `execve`, sockets
+and other dangerous system calls, and an rlimit caps memory. A bug in a parser then has
+nowhere to go. `--require-sandbox` turns a failure to confine into an error, and is what a
+deployment should pass; `--no-sandbox` turns confinement off. Linux only.
+
+**Limits.** A file that exceeds one is reported with a `limit.*` finding, never as clean.
+
+| Option | Default | What it bounds |
+|---|---|---|
+| `--max-size <BYTES>` | 64 MB | The file; the daemon refuses a larger one outright |
+| `--scan-timeout <S>` | 10 | One scan, checked between steps of the analysis |
+| `--hard-timeout <S>` | 6 × the above | A scan that does not end: the process exits with status 3 |
+
+From Rust, `Limits` holds these and the caps on decompressed data (256 MB), nesting depth
+(4) and pixel count (2^28). The hard timeout exists in the commands only; see
+[Known limits](#known-limits).
+
+**The daemon.** `--workers` (4) is the number of requests worked on at once and is what
+bounds memory and processors; `--connections` (256) is the number of connections kept
+open, and an idle one holds no worker. Because a scan past the hard timeout ends the
+process, run the daemon under a supervisor that starts it again:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/malmald --socket /run/malmal/malmal.sock --http 127.0.0.1:8080 --require-sandbox
+Restart=always
+DynamicUser=yes
+RuntimeDirectory=malmal
+```
+
+`GET /healthz` answers `200 ok`, and `GET /metrics` has counters in the Prometheus text
+format: scans by verdict, errors, refused requests, bytes, time, rebuilt images.
+
+**In a container** the image runs `malmald --http 0.0.0.0:8080` as an unprivileged user;
+arguments replace that default. Publish the port to the upload service only.
+
+```bash
+docker run --rm -p 127.0.0.1:3310:3310 ghcr.io/nguyenthuan155632/malmal --clamd 0.0.0.0:3310 --max-size 20000000
+```
 
 ## Testing
 
@@ -258,7 +478,7 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
   `MALMAL_RECORD=1 cargo test -p malmal --test corpus`.
 - `cargo run --release --example survey -- --expect-clean DIR...` scans a directory of
   known-good files and lists those that did not come back clean: the false-positive rate on
-  your own uploads.
+  your own uploads. Run it before you deploy.
 - `fuzz/` has one target per format (`cargo fuzz list`).
 - `cargo run --release --example throughput -- FILE...` measures throughput.
 
@@ -276,8 +496,8 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
 - **Short tags (`<?=`, `<%=`, `<%@`) in images are reported only as complete tags**: text that
   is closed, balanced and reaches a call or variable. Uncompressed pixels otherwise match
   them by chance.
-- **No pixel data is decoded.** For HEIC and AVIF the boxes, the declared sizes and the item
-  locations are checked, not the HEVC or AV1 stream.
+- **A scan decodes no pixel data.** For HEIC and AVIF the boxes, the declared sizes and the
+  item locations are checked, not the HEVC or AV1 stream.
 - **A bare JPEG XL codestream has no end that can be found without decoding it**, so data
   appended to one is not reported as trailing data; it is still searched for payloads. In the
   boxed form the end is known, and Brotli-compressed metadata boxes are decompressed and
@@ -289,24 +509,24 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
   `with_override` to reject them. Other trailing data stays `image.trailing_data`.
 - **Changes to `errordict` and `systemdict` are not reported.** Exploits use them to keep
   running after an error, and so does the prolog of every Illustrator EPS.
-- **PDFs that need a password are decrypted only when it is supplied** (`pdf_passwords`,
-  `--pdf-passwords`); otherwise they yield `pdf.encrypted` at Medium. Those encrypted with
-  an empty password, which every reader opens without asking, are always decrypted and
-  inspected. Only the standard security handler is supported, not certificate encryption.
+- **PDFs that need a password are decrypted only when it is supplied**; otherwise they
+  yield `pdf.encrypted` at Medium. Only the standard security handler is supported, not
+  certificate encryption.
 - **Strings in a PDF are not inspected**, encrypted or not: JavaScript is reported because
   it is there, not for what it does.
 - **XFA forms are searched for scripts and nothing else.**
 - **The ClamAV protocol carries no file name**, so `type.mismatch` and
   `name.dangerous_extension` cannot be reported over it.
-- **Over ICAP a request body is judged as a file** unless it is a form: route only upload
-  URLs to it, or JSON API calls are blocked as `type.unknown`. The ICAP endpoint is tested
-  against the protocol as specified and behind Squid 6, not behind other proxies.
+- **Over ICAP a request body is judged as a file** unless it is a form. The endpoint is
+  tested against the protocol as specified and behind Squid 6, not behind other proxies.
 - **Rebuilding keeps the pixels**, so data encoded in them survives, and it relies on the
-  `image` crate's decoders. An animated PNG with 16 bits a channel comes out with 8.
+  `image` crate's decoders. HEIC, AVIF, JPEG XL and PSD are scanned but not rebuilt. An
+  animated PNG with 16 bits a channel comes out with 8.
 - **The time limit is checked between steps** of the analysis, and between the frames of
   an image being rebuilt; it bounds the work without cutting it off at an exact moment.
   The library cannot stop a step that does not end. The commands can: past
   `--hard-timeout` the process exits with status 3, and whatever else the daemon was
-  doing at that moment is lost with it.
+  doing at that moment is lost with it. A service that needs that guarantee calls the
+  daemon rather than the library.
 - Office documents, archives and video are out of scope; they are rejected with
   `type.not_allowed` or `type.unknown`.
