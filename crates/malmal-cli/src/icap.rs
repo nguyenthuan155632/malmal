@@ -376,6 +376,9 @@ pub fn icap(
     service: &Service,
 ) -> io::Result<()> {
     loop {
+        let Some(_turn) = service.turn(reader)? else {
+            return Ok(());
+        };
         let refuse = |writer, status: &str| {
             service.metrics().reject();
             Reply::status(status).write(writer)

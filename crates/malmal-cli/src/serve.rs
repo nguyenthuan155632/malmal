@@ -16,6 +16,7 @@
 use std::io::{self, BufRead, Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use malmal::{Report, ScanHints, Scanner, Severity, Verdict};
@@ -99,12 +100,54 @@ impl Metrics {
     }
 }
 
+/// A number of places, each held by one [`Slot`] at a time.
+#[derive(Debug)]
+pub struct Slots {
+    free: Mutex<usize>,
+    freed: Condvar,
+}
+
+/// A place taken from [`Slots`]; dropping it gives the place back.
+#[derive(Debug)]
+pub struct Slot(Arc<Slots>);
+
+impl Slots {
+    pub fn new(count: usize) -> Arc<Self> {
+        Arc::new(Self {
+            free: Mutex::new(count),
+            freed: Condvar::new(),
+        })
+    }
+
+    /// Wait for a place.
+    pub fn take(self: &Arc<Self>) -> Slot {
+        let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
+        while *free == 0 {
+            free = self
+                .freed
+                .wait(free)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        *free -= 1;
+        Slot(Arc::clone(self))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        self.0.freed.notify_one();
+    }
+}
+
 /// The scanner and its counters, shared by every connection.
 #[derive(Debug)]
 pub struct Service {
     scanner: Scanner,
     metrics: Metrics,
     watchdog: Watchdog,
+    /// Places for requests being worked on; without them, any number.
+    turns: Option<Arc<Slots>>,
 }
 
 impl Service {
@@ -113,7 +156,26 @@ impl Service {
             scanner,
             metrics: Metrics::default(),
             watchdog: Watchdog::default(),
+            turns: None,
         }
+    }
+
+    /// Work on at most `requests` at once, however many connections there
+    /// are. This is what bounds the memory and the processors in use.
+    pub fn at_once(mut self, requests: usize) -> Self {
+        self.turns = Some(Slots::new(requests));
+        self
+    }
+
+    /// Wait for the next request on a connection, then for a place to work
+    /// on it; `None` when the connection has ended. A connection kept open
+    /// between requests holds no place, so the clients that keep theirs,
+    /// as proxies do, cannot keep the others waiting.
+    pub(crate) fn turn(&self, reader: &mut impl BufRead) -> io::Result<Option<Option<Slot>>> {
+        if reader.fill_buf()?.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.turns.as_ref().map(Slots::take)))
     }
 
     /// End the process when a scan runs for as long as `watchdog` allows.
@@ -235,6 +297,9 @@ pub fn json(
     };
     let error = |message: &str| serde_json::json!({ "ok": false, "error": message });
     loop {
+        let Some(_turn) = service.turn(reader)? else {
+            return Ok(());
+        };
         let mut header = String::new();
         if reader
             .by_ref()
@@ -358,6 +423,9 @@ pub fn http(
     service: &Service,
 ) -> io::Result<()> {
     loop {
+        let Some(_turn) = service.turn(reader)? else {
+            return Ok(());
+        };
         let too_large = |writer| {
             service.metrics.reject();
             Response::error("431 Request Header Fields Too Large", "headers too large")
@@ -544,6 +612,9 @@ pub fn clamd(
     let mut session = false;
     let mut id = 0u32;
     loop {
+        let Some(_turn) = service.turn(reader)? else {
+            return Ok(());
+        };
         let Some(&first) = reader.fill_buf()?.first() else {
             return Ok(());
         };

@@ -18,7 +18,7 @@ use std::time::Duration;
 use malmal_cli::icap;
 use malmal_cli::options::{self, Common};
 use malmal_cli::sandbox;
-use malmal_cli::serve::{self, Service};
+use malmal_cli::serve::{self, Service, Slots};
 
 const USAGE: &str = "\
 Usage: malmald (--socket <PATH> | --http <ADDR> | --clamd <ADDR> | --icap <ADDR>)...
@@ -31,7 +31,8 @@ Options:
   --http <ADDR>        HTTP: POST /scan, GET /metrics, GET /healthz
   --clamd <ADDR>       ClamAV daemon protocol (PING, VERSION, INSTREAM)
   --icap <ADDR>        ICAP for proxies (OPTIONS, REQMOD, RESPMOD)
-  --workers <N>        Connections served at once on each endpoint [default: 4]
+  --workers <N>        Requests worked on at once [default: 4]
+  --connections <N>    Connections kept open at once [default: 256]
   --timeout <SECONDS>  Idle time before a connection is dropped [default: 30]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,7 @@ impl Protocol {
 struct Args {
     endpoints: Vec<(Protocol, String)>,
     workers: usize,
+    connections: usize,
     timeout: Duration,
     common: Common,
 }
@@ -70,6 +72,7 @@ fn usage() -> String {
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut endpoints = Vec::new();
     let mut workers = 4;
+    let mut connections = 256;
     let mut timeout = 30;
     let mut common = Common::default();
     while let Some(arg) = args.next() {
@@ -85,6 +88,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     .ok()
                     .filter(|&n| n > 0)
                     .ok_or("--workers needs a positive number")?
+            }
+            "--connections" => {
+                connections = value("--connections")?
+                    .parse()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or("--connections needs a positive number")?
             }
             "--timeout" => {
                 timeout = value("--timeout")?
@@ -106,6 +116,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     Ok(Args {
         endpoints,
         workers,
+        connections,
         timeout: Duration::from_secs(timeout),
         common,
     })
@@ -139,13 +150,6 @@ impl Listener {
         let listener = UnixListener::bind(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o660))?;
         Ok((Self::Unix(listener), address.to_string()))
-    }
-
-    fn try_clone(&self) -> io::Result<Self> {
-        Ok(match self {
-            Self::Unix(listener) => Self::Unix(listener.try_clone()?),
-            Self::Tcp(listener) => Self::Tcp(listener.try_clone()?),
-        })
     }
 
     fn accept(&self) -> io::Result<Stream> {
@@ -198,22 +202,45 @@ impl Write for &Stream {
     }
 }
 
-fn worker(listener: Listener, protocol: Protocol, service: Arc<Service>, timeout: Duration) {
+/// Serve one connection to its end.
+fn serve(stream: &Stream, protocol: Protocol, service: &Service, timeout: Duration) {
+    if stream.set_timeout(timeout).is_err() {
+        return;
+    }
+    let mut reader = BufReader::new(stream);
+    // Errors here are the peer's: a timeout, a reset, a short body.
+    let _ = match protocol {
+        Protocol::Json => serve::json(&mut reader, stream, service),
+        Protocol::Http => serve::http(&mut reader, stream, service),
+        Protocol::Clamd => serve::clamd(&mut reader, stream, service),
+        Protocol::Icap => icap::icap(&mut reader, stream, service),
+    };
+}
+
+/// Give every connection to an endpoint a thread of its own. A thread that
+/// waits for a client's next request costs little; the work is bounded by
+/// the service, and the number of connections by `connections`, past which
+/// they wait to be accepted.
+fn accept(
+    listener: Listener,
+    protocol: Protocol,
+    service: Arc<Service>,
+    connections: Arc<Slots>,
+    timeout: Duration,
+) {
     loop {
+        let place = connections.take();
         let Ok(stream) = listener.accept() else {
+            // Out of descriptors, most likely; they come back as connections end.
+            thread::sleep(Duration::from_millis(50));
             continue;
         };
-        if stream.set_timeout(timeout).is_err() {
-            continue;
-        }
-        let mut reader = BufReader::new(&stream);
-        // Errors here are the peer's: a timeout, a reset, a short body.
-        let _ = match protocol {
-            Protocol::Json => serve::json(&mut reader, &stream, &service),
-            Protocol::Http => serve::http(&mut reader, &stream, &service),
-            Protocol::Clamd => serve::clamd(&mut reader, &stream, &service),
-            Protocol::Icap => icap::icap(&mut reader, &stream, &service),
-        };
+        let service = Arc::clone(&service);
+        // If no thread can be had, the connection is dropped with the closure.
+        let _ = thread::Builder::new().spawn(move || {
+            let _place = place;
+            serve(&stream, protocol, &service, timeout);
+        });
     }
 }
 
@@ -270,19 +297,16 @@ fn main() -> ExitCode {
     }
 
     let watchdog = args.common.watchdog("malmald");
-    let service = Arc::new(Service::new(scanner).watched_by(watchdog));
+    let service = Service::new(scanner).watched_by(watchdog);
+    let service = Arc::new(service.at_once(args.workers));
+    let connections = Slots::new(args.connections);
     let mut handles = Vec::new();
-    for (protocol, listener, _) in &listeners {
-        for _ in 0..args.workers {
-            let Ok(listener) = listener.try_clone() else {
-                eprintln!("malmald: cannot share the listening socket");
-                return ExitCode::FAILURE;
-            };
-            let (protocol, service, timeout) = (*protocol, Arc::clone(&service), args.timeout);
-            handles.push(thread::spawn(move || {
-                worker(listener, protocol, service, timeout)
-            }));
-        }
+    for (protocol, listener, _) in listeners {
+        let (service, connections) = (Arc::clone(&service), Arc::clone(&connections));
+        let timeout = args.timeout;
+        handles.push(thread::spawn(move || {
+            accept(listener, protocol, service, connections, timeout)
+        }));
     }
     for handle in handles {
         let _ = handle.join();

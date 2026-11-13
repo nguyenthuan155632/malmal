@@ -537,6 +537,36 @@ fn daemon_answers_icap_clients() {
     assert!(blocked.contains("HTTP/1.1 403 Forbidden"), "{blocked}");
 }
 
+/// A proxy keeps its connections open between requests. With a thread
+/// held by each, a handful of them once kept every other client waiting.
+#[test]
+fn idle_connections_do_not_keep_others_waiting() {
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    let (_daemon, address) = daemon_on_tcp("--http");
+    let request = b"GET /healthz HTTP/1.1\r\n\r\n";
+    let answered = |stream: &mut TcpStream| {
+        stream.write_all(request).unwrap();
+        let mut reply = [0; 15];
+        stream.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"HTTP/1.1 200 OK");
+    };
+    // Three times as many as requests are worked on at once.
+    let mut kept: Vec<TcpStream> = (0..12)
+        .map(|_| TcpStream::connect(&address).unwrap())
+        .collect();
+    kept.iter_mut().for_each(answered);
+
+    let started = Instant::now();
+    let mut late = TcpStream::connect(&address).unwrap();
+    late.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+    answered(&mut late);
+    // Well inside the five seconds after which an idle connection is dropped.
+    assert!(started.elapsed() < Duration::from_secs(3));
+    drop(kept);
+}
+
 #[test]
 fn daemon_needs_an_endpoint() {
     let output = Command::new(MALMALD).output().unwrap();
