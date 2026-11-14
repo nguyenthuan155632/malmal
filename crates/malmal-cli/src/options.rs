@@ -3,7 +3,7 @@
 use std::fs;
 use std::time::Duration;
 
-use malmal::{FileType, HashList, Limits, Policy, Scanner};
+use malmal::{FileType, HashList, Limits, Policy, Scanner, Severity};
 
 use crate::sandbox::Mode;
 use crate::watchdog::Watchdog;
@@ -15,6 +15,9 @@ pub const HELP: &str = "  --policy <NAME>      default or strict [default: defau
   --types <LIST>       Accepted file types, comma-separated
                        [default: jpeg,png,gif,webp,bmp,tiff,psd,heif,avif,jxl,ico,
                        svg,pdf,postscript]
+  --allow <CODES>      Finding codes that do not count against a file,
+                       separated by commas or |: pdf.xfa,pdf.embedded_file
+                       (repeatable; codes are in docs/findings.md)
   --hashlist <FILE>    SHA-256 blocklist, one hex digest per line
   --no-hash            Do not compute the SHA-256 of a file, unless a
                        blocklist needs it; the slowest part on large files
@@ -38,6 +41,9 @@ pub const HELP: &str = "  --policy <NAME>      default or strict [default: defau
   --types <LIST>       Accepted file types, comma-separated
                        [default: jpeg,png,gif,webp,bmp,tiff,psd,heif,avif,jxl,ico,
                        svg,pdf,postscript]
+  --allow <CODES>      Finding codes that do not count against a file,
+                       separated by commas or |: pdf.xfa,pdf.embedded_file
+                       (repeatable; codes are in docs/findings.md)
   --hashlist <FILE>    SHA-256 blocklist, one hex digest per line
   --no-hash            Do not compute the SHA-256 of a file, unless a
                        blocklist needs it; the slowest part on large files
@@ -90,6 +96,8 @@ pub struct Common {
     pub policy: Policy,
     /// Replaces the policy's accepted types when given.
     pub types: Option<Vec<FileType>>,
+    /// Codes given with `--allow`, reported at Info whatever the policy.
+    pub allow: Vec<&'static str>,
     pub hashlist: HashList,
     pub no_hash: bool,
     pub pdf_passwords: Vec<String>,
@@ -106,6 +114,7 @@ impl Default for Common {
         Self {
             policy: Policy::default(),
             types: None,
+            allow: Vec::new(),
             hashlist: HashList::default(),
             no_hash: false,
             pdf_passwords: Vec::new(),
@@ -145,6 +154,12 @@ impl Common {
                     })
                     .collect::<Result<_, _>>()?;
                 self.types = Some(types);
+            }
+            "--allow" => {
+                let list = rest.next().ok_or("--allow needs a value")?;
+                for code in list.split([',', '|']).map(str::trim) {
+                    self.allow.push(allowable(code)?);
+                }
             }
             "--hashlist" => {
                 let path = rest.next().ok_or("--hashlist needs a value")?;
@@ -226,6 +241,9 @@ impl Common {
                 .with_allowed_types(types.iter().copied()),
             None => self.policy.clone(),
         };
+        let policy = self.allow.iter().fold(policy, |policy, &code| {
+            policy.with_override(code, Severity::Info)
+        });
         let builder = Scanner::builder()
             .limits(self.limits.clone())
             .policy(policy)
@@ -244,6 +262,22 @@ impl Common {
             builder.yara(malmal::YaraRules::compile(sources).map_err(|e| e.to_string())?)
         };
         Ok(builder.build())
+    }
+}
+
+/// The code `--allow` was given, if the scanner reports it. A limit cannot
+/// be allowed: a file that was not analyzed to the end is never clean.
+fn allowable(code: &str) -> Result<&'static str, String> {
+    let known = malmal::report::CODES.iter().find(|&&known| known == code);
+    match known {
+        Some(code) if code.starts_with("limit.") => Err(format!(
+            "--allow {code}: a file that was not analyzed to the end is never clean; \
+             raise the limit instead"
+        )),
+        Some(&code) => Ok(code),
+        None => Err(format!(
+            "--allow: unknown finding code {code:?}; the codes are listed in docs/findings.md"
+        )),
     }
 }
 
@@ -269,4 +303,69 @@ fn read_rules(path: &str) -> Result<Vec<String>, String> {
         .collect();
     files.sort();
     files.iter().map(|file| read(file)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Common, String> {
+        let mut common = Common::default();
+        let mut rest = args.iter().map(|arg| arg.to_string());
+        while let Some(arg) = rest.next() {
+            assert!(common.parse(&arg, &mut rest)?, "{arg} is not an option");
+        }
+        Ok(common)
+    }
+
+    #[test]
+    fn allowed_codes_are_listed_with_either_separator() {
+        let common = parse(&[
+            "--allow",
+            "pdf.xfa|pdf.embedded_file",
+            "--allow",
+            "pdf.uri, svg.foreign_object",
+        ])
+        .unwrap();
+        assert_eq!(
+            common.allow,
+            [
+                "pdf.xfa",
+                "pdf.embedded_file",
+                "pdf.uri",
+                "svg.foreign_object"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_codes_the_scanner_reports_can_be_allowed() {
+        let error = parse(&["--allow", "pdf.embeddedfile"]).err().unwrap();
+        assert!(
+            error.contains("unknown finding code \"pdf.embeddedfile\""),
+            "{error}"
+        );
+        assert!(parse(&["--allow", ""]).is_err());
+        assert!(parse(&["--allow"]).is_err());
+        let error = parse(&["--allow", "pdf.xfa,limit.complexity"])
+            .err()
+            .unwrap();
+        assert!(error.contains("never clean"), "{error}");
+    }
+
+    #[test]
+    fn allowed_codes_survive_a_later_policy() {
+        let common = parse(&["--allow", "pdf.xfa", "--policy", "strict"]).unwrap();
+        let scanner = common.scanner().unwrap();
+        let form = b"%PDF-1.7\n1 0 obj << /Type /Catalog /AcroForm << /XFA 2 0 R >> >> endobj\n\
+            2 0 obj << /Length 0 >> stream\n\nendstream endobj\n\
+            trailer << /Root 1 0 R >>\n%%EOF\n";
+        let report = scanner.scan_bytes(form, malmal::ScanHints::default());
+        let xfa = report
+            .findings
+            .iter()
+            .find(|f| f.code == "pdf.xfa")
+            .expect("no pdf.xfa");
+        assert_eq!(xfa.severity, Severity::Info);
+    }
 }

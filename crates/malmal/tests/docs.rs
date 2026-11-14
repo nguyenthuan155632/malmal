@@ -30,6 +30,8 @@ fn sources(dir: &Path, text: &mut String) {
         let path = entry.unwrap().path();
         if path.is_dir() {
             sources(&path, text);
+        } else if path.ends_with("report.rs") {
+            // Holds the list of codes, which is checked against the others.
         } else if path.extension().is_some_and(|ext| ext == "rs") {
             text.push_str(&fs::read_to_string(&path).unwrap());
         }
@@ -58,4 +60,15 @@ fn every_finding_code_is_documented() {
         unknown.is_empty(),
         "documented but never emitted: {unknown:?}"
     );
+
+    let listed: BTreeSet<String> = malmal::report::CODES
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+    assert_eq!(
+        listed.len(),
+        malmal::report::CODES.len(),
+        "a code is listed twice"
+    );
+    assert_eq!(listed, emitted, "malmal::report::CODES is out of date");
 }

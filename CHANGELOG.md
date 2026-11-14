@@ -81,6 +81,11 @@
   96 MB. Without the option every file is held in memory, as before.
 - `--max-decompressed` and `--max-pixels` for both commands, which with `--max-size` and
   `--workers` decide what a request can cost in memory.
+- `--allow <CODES>` for both commands: the finding codes named, separated by commas or
+  `|`, are reported at Info and leave a file clean, as `Policy::with_override` does from
+  Rust. An unknown code is an error, and so is a `limit.*` code. `malmal::report::CODES`
+  lists every code the scanner reports. The README lists the codes honest files carry and
+  what letting each through takes on.
 - `malmal_sanitize` in the C interface and `Scanner.sanitize` in the Python binding;
   `malmal_scanner_new_with_passwords` and `Scanner(pdf_passwords=...)` for encrypted PDFs.
 - `malmald --connections`. Every connection has its own thread, and `--workers` now counts

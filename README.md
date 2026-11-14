@@ -435,8 +435,45 @@ quarantined and malicious ones dropped.
 malmal scan --policy strict upload.pdf
 ```
 
-To accept something the default policy flags, lower that one code rather than ignoring
-verdicts; to reject something it lets through, raise it. This is in the Rust API:
+To accept something the default policy flags, let that one code through rather than
+ignoring verdicts. `--allow` takes codes separated by commas or `|`, and can be given
+more than once, to both `malmal` and `malmald`:
+
+```bash
+malmal scan --allow 'pdf.xfa|pdf.embedded_file' tax-form.pdf
+```
+
+An allowed code is still reported, at Info, and the rest of the file is still checked:
+an attachment is scanned whether `pdf.embedded_file` is allowed or not, and a script in
+an XFA form is `pdf.javascript`, not `pdf.xfa`. A code the scanner does not report is
+an error, so a misspelling does not pass for an allowance; so is a `limit.*` code,
+since a file that was not analyzed to the end is never clean (raise the limit instead).
+
+The codes honest files carry, and what letting each through takes on:
+
+| File type | Code | Severity | Honest files that carry it | What you take on |
+|---|---|---|---|---|
+| PDF | `pdf.xfa` | Medium | Tax and government forms made with Adobe LiveCycle | A form whose rendering differs between readers; its scripts are still refused |
+| PDF | `pdf.embedded_file` | Medium | The Word source of a document, the job options of the program that wrote it, invoices with XML data (ZUGFeRD, Factur-X) | Files a reader offers to open; each is scanned, an executable still refused |
+| PDF | `pdf.javascript` | High | Forms that compute totals or check fields, documents that print themselves on opening | Scripts in the reader: the most common way PDFs attack it |
+| PDF | `pdf.open_action`, `pdf.additional_action` | Medium / High | Documents that open at a page, or run a script on an event | Code that runs without a click, when it leads to a script or a launch |
+| PDF | `pdf.rich_media` | Medium | Brochures and manuals with video, sound or 3D models | Flash, media and 3D decoders, with a long history of exploits |
+| PDF | `pdf.external_ref` | Medium | Prepress files with OPI comments, documents that show pages of another | What is printed is not what was scanned |
+| PDF | `pdf.encrypted` | Medium | Documents locked with a password you do not have (`--pdf-passwords` adds them) | Streams that were not inspected at all |
+| PDF | `pdf.submit_form`, `pdf.remote_goto`, `pdf.trailing_data` | Low | Forms that send their data, documents linking to others, files edited by hand | A request to an address the file chose; bytes after the end that nothing read |
+| PDF | `pdf.launch` | High | Old documents opening a file next to them | A program started by the reader; rarely worth it |
+| SVG | `svg.foreign_object` | Medium | Text wrapped by some editors (draw.io) | HTML inside the image, rendered by a browser |
+| SVG | `svg.external_ref` | Medium | Images that link a web font or a picture by address | A request to that address each time it is shown, and content that was not scanned |
+| Image | `image.trailing_data` | Low | Photos from some cameras and editors | Bytes after the image that nothing read; rebuilding the image (`sanitize`) drops them |
+| Any | `type.mismatch` | Medium | Files with the wrong extension, such as a PNG saved as `.jpg` | A file served under a type it is not; store it under the detected type instead |
+
+What only an attack carries is not worth allowing: `type.executable`, `payload.*`,
+`hash.blocklisted`, `yara.match`, `*.polyglot`, `*.malformed`, the `svg.script`,
+`svg.event_handler`, `svg.javascript_uri` and `svg.entity` codes, `pdf.obfuscated_name`,
+`pdf.dangerous_uri`, `pdf.postscript`, `pdf.xml_entity` and the `ps.*` codes for files and
+devices. [docs/findings.md](docs/findings.md) lists every code. To reject something the
+policy lets through, raise its severity instead; that, and lowering a code to a severity
+other than Info, is in the Rust API:
 
 ```rust
 use malmal::{Policy, Severity};
@@ -554,9 +591,12 @@ refused for a limit or for being malformed: scripts (660), XFA forms without a s
 (260), attachments (207, mostly the Word source of the document or the job options of
 the program that made it), launch actions (12), 3D and media (9), data after `%%EOF`
 (4), a password that is not known, OPI comments and a page of 44 million points (one
-each). A service whose users send tax forms or documents with attachments lowers
-`pdf.xfa` or `pdf.embedded_file` with `Policy::with_override`; `survey` on its own files
-says whether it has to.
+each). A service whose users send tax forms or documents with attachments lets
+`pdf.xfa` or `pdf.embedded_file` through with `--allow` (see
+[Decide what is rejected](#decide-what-is-rejected)); `survey` on its own files says
+whether it has to. On this set, `--allow 'pdf.xfa|pdf.embedded_file'` accepts 92.38% of
+the clean files and still refuses 98.18% of the malicious ones; allowing `pdf.javascript`
+as well accepts 97.11% and refuses only 76.19%.
 
 Of the 396 malicious files accepted, 379 are a picture and a link to an ordinary web
 address, which is what an invoice is too: telling them apart takes knowing the address,

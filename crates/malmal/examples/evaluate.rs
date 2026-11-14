@@ -5,6 +5,8 @@
 //!     --clean PATH       Files that must be accepted; may be repeated
 //!     --malicious PATH   Files that must not be; may be repeated
 //!     --strict           Use the strict policy
+//!     --allow CODES      Finding codes reported at Info, separated by commas
+//!                        or `|`, as `--allow` does in the commands
 //!     --max-size BYTES   Largest file analyzed in full
 //!     --tsv FILE         Write one `class<TAB>path<TAB>verdict<TAB>codes`
 //!                        line per file, to diff between two versions
@@ -87,7 +89,7 @@ fn usage(message: &str) -> ExitCode {
     eprintln!("evaluate: {message}");
     eprintln!(
         "usage: evaluate [--clean PATH]... [--malicious PATH]... [--strict] \
-         [--max-size BYTES] [--tsv FILE] [--list N]"
+         [--allow CODES] [--max-size BYTES] [--tsv FILE] [--list N]"
     );
     ExitCode::from(2)
 }
@@ -95,6 +97,7 @@ fn usage(message: &str) -> ExitCode {
 fn main() -> ExitCode {
     let mut files = Vec::new();
     let mut strict = false;
+    let mut allow = Vec::new();
     let mut limits = Limits::default();
     let mut tsv = None;
     let mut list = 20;
@@ -110,6 +113,13 @@ fn main() -> ExitCode {
                 strict = true;
                 Ok(())
             }
+            "--allow" => value().and_then(|list| {
+                for code in list.split([',', '|']).map(str::trim) {
+                    let known = malmal::report::CODES.iter().find(|&&known| known == code);
+                    allow.push(*known.ok_or(format!("unknown finding code {code:?}"))?);
+                }
+                Ok(())
+            }),
             "--max-size" => value().and_then(|text| {
                 limits.max_file_size = text.parse().map_err(|_| "--max-size needs a number")?;
                 Ok(())
@@ -134,6 +144,9 @@ fn main() -> ExitCode {
     } else {
         Policy::default()
     };
+    let policy = allow.iter().fold(policy, |policy, &code| {
+        policy.with_override(code, malmal::Severity::Info)
+    });
     let scanner = Scanner::builder().policy(policy).limits(limits).build();
     let next = AtomicUsize::new(0);
     let outcomes = Mutex::new(Vec::with_capacity(files.len()));

@@ -7,7 +7,8 @@ arrive in minor releases.
 The default policy turns the worst severity into the verdict: **High** and **Critical** give
 `malicious`, **Low** and **Medium** give `suspicious`, **Info** leaves the file `clean`.
 `Policy::strict()` already treats Medium as `malicious`, and
-`Policy::with_override(code, severity)` changes one code.
+`Policy::with_override(code, severity)` changes one code, and `--allow CODE` lowers it to Info
+in the commands. `malmal::report::CODES` lists the codes below.
 
 A code listed with two severities is reported at the higher one when the reason given applies.
 

@@ -153,7 +153,8 @@ async fn main() -> std::io::Result<()> {
   that far; re-encoding is what removes whatever a scanner cannot see. The next section
   does both in one call.
 - The codes are listed in [findings.md](findings.md). To accept something the default policy
-  flags, lower that one code with `Policy::with_override` rather than ignoring verdicts.
+  flags, let that one code through with `--allow` (`Policy::with_override` from Rust)
+  rather than ignoring verdicts.
 
 ### Rebuilding images
 

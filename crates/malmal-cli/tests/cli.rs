@@ -120,6 +120,44 @@ fn types_option_replaces_the_accepted_types() {
 }
 
 #[test]
+fn allow_option_lets_the_codes_it_names_through() {
+    let dir = scratch("allow");
+    let form = dir.join("form.pdf");
+    fs::write(
+        &form,
+        "%PDF-1.7\n1 0 obj << /Type /Catalog /AcroForm << /XFA 2 0 R >> >> endobj\n\
+         2 0 obj << /Length 0 >> stream\n\nendstream endobj\n\
+         trailer << /Root 1 0 R >>\n%%EOF\n",
+    )
+    .unwrap();
+
+    let scan = |options: &[&str]| {
+        let output = Command::new(MALMAL)
+            .arg("scan")
+            .args(options)
+            .arg(&form)
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).unwrap() + &String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+    let (code, report) = scan(&["--json"]);
+    assert_eq!(code, Some(1), "{report}");
+    assert!(report.contains("pdf.xfa"), "{report}");
+    // The finding is still reported, at Info.
+    let (code, report) = scan(&["--json", "--allow", "pdf.embedded_file|pdf.xfa"]);
+    assert_eq!(code, Some(0), "{report}");
+    assert!(report.contains("pdf.xfa"), "{report}");
+    let (code, report) = scan(&["--allow", "pdf.embeddedfile"]);
+    assert_eq!(code, Some(3), "{report}");
+    assert!(report.contains("unknown finding code"), "{report}");
+    let (code, _) = scan(&["--allow", "limit.time"]);
+    assert_eq!(code, Some(3));
+}
+
+#[test]
 fn help_works_after_the_command_and_stays_aligned() {
     for args in [
         &["--help"][..],
