@@ -57,9 +57,8 @@
 - A PDF whose trailers take more than eight times the file to read, an object stream
   whose entries do, and a PostScript program whose strings that start after a backslash
   and never close take more than four times the program, are `limit.complexity`. An
-  icon whose images take more than twice the file is `image.malformed`. None of the files of `tests/corpus` comes near these,
-  and 3,359 files uploaded by customers (PDF, JPEG, PNG, PSD, EPS) get the same verdicts
-  as before.
+  icon whose images take more than twice the file is `image.malformed`. None of the
+  files of `tests/corpus` comes near these.
 - A PDF whose damaged streams decode to more than `--max-decompressed` in all is
   `limit.decompression`, and so is a PostScript program whose ASCII85 strings do.
 - `malmald` may hold more files at once than it has workers, up to `--file-budget`: with
