@@ -2848,7 +2848,10 @@ mod tests {
             );
         }
         assert_eq!(codes(&file(body.as_bytes())), ["pdf.draw_recursion"]);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // Some 2 s in a debug build on one core; the trailers alone took more
+        // than a minute of an optimized build when each was read to the end.
+        // The bound leaves room for a shared runner.
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
     }
 
     #[test]

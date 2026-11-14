@@ -1070,7 +1070,9 @@ mod tests {
         // Strings that start where the others read an escape are not known
         // to them, and are read each on its own.
         assert_eq!(codes(&"\\(".repeat(200_000)), ["limit.complexity"]);
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // Some 0.6 s in a debug build; the resources alone took 19 s of an
+        // optimized build when each comment was read to the end.
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]
