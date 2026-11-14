@@ -40,6 +40,15 @@
 - A rebuilt PDF keeps the text of its pages, where it was, as characters that can be
   searched and copied and do not draw; `--pdf-no-text` and `Options::pdf_text` leave it
   out.
+- A rebuilt PDF draws text from the outlines of its glyphs, written anew as Type 3 fonts,
+  where the page shows it in one opaque colour on a plain background with nothing over
+  it; each glyph is checked against the drawing of the page before it is taken out of
+  it. `--pdf-raster-text` and `Options::pdf_vector_text` keep all text in the drawing.
+  On 78 clean CIC-Evasive-PDFMal2022 documents, the 47 with text came out a fifth of
+  the size they did (median; at most 0.78), with a median 2.5% of the dark pixels of the
+  page left in the drawing; poppler draws none of them further from the original than
+  the drawing alone. The other 31 are scans and come out as before. Rebuilding took 51%
+  longer.
 
 ### Fixed
 
