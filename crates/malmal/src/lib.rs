@@ -64,7 +64,7 @@ pub use detect::FileType;
 pub use hashlist::{HashList, HashListError};
 pub use limits::Limits;
 use limits::{Budget, LimitExceeded};
-pub use policy::Policy;
+pub use policy::{AllowError, Policy};
 pub use report::{Finding, Report, Severity, Verdict};
 #[cfg(feature = "yara")]
 #[cfg_attr(docsrs, doc(cfg(feature = "yara")))]

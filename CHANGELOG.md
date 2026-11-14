@@ -84,7 +84,9 @@
 - `--allow <CODES>` for both commands: the finding codes named, separated by commas or
   `|`, are reported at Info and leave a file clean, as `Policy::with_override` does from
   Rust. An unknown code is an error, and so is a `limit.*` code. `malmal::report::CODES`
-  lists every code the scanner reports. The README lists the codes honest files carry and
+  lists every code the scanner reports, and `Policy::allow` checks a code against it
+  (`AllowError`). `Scanner(allow=[...])` in Python and `malmal_scanner_new_with_allow` in
+  C take the same list; the C function also gives the reason when it returns NULL. The README lists the codes honest files carry and
   what letting each through takes on.
 - `malmal_sanitize` in the C interface and `Scanner.sanitize` in the Python binding;
   `malmal_scanner_new_with_passwords` and `Scanner(pdf_passwords=...)` for encrypted PDFs.

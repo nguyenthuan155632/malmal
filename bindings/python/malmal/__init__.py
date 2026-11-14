@@ -123,13 +123,15 @@ def _load(path):
             "libmalmal_ffi was not found; build it with `cargo build --release "
             "-p malmal-ffi` and set MALMAL_LIBRARY to its path"
         )
-    library.malmal_scanner_new_with_passwords.restype = ctypes.c_void_p
-    library.malmal_scanner_new_with_passwords.argtypes = [
+    library.malmal_scanner_new_with_allow.restype = ctypes.c_void_p
+    library.malmal_scanner_new_with_allow.argtypes = [
         ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_size_t,
         ctypes.c_char_p,
         ctypes.c_size_t,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_void_p),
     ]
     library.malmal_scanner_free.restype = None
     library.malmal_scanner_free.argtypes = [ctypes.c_void_p]
@@ -176,10 +178,17 @@ class Scanner:
     SHA-256 blocklist as text, one hex digest per line. ``library`` is the
     path of ``libmalmal_ffi``, when it is not found otherwise.
     ``pdf_passwords`` are passwords (``str`` or ``bytes``) to try on
-    encrypted PDFs, each as user and as owner password.
+    encrypted PDFs, each as user and as owner password. ``allow`` names
+    finding codes that do not count against a file, such as
+    ``["pdf.xfa", "pdf.embedded_file"]`` or ``"pdf.xfa|pdf.embedded_file"``;
+    they are still reported, at ``"info"``. A code the scanner does not
+    report, or a ``limit.*`` code, raises :class:`ValueError`, as does a hash
+    list that does not parse.
     """
 
-    def __init__(self, strict=False, hashlist=None, library=None, pdf_passwords=()):
+    def __init__(
+        self, strict=False, hashlist=None, library=None, pdf_passwords=(), allow=()
+    ):
         # Before anything is loaded: `close` runs even when this raises.
         self._handle = None
         passwords = [
@@ -189,17 +198,28 @@ class Scanner:
         if any(b"\n" in password for password in passwords):
             raise ValueError("a password cannot contain a line break")
         passwords = b"\n".join(passwords)
+        codes = [allow] if isinstance(allow, str) else list(allow)
+        if not all(isinstance(code, str) for code in codes):
+            raise TypeError("allow takes finding codes as str")
+        codes = ",".join(code.replace("\0", "") for code in codes).encode()
         self._library = _load(library)
         blocklist = hashlist.encode() if isinstance(hashlist, str) else hashlist
-        self._handle = self._library.malmal_scanner_new_with_passwords(
+        error = ctypes.c_void_p()
+        self._handle = self._library.malmal_scanner_new_with_allow(
             int(strict),
             blocklist,
             len(blocklist) if blocklist else 0,
             passwords,
             len(passwords),
+            codes,
+            ctypes.byref(error),
         )
         if not self._handle:
-            raise ValueError("the hash list does not parse")
+            message = "the scanner could not be created"
+            if error.value:
+                message = ctypes.string_at(error.value).decode(errors="replace")
+                self._library.malmal_string_free(error)
+            raise ValueError(message)
 
     def scan(self, data, filename=None, content_type=None):
         """Scan ``data`` (bytes). ``filename`` and ``content_type`` are what

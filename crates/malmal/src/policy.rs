@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::detect::FileType;
-use crate::report::{Finding, Severity, Verdict};
+use crate::report::{CODES, Finding, Severity, Verdict};
 
 /// Turns findings into a verdict and decides which file types are accepted.
 #[derive(Debug, Clone)]
@@ -56,6 +57,18 @@ impl Policy {
         self
     }
 
+    /// Report every finding with this code at Info, so that it leaves a file
+    /// clean. Unlike [`Policy::with_override`], the code must be one the
+    /// scanner reports, and not a limit: a file that was not analyzed to
+    /// the end is never clean.
+    pub fn allow(self, code: &str) -> Result<Self, AllowError> {
+        match CODES.iter().find(|&&known| known == code) {
+            Some(&code) if code.starts_with("limit.") => Err(AllowError::Limit(code)),
+            Some(&code) => Ok(self.with_override(code, Severity::Info)),
+            None => Err(AllowError::Unknown(code.to_string())),
+        }
+    }
+
     /// Replace the set of accepted file types.
     pub fn with_allowed_types(mut self, types: impl IntoIterator<Item = FileType>) -> Self {
         self.allowed = types.into_iter().collect();
@@ -84,12 +97,56 @@ impl Policy {
     }
 }
 
+/// Why [`Policy::allow`] refused a code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllowError {
+    /// The scanner reports no such code.
+    Unknown(String),
+    /// A `limit.*` code: raise the limit instead.
+    Limit(&'static str),
+}
+
+impl fmt::Display for AllowError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown(code) => write!(
+                f,
+                "unknown finding code {code:?}; the codes are listed in docs/findings.md"
+            ),
+            Self::Limit(code) => write!(
+                f,
+                "{code} cannot be allowed: a file that was not analyzed to the end is never \
+                 clean; raise the limit instead"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AllowError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn finding(severity: Severity) -> Finding {
         Finding::new("test.code", severity, "test")
+    }
+
+    #[test]
+    fn only_codes_the_scanner_reports_are_allowed() {
+        let policy = Policy::strict().allow("pdf.xfa").unwrap();
+        let mut findings = [Finding::new("pdf.xfa", Severity::Medium, "form")];
+        assert_eq!(policy.apply(&mut findings), Verdict::Clean);
+        assert_eq!(findings[0].severity, Severity::Info);
+
+        let error = Policy::default().allow("pdf.embeddedFile").unwrap_err();
+        assert_eq!(error, AllowError::Unknown("pdf.embeddedFile".into()));
+        assert!(error.to_string().contains("unknown finding code"));
+        assert!(Policy::default().allow("").is_err());
+        assert_eq!(
+            Policy::default().allow("limit.time").unwrap_err(),
+            AllowError::Limit("limit.time")
+        );
     }
 
     #[test]

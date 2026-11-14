@@ -43,6 +43,22 @@ malmal_scanner *malmal_scanner_new_with_passwords(int strict,
                                                   const char *pdf_passwords,
                                                   size_t pdf_passwords_len);
 
+/*
+ * As malmal_scanner_new_with_passwords, with finding codes that do not count
+ * against a file: `allow` is a NUL-terminated list such as
+ * "pdf.xfa,pdf.embedded_file" (commas or '|' between them), or NULL for
+ * none. An allowed finding is still in the report, at "info". The codes are
+ * listed in docs/findings.md; a code the scanner does not report, or a
+ * limit.* code, is an error.
+ * On an error, returns NULL and, if `error` is not NULL, stores in it a
+ * NUL-terminated message, to be released with malmal_string_free; it is
+ * set to NULL otherwise.
+ */
+malmal_scanner *malmal_scanner_new_with_allow(
+    int strict, const char *hashlist, size_t hashlist_len,
+    const char *pdf_passwords, size_t pdf_passwords_len, const char *allow,
+    char **error);
+
 void malmal_scanner_free(malmal_scanner *scanner);
 
 /*

@@ -113,12 +113,8 @@ fn main() -> ExitCode {
                 strict = true;
                 Ok(())
             }
-            "--allow" => value().and_then(|list| {
-                for code in list.split([',', '|']).map(str::trim) {
-                    let known = malmal::report::CODES.iter().find(|&&known| known == code);
-                    allow.push(*known.ok_or(format!("unknown finding code {code:?}"))?);
-                }
-                Ok(())
+            "--allow" => value().map(|list| {
+                allow.extend(list.split([',', '|']).map(|code| code.trim().to_string()))
             }),
             "--max-size" => value().and_then(|text| {
                 limits.max_file_size = text.parse().map_err(|_| "--max-size needs a number")?;
@@ -144,9 +140,13 @@ fn main() -> ExitCode {
     } else {
         Policy::default()
     };
-    let policy = allow.iter().fold(policy, |policy, &code| {
-        policy.with_override(code, malmal::Severity::Info)
-    });
+    let policy = match allow
+        .iter()
+        .try_fold(policy, |policy, code| policy.allow(code))
+    {
+        Ok(policy) => policy,
+        Err(error) => return usage(&format!("--allow: {error}")),
+    };
     let scanner = Scanner::builder().policy(policy).limits(limits).build();
     let next = AtomicUsize::new(0);
     let outcomes = Mutex::new(Vec::with_capacity(files.len()));

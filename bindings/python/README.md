@@ -13,7 +13,11 @@ if not report.clean:
 ```
 
 Anything but `report.clean`, including a `malmal.ScanError`, means the file is not accepted.
-`Scanner(pdf_passwords=["..."])` supplies passwords to try on encrypted PDFs.
+`Scanner(pdf_passwords=["..."])` supplies passwords to try on encrypted PDFs, and
+`Scanner(allow=["pdf.xfa", "pdf.embedded_file"])` names finding codes that do not count
+against a file; they are still reported, at `"info"`. A code that does not exist raises
+`ValueError`. Which codes honest files carry, and what letting each through takes on, is
+in the [main README](https://github.com/nguyenthuan155632/malmal#allowing-finding-codes).
 
 `sanitize` scans and then writes a clean image anew from its pixels, so that nothing but the
 picture is kept:

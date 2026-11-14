@@ -39,32 +39,85 @@ pub unsafe extern "C" fn malmal_scanner_new_with_passwords(
     pdf_passwords: *const c_char,
     pdf_passwords_len: usize,
 ) -> *mut malmal_scanner {
-    // SAFETY: the caller guarantees each is null or as long as it says.
-    let (text, passwords) = unsafe {
+    // SAFETY: the caller's guarantees are the ones asked for there; the
+    // allowed codes are null and no error is asked for.
+    unsafe {
+        malmal_scanner_new_with_allow(
+            strict,
+            hashlist,
+            hashlist_len,
+            pdf_passwords,
+            pdf_passwords_len,
+            ptr::null(),
+            ptr::null_mut(),
+        )
+    }
+}
+
+/// # Safety
+/// As for `malmal_scanner_new_with_passwords`; `allow` must be null or
+/// NUL-terminated, and `error` null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn malmal_scanner_new_with_allow(
+    strict: c_int,
+    hashlist: *const c_char,
+    hashlist_len: usize,
+    pdf_passwords: *const c_char,
+    pdf_passwords_len: usize,
+    allow: *const c_char,
+    error: *mut *mut c_char,
+) -> *mut malmal_scanner {
+    if !error.is_null() {
+        // SAFETY: the caller guarantees `error` is writable.
+        unsafe { *error = ptr::null_mut() };
+    }
+    // SAFETY: the caller guarantees each is null or as long as it says, and
+    // `allow` null or NUL-terminated.
+    let (text, passwords, allow) = unsafe {
         (
             lines(hashlist, hashlist_len),
             lines(pdf_passwords, pdf_passwords_len),
+            optional_str(allow),
         )
     };
     let built = catch_unwind(|| {
-        let hashlist = HashList::parse(std::str::from_utf8(text).ok()?).ok()?;
+        let text =
+            std::str::from_utf8(text).map_err(|_| "the hash list is not UTF-8".to_string())?;
+        let hashlist = HashList::parse(text).map_err(|e| e.to_string())?;
         let policy = if strict != 0 {
             Policy::strict()
         } else {
             Policy::default()
         };
+        // Separated as the commands' --allow is; nothing given is nothing allowed.
+        let codes = allow
+            .as_deref()
+            .unwrap_or("")
+            .split([',', '|'])
+            .map(str::trim);
+        let policy = codes
+            .filter(|code| !code.is_empty())
+            .try_fold(policy, |policy, code| policy.allow(code))
+            .map_err(|e| e.to_string())?;
         // One to a line; a password is bytes, not necessarily text.
         let passwords = passwords
             .split(|&byte| byte == b'\n')
             .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
             .filter(|line| !line.is_empty());
         let builder = Scanner::builder().policy(policy).hashlist(hashlist);
-        Some(builder.pdf_passwords(passwords).build())
+        Ok::<_, String>(builder.pdf_passwords(passwords).build())
     });
-    match built {
-        Ok(Some(scanner)) => Box::into_raw(Box::new(malmal_scanner(scanner))),
-        _ => ptr::null_mut(),
+    let message = match built {
+        Ok(Ok(scanner)) => return Box::into_raw(Box::new(malmal_scanner(scanner))),
+        Ok(Err(message)) => message,
+        Err(_) => "the scanner could not be created".to_string(),
+    };
+    if !error.is_null() {
+        let message = CString::new(message.replace('\0', "")).unwrap_or_default();
+        // SAFETY: the caller guarantees `error` is writable.
+        unsafe { *error = message.into_raw() };
     }
+    ptr::null_mut()
 }
 
 /// # Safety
@@ -472,6 +525,69 @@ mod tests {
         unsafe {
             malmal_scanner_free(closed);
             malmal_scanner_free(opened);
+        }
+    }
+
+    #[test]
+    fn allowed_codes_leave_a_file_clean() {
+        let form = b"%PDF-1.7\n1 0 obj << /Type /Catalog /AcroForm << /XFA 2 0 R >> >> endobj\n\
+            2 0 obj << /Length 0 >> stream\n\nendstream endobj\n\
+            trailer << /Root 1 0 R >>\n%%EOF\n";
+        let new = |allow: &CStr, error: &mut *mut c_char| unsafe {
+            malmal_scanner_new_with_allow(1, ptr::null(), 0, ptr::null(), 0, allow.as_ptr(), error)
+        };
+        let mut error = ptr::dangling_mut::<c_char>();
+        let strict = new(c"", &mut error);
+        assert!(error.is_null());
+        assert_eq!(scan(strict, form, c"a.pdf").0, 2);
+
+        let allowing = new(c" pdf.embedded_file | pdf.xfa ", &mut error);
+        assert!(error.is_null());
+        let (verdict, report) = scan(allowing, form, c"a.pdf");
+        assert_eq!(verdict, MALMAL_CLEAN, "{report}");
+        assert!(report.contains(r#""code":"pdf.xfa""#), "{report}");
+
+        for (allow, expected) in [
+            (c"pdf.embeddedfile", "unknown finding code"),
+            (c"limit.time", "never"),
+        ] {
+            assert!(new(allow, &mut error).is_null());
+            let message = unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned();
+            assert!(message.contains(expected), "{message}");
+            unsafe { malmal_string_free(error) };
+        }
+        let bad_list = c"not a digest";
+        let scanner = unsafe {
+            malmal_scanner_new_with_allow(
+                0,
+                bad_list.as_ptr(),
+                bad_list.count_bytes(),
+                ptr::null(),
+                0,
+                ptr::null(),
+                &mut error,
+            )
+        };
+        assert!(scanner.is_null() && !error.is_null());
+        // Nowhere to put the message is not an error of its own.
+        let scanner = unsafe {
+            malmal_scanner_new_with_allow(
+                0,
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                c"x".as_ptr(),
+                ptr::null_mut(),
+            )
+        };
+        assert!(scanner.is_null());
+        unsafe {
+            malmal_string_free(error);
+            malmal_scanner_free(strict);
+            malmal_scanner_free(allowing);
         }
     }
 

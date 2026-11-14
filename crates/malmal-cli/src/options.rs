@@ -3,7 +3,7 @@
 use std::fs;
 use std::time::Duration;
 
-use malmal::{FileType, HashList, Limits, Policy, Scanner, Severity};
+use malmal::{FileType, HashList, Limits, Policy, Scanner};
 
 use crate::sandbox::Mode;
 use crate::watchdog::Watchdog;
@@ -97,7 +97,7 @@ pub struct Common {
     /// Replaces the policy's accepted types when given.
     pub types: Option<Vec<FileType>>,
     /// Codes given with `--allow`, reported at Info whatever the policy.
-    pub allow: Vec<&'static str>,
+    pub allow: Vec<String>,
     pub hashlist: HashList,
     pub no_hash: bool,
     pub pdf_passwords: Vec<String>,
@@ -158,7 +158,11 @@ impl Common {
             "--allow" => {
                 let list = rest.next().ok_or("--allow needs a value")?;
                 for code in list.split([',', '|']).map(str::trim) {
-                    self.allow.push(allowable(code)?);
+                    // Checked here, so that a later --policy cannot hide a misspelling.
+                    Policy::default()
+                        .allow(code)
+                        .map_err(|e| format!("--allow: {e}"))?;
+                    self.allow.push(code.to_string());
                 }
             }
             "--hashlist" => {
@@ -241,9 +245,11 @@ impl Common {
                 .with_allowed_types(types.iter().copied()),
             None => self.policy.clone(),
         };
-        let policy = self.allow.iter().fold(policy, |policy, &code| {
-            policy.with_override(code, Severity::Info)
-        });
+        let policy = self
+            .allow
+            .iter()
+            .try_fold(policy, |policy, code| policy.allow(code))
+            .map_err(|e| format!("--allow: {e}"))?;
         let builder = Scanner::builder()
             .limits(self.limits.clone())
             .policy(policy)
@@ -262,22 +268,6 @@ impl Common {
             builder.yara(malmal::YaraRules::compile(sources).map_err(|e| e.to_string())?)
         };
         Ok(builder.build())
-    }
-}
-
-/// The code `--allow` was given, if the scanner reports it. A limit cannot
-/// be allowed: a file that was not analyzed to the end is never clean.
-fn allowable(code: &str) -> Result<&'static str, String> {
-    let known = malmal::report::CODES.iter().find(|&&known| known == code);
-    match known {
-        Some(code) if code.starts_with("limit.") => Err(format!(
-            "--allow {code}: a file that was not analyzed to the end is never clean; \
-             raise the limit instead"
-        )),
-        Some(&code) => Ok(code),
-        None => Err(format!(
-            "--allow: unknown finding code {code:?}; the codes are listed in docs/findings.md"
-        )),
     }
 }
 
@@ -350,7 +340,7 @@ mod tests {
         let error = parse(&["--allow", "pdf.xfa,limit.complexity"])
             .err()
             .unwrap();
-        assert!(error.contains("never clean"), "{error}");
+        assert!(error.contains("never"), "{error}");
     }
 
     #[test]
@@ -366,6 +356,6 @@ mod tests {
             .iter()
             .find(|f| f.code == "pdf.xfa")
             .expect("no pdf.xfa");
-        assert_eq!(xfa.severity, Severity::Info);
+        assert_eq!(xfa.severity, malmal::Severity::Info);
     }
 }

@@ -56,6 +56,30 @@ class ScannerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             malmal.Scanner(hashlist="not a digest")
 
+    def test_allow(self):
+        form = (
+            b"%PDF-1.7\n1 0 obj << /Type /Catalog /AcroForm << /XFA 2 0 R >> >> endobj\n"
+            b"2 0 obj << /Length 0 >> stream\n\nendstream endobj\n"
+            b"trailer << /Root 1 0 R >>\n%%EOF\n"
+        )
+
+        def xfa(report):
+            return next(f["severity"] for f in report.findings if f["code"] == "pdf.xfa")
+
+        with malmal.Scanner(strict=True) as scanner:
+            report = scanner.scan(form)
+            self.assertEqual((report.verdict, xfa(report)), ("malicious", "medium"))
+        for allow in (["pdf.embedded_file", "pdf.xfa"], "pdf.embedded_file|pdf.xfa"):
+            with malmal.Scanner(strict=True, allow=allow) as scanner:
+                report = scanner.scan(form)
+                self.assertEqual((report.verdict, xfa(report)), ("clean", "info"))
+        with self.assertRaisesRegex(ValueError, "unknown finding code"):
+            malmal.Scanner(allow=["pdf.embeddedfile"])
+        with self.assertRaisesRegex(ValueError, "limit.time"):
+            malmal.Scanner(allow="limit.time")
+        with self.assertRaises(TypeError):
+            malmal.Scanner(allow=[b"pdf.xfa"])
+
     def test_pdf_passwords(self):
         corpus = os.path.join(os.path.dirname(__file__), "../../../tests/corpus/malicious")
         with open(os.path.join(corpus, "password-javascript.pdf"), "rb") as file:
