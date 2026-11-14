@@ -344,9 +344,9 @@ limit, and some hundreds of requests at once. Other proxies have not been tried.
 
 Every connection has a thread of its own, up to `--connections` (256); beyond that they
 wait to be accepted. `--workers` (4) is the number of requests worked on at once, across
-all endpoints, and is what bounds memory and processors: each can hold a file of
-`--max-size`. A connection kept open between requests holds no worker, so clients that
-keep theirs, as proxies and HTTP clients do, do not keep others waiting.
+all endpoints, and is what bounds memory and processors: see
+[Memory](#memory). A connection kept open between requests holds no worker, so clients
+that keep theirs, as proxies and HTTP clients do, do not keep others waiting.
 
 ### Limits and timeouts
 
@@ -355,10 +355,66 @@ every request; `--timeout` is how long an idle connection is kept. The time limi
 between steps of the analysis, so it bounds a scan without cutting it off at an exact moment.
 A file over the size limit is refused outright by the daemon rather than scanned in part.
 
-`malmal scan` maps the file it is given, so its memory does not grow with the file; the
-daemon receives the file over a socket and holds it whole. For files of hundreds of
-megabytes, run the command on the stored file, or keep `--workers` low enough that
-`--workers` times `--max-size` fits in memory.
+### Memory
+
+`malmal scan` maps the file it is given, so its memory does not grow with the file. The
+daemon receives the file over a socket and, as shipped, holds it whole: `--workers` times
+`--max-size` of memory for the files alone.
+
+`--spool-dir <DIR>` changes that. Files of 1 MiB and more are written to a file in `DIR`
+as they arrive and mapped from there; smaller ones stay in memory, where they are
+faster. What to know about it:
+
+- The files have no names. They are opened when the daemon starts, one for each worker,
+  before the sandbox closes, and are emptied after each request and used again. Nothing
+  is left in `DIR` when the daemon ends, however it ends, and the sandbox allows no more
+  than it does without the option: `--require-sandbox` works as before.
+- `DIR` has to be on a disk. `/tmp` is memory on most systems; a file there is no
+  saving. It needs room for `--workers` times `--max-size`.
+- Uploads are then written to that disk for as long as they are scanned. Without the
+  option nothing a client sends is written anywhere.
+- A daemon with less memory than the file it is scanning reads the file back from the
+  disk for each pass over it. 1 GB takes 6 to 7 seconds with memory to spare and 18 to
+  26 in a container limited to 96 MB, on a SATA SSD: raise `--scan-timeout` if you
+  take such files in such a container.
+
+```bash
+malmald --http 127.0.0.1:8080 --spool-dir /var/spool/malmal --max-size 2147483648 --require-sandbox
+```
+
+A file is not all that a request costs. Compressed data inside it is expanded, up to
+`--max-decompressed` (256 MiB) for one file, and `/sanitize` decodes an image to its
+pixels, up to that many bytes and `--max-pixels` (2^28) pixels. With files made to cost
+as much as the defaults allow, one request takes this much, the file included:
+
+| Request | File | Memory |
+|---|---:|---:|
+| `/scan`, a PDF whose object stream expands to 250 MiB | 18 MB | 426 MiB |
+| `/scan`, a PDF of 4.2 million empty objects | 63 MB | 379 MiB |
+| `/scan`, a PDF with an attachment that expands to 250 MiB | 0.3 MB | 255 MiB |
+| `/sanitize`, a PNG of 5700 × 5700 pixels at 16 bits | 0.3 MB | 502 MiB |
+| `/sanitize`, a PNG of 8000 × 8000 pixels | 0.3 MB | 250 MiB |
+
+Four of the worst at once, which is what four workers allow, took the daemon to 1.7 GiB
+scanning and 2.1 GiB rebuilding. Nothing makes a request wait for memory: a container
+with less than `--workers` times some 550 MiB can be ended by its memory limit when
+such files arrive together, and the daemon with defaults in a container of 512 MiB is.
+Ordinary files are nowhere near: 3,000 scans of a 200 KB PDF leave the daemon at 4 MiB.
+
+To run in less, lower what a request may cost and how many are worked on:
+
+```bash
+malmald --http 127.0.0.1:8080 --workers 2 --max-size 16777216 --max-decompressed 33554432 --max-pixels 16000000
+```
+
+With `--max-decompressed` at 32 MiB the four object streams above are refused with
+`limit.decompression` in 228 MiB all told. What a PDF of nothing but objects costs
+follows the size of the file, about six times it, and `--max-size` bounds that. A file
+refused for a limit is never reported clean.
+
+Memory is given back between requests. After the largest ones the daemon rests at some
+130 MiB, which the allocator keeps for the next request, and stays there round after
+round.
 
 A step that never ends never reaches that check, and a thread cannot be stopped from
 outside. `--hard-timeout <S>` is the answer to that: when a scan or a rebuild has run for

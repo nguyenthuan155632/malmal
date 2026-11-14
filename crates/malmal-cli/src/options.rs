@@ -21,6 +21,12 @@ pub const HELP: &str = "  --policy <NAME>      default or strict [default: defau
   --pdf-passwords <FILE>
                        Passwords to try on encrypted PDFs, one per line
   --max-size <BYTES>   Largest file analyzed in full [default: 67108864]
+  --max-decompressed <BYTES>
+                       Most that the compressed data in one file may expand
+                       to, and that the pixels of an image rebuilt may take;
+                       what a request costs in memory follows from it
+                       [default: 268435456]
+  --max-pixels <N>     Most pixels an image may declare [default: 268435456]
   --scan-timeout <S>   Seconds one scan may take [default: 10]
   --hard-timeout <S>   Seconds after which a scan still running ends the
                        process; 0 for never [default: six times --scan-timeout]
@@ -38,6 +44,12 @@ pub const HELP: &str = "  --policy <NAME>      default or strict [default: defau
   --pdf-passwords <FILE>
                        Passwords to try on encrypted PDFs, one per line
   --max-size <BYTES>   Largest file analyzed in full [default: 67108864]
+  --max-decompressed <BYTES>
+                       Most that the compressed data in one file may expand
+                       to, and that the pixels of an image rebuilt may take;
+                       what a request costs in memory follows from it
+                       [default: 268435456]
+  --max-pixels <N>     Most pixels an image may declare [default: 268435456]
   --scan-timeout <S>   Seconds one scan may take [default: 10]
   --hard-timeout <S>   Seconds after which a scan still running ends the
                        process; 0 for never [default: six times --scan-timeout]
@@ -54,11 +66,23 @@ const MEMORY_LIMIT: Option<u64> = if cfg!(feature = "yara") {
     Some(4 << 30)
 };
 
-/// The address space limit for a process that scans files of up to
-/// `max_file_size` bytes: the file is mapped or held whole, and a limit
-/// below its size would refuse the files `--max-size` was raised for.
-pub fn memory_limit(max_file_size: u64) -> Option<u64> {
-    let beyond_default = max_file_size.saturating_sub(malmal::Limits::default().max_file_size);
+/// The address space limit for a process that works on `at_once` files of
+/// up to `limits.max_file_size` bytes at a time. Each file is mapped or held
+/// whole, and what is decoded from it comes to a few times
+/// `limits.max_decompressed`: a limit below what the options allow would
+/// end the process on the files they were raised for, or on as many honest
+/// requests as it was told to take at once. The limit is there to stop a
+/// decoder that has lost its way, not to do the work of the other limits.
+pub fn memory_limit(limits: &Limits, at_once: u64) -> Option<u64> {
+    let defaults = Limits::default();
+    let files = limits.max_file_size.saturating_mul(at_once);
+    let decoded = limits
+        .max_decompressed
+        .saturating_mul(3)
+        .saturating_mul(at_once);
+    let beyond_default = files
+        .saturating_sub(defaults.max_file_size)
+        .saturating_add(decoded.saturating_sub(defaults.max_decompressed * 12));
     MEMORY_LIMIT.map(|limit| limit.saturating_add(beyond_default))
 }
 
@@ -145,6 +169,20 @@ impl Common {
                     .and_then(|value| value.parse().ok())
                     .filter(|&bytes: &u64| bytes > 0)
                     .ok_or("--max-size needs a positive number of bytes")?;
+            }
+            "--max-decompressed" => {
+                self.limits.max_decompressed = rest
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|&bytes: &u64| bytes > 0)
+                    .ok_or("--max-decompressed needs a positive number of bytes")?;
+            }
+            "--max-pixels" => {
+                self.limits.max_pixels = rest
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|&pixels: &u64| pixels > 0)
+                    .ok_or("--max-pixels needs a positive number of pixels")?;
             }
             "--scan-timeout" => {
                 let seconds = rest

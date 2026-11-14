@@ -373,12 +373,35 @@ Taken from a comparison with quelda (github.com/tranhuucanh/quelda), a PDF scann
       container.
 - [x] PDF checks that read strings, numbers and positions: `pdf/deep.rs`.
 - [x] `examples/evaluate.rs`, for sets of files with known labels.
-- [ ] Measure on CIC-Evasive-PDFMal2022 and PDF Insecurity, and tune severities on what
-      the clean halves show.
-- [ ] Not done: reading the file in blocks (every analyzer takes a slice), which is what
-      would bound the daemon's memory too; parsing objects on demand instead of keeping
-      the tree; recursion through patterns, soft masks and glyphs; page tree and
-      bookmark loops; embedded fonts and colour profiles; presets and locked rules.
+- [x] Measured on CIC-Evasive-PDFMal2022: 9,107 clean and 21,899 malicious files.
+      Before: 98.20 % of the malicious refused, 82.62 % of the clean accepted. After:
+      98.19 % and 87.32 % (the same under the strict policy, which only turns
+      suspicious into malicious). The 428 clean files gained were refused for rule
+      errors: `/EF` as the array of a signature's rights (365), empty name trees of
+      scripts and attachments (60), links to local files left by a conversion (3). XFA
+      packets were also reported as attachments, which changed no verdict. Two
+      malicious files lost with them had an empty script tree and nothing else but a
+      link. Of the new codes, `pdf.conflicting_objects` (89 malicious, 0 clean),
+      `pdf.polyglot` (86, 0) and `pdf.external_ref` (120, 2) earn their severity;
+      `pdf.dangerous_uri` did not for local files and was narrowed.
+      The 1,155 clean files still refused, each counted once: scripts (660), XFA
+      forms without a script (260), attachments (207, mostly the Word source of the
+      document or the job options of the program that made it), launch actions (12),
+      3D and media (9), data after `%%EOF` (4), a password that is not known (1),
+      OPI (1), a page of 44 million points (1). The 396 malicious files accepted: 379
+      are a picture and a link to a web page, which no structure tells from an
+      invoice, and 17 have no active content at all.
+- [x] The daemon's memory no longer grows with the file: `--spool-dir`, unnamed files
+      opened before the sandbox closes.
+- [x] Objects are parsed on demand and not kept as a tree; content streams are read in
+      blocks through the whole filter chain.
+- [x] What a request can cost in memory, measured with hostile files, and the options
+      that bound it (`--max-decompressed`, `--max-pixels`).
+- [ ] Not done: PDF Insecurity (not downloaded); a ceiling on the daemon's memory that
+      holds whatever arrives (requests are not made to wait for memory);
+      reading object streams, attachments, XFA and metadata in blocks; recursion through
+      patterns, soft masks and glyphs; page tree and bookmark loops; embedded fonts and
+      colour profiles; presets and locked rules.
 
 ## Order and dependencies
 

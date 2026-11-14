@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use malmal::{Report, ScanHints, Scanner, Severity, Verdict};
 use serde::Deserialize;
 
+use crate::input::{Body, Incoming, Spool};
 use crate::watchdog::Watchdog;
 
 pub(crate) const MAX_HEADER_LEN: u64 = 16 << 10;
@@ -148,6 +149,8 @@ pub struct Service {
     watchdog: Watchdog,
     /// Places for requests being worked on; without them, any number.
     turns: Option<Arc<Slots>>,
+    /// Where large request bodies are kept; without it, in memory.
+    spool: Option<Arc<Spool>>,
 }
 
 impl Service {
@@ -157,7 +160,20 @@ impl Service {
             metrics: Metrics::default(),
             watchdog: Watchdog::default(),
             turns: None,
+            spool: None,
         }
+    }
+
+    /// Keep large request bodies in the files of `spool` and not in memory,
+    /// so that what a request costs in memory does not grow with its file.
+    pub fn spooling_to(mut self, spool: Arc<Spool>) -> Self {
+        self.spool = Some(spool);
+        self
+    }
+
+    /// A request body to read into.
+    pub(crate) fn incoming(&self) -> Incoming<'_> {
+        Incoming::new(self.spool.as_ref())
     }
 
     /// Work on at most `requests` at once, however many connections there
@@ -267,10 +283,10 @@ pub(crate) fn read_line(reader: &mut impl BufRead, limit: u64) -> io::Result<Lin
     Ok(Line::Text(String::from_utf8_lossy(&line).into_owned()))
 }
 
-fn read_body(reader: &mut impl BufRead, size: u64) -> io::Result<Vec<u8>> {
-    let mut body = vec![0; size as usize];
-    reader.read_exact(&mut body)?;
-    Ok(body)
+fn read_body(reader: &mut impl BufRead, size: u64, service: &Service) -> io::Result<Body> {
+    let mut body = service.incoming();
+    body.read_from(reader, size)?;
+    body.finish()
 }
 
 #[derive(Deserialize)]
@@ -323,7 +339,7 @@ pub fn json(
             service.metrics.reject();
             return reply(error("file exceeds the size limit"));
         }
-        let body = read_body(reader, request.size)?;
+        let body = read_body(reader, request.size, service)?;
 
         let hints = ScanHints {
             filename: request.filename.as_deref(),
@@ -500,7 +516,7 @@ pub fn http(
                     writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
                     writer.flush()?;
                 }
-                let body = read_body(reader, size)?;
+                let body = read_body(reader, size, service)?;
 
                 let from_query = query
                     .split('&')
@@ -658,7 +674,7 @@ pub fn clamd(
             }
             "END" => return Ok(()),
             "INSTREAM" => {
-                let mut body = Vec::new();
+                let mut body = service.incoming();
                 loop {
                     let mut length = [0; 4];
                     reader.read_exact(&mut length)?;
@@ -667,13 +683,14 @@ pub fn clamd(
                         break;
                     }
                     // The rest of the stream cannot be skipped safely.
-                    if body.len() as u64 + length > service.max_size() {
+                    if body.len() + length > service.max_size() {
                         service.metrics.reject();
                         writer.write_all(b"INSTREAM size limit exceeded. ERROR")?;
                         return writer.write_all(&[delimiter]);
                     }
-                    reader.by_ref().take(length).read_to_end(&mut body)?;
+                    body.read_from(reader, length)?;
                 }
+                let body = body.finish()?;
                 match service.scan(&body, ScanHints::default()) {
                     Some(report) if report.verdict == Verdict::Clean => "stream: OK".to_string(),
                     Some(report) => format!("stream: {} FOUND", signature(&report)),

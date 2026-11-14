@@ -909,14 +909,17 @@ fn still(
 /// Write a still image in the format `output` names.
 fn write(image: DynamicImage, deadline: Deadline, output: Output) -> Result<Rebuilt, Error> {
     deadline.check()?;
+    let (width, height) = (image.width(), image.height());
     let mut data = Vec::new();
+    // The pixels are held once: an image that has to be converted gives
+    // way to what it is converted to, and one that has not is not copied.
     let file_type = match output {
         Output::Jpeg(quality) => {
             // The format stores 8-bit grey or colour and nothing else.
-            let image = match image {
-                DynamicImage::ImageLuma8(_) | DynamicImage::ImageRgb8(_) => image.clone(),
-                _ if image.color().has_color() => image.to_rgb8().into(),
-                _ => image.to_luma8().into(),
+            let image: DynamicImage = match image {
+                DynamicImage::ImageLuma8(_) | DynamicImage::ImageRgb8(_) => image,
+                _ if image.color().has_color() => image.into_rgb8().into(),
+                _ => image.into_luma8().into(),
             };
             JpegEncoder::new_with_quality(&mut data, quality)
                 .encode_image(&image)
@@ -925,10 +928,10 @@ fn write(image: DynamicImage, deadline: Deadline, output: Output) -> Result<Rebu
         }
         Output::Png => {
             // Floating-point samples have no place in a PNG.
-            let image = match image {
-                DynamicImage::ImageRgb32F(_) => image.to_rgb16().into(),
-                DynamicImage::ImageRgba32F(_) => image.to_rgba16().into(),
-                _ => image.clone(),
+            let image: DynamicImage = match image {
+                DynamicImage::ImageRgb32F(_) => image.into_rgb16().into(),
+                DynamicImage::ImageRgba32F(_) => image.into_rgba16().into(),
+                _ => image,
             };
             // The encoder's own default trades size for speed.
             let encoder = PngEncoder::new_with_quality(
@@ -941,9 +944,9 @@ fn write(image: DynamicImage, deadline: Deadline, output: Output) -> Result<Rebu
         }
         Output::Webp => {
             let image: DynamicImage = if image.color().has_alpha() {
-                image.to_rgba8().into()
+                image.into_rgba8().into()
             } else {
-                image.to_rgb8().into()
+                image.into_rgb8().into()
             };
             image
                 .write_with_encoder(WebPEncoder::new_lossless(&mut data))
@@ -954,8 +957,8 @@ fn write(image: DynamicImage, deadline: Deadline, output: Output) -> Result<Rebu
     Ok(Rebuilt {
         data,
         file_type,
-        width: image.width(),
-        height: image.height(),
+        width,
+        height,
         frames: 1,
     })
 }

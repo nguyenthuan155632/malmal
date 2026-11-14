@@ -127,26 +127,49 @@ impl Value {
     /// Non-negative integer value.
     pub fn as_usize(&self) -> Option<usize> {
         match *self {
-            Self::Number(n) if n >= 0.0 && n.fract() == 0.0 && n < 1e15 => Some(n as usize),
+            // Whole, which below this it is if the integer it is cut to is
+            // the same number.
+            Self::Number(n) if (0.0..1e15).contains(&n) && (n as u64) as f64 == n => {
+                Some(n as usize)
+            }
             _ => None,
         }
     }
 }
 
-pub(crate) fn is_whitespace(byte: u8) -> bool {
+pub(crate) const fn is_whitespace(byte: u8) -> bool {
     matches!(byte, 0 | b'\t' | b'\n' | 0x0C | b'\r' | b' ')
 }
 
-fn is_delimiter(byte: u8) -> bool {
+const fn is_delimiter(byte: u8) -> bool {
     matches!(
         byte,
         b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
     )
 }
 
+/// Whether each byte is neither whitespace nor a delimiter. Names and
+/// operators are runs of these, and finding their ends is done a byte at a
+/// time.
+const REGULAR: [bool; 256] = {
+    let mut regular = [false; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        regular[byte] = !is_whitespace(byte as u8) && !is_delimiter(byte as u8);
+        byte += 1;
+    }
+    regular
+};
+
 pub(crate) fn is_regular(byte: u8) -> bool {
-    !is_whitespace(byte) && !is_delimiter(byte)
+    REGULAR[byte as usize]
 }
+
+/// Items of one array or dictionary that are gathered where those of the
+/// others are. One that grows past this gets a buffer of its own, which
+/// becomes the array without a copy: an array of millions of items is then
+/// in memory once and not twice.
+const SHARED: usize = 64;
 
 pub(crate) struct Parser<'a> {
     pub data: &'a [u8],
@@ -154,6 +177,13 @@ pub(crate) struct Parser<'a> {
     /// Values this parser may still allocate; parsing fails at zero so a
     /// file of millions of tiny tokens cannot exhaust memory.
     pub nodes_left: usize,
+    /// The value is read and not built: see [`Parser::skip_value`].
+    skipping: bool,
+    /// The items of the arrays and dictionaries being read, innermost last,
+    /// so that each is allocated once and at its size. Only while they are
+    /// small: see [`SHARED`].
+    items: Vec<Value>,
+    entries: Vec<(Name, Value)>,
 }
 
 impl<'a> Parser<'a> {
@@ -162,6 +192,9 @@ impl<'a> Parser<'a> {
             data,
             pos,
             nodes_left,
+            skipping: false,
+            items: Vec::new(),
+            entries: Vec::new(),
         }
     }
 
@@ -200,7 +233,21 @@ impl<'a> Parser<'a> {
     }
 
     pub fn parse_value(&mut self) -> Option<Value> {
-        self.value(0)
+        let value = self.value(0);
+        // A value that failed part of the way left its items behind.
+        self.items.clear();
+        self.entries.clear();
+        value
+    }
+
+    /// Read a value as [`Parser::parse_value`] does, to the same end and
+    /// with the same count of values, without keeping any of it. Returns
+    /// whether it is one.
+    pub fn skip_value(&mut self) -> bool {
+        self.skipping = true;
+        let value = self.value(0);
+        self.skipping = false;
+        value.is_some()
     }
 
     fn value(&mut self, depth: usize) -> Option<Value> {
@@ -215,14 +262,28 @@ impl<'a> Parser<'a> {
             b'(' => self.literal_string(),
             b'[' => {
                 self.pos += 1;
-                let mut items = Vec::new();
+                let first = self.items.len();
+                let mut own: Option<Vec<Value>> = None;
                 loop {
                     self.skip_whitespace();
                     if self.peek()? == b']' {
                         self.pos += 1;
-                        return Some(Value::Array(items.into()));
+                        return Some(Value::Array(match own {
+                            Some(items) => items.into(),
+                            None => self.items.drain(first..).collect(),
+                        }));
                     }
-                    items.push(self.value(depth + 1)?);
+                    let item = self.value(depth + 1)?;
+                    match &mut own {
+                        _ if self.skipping => {}
+                        Some(items) => items.push(item),
+                        None => {
+                            self.items.push(item);
+                            if self.items.len() - first > SHARED {
+                                own = Some(self.items.split_off(first));
+                            }
+                        }
+                    }
                 }
             }
             b'/' => self.name().map(Value::Name),
@@ -236,19 +297,32 @@ impl<'a> Parser<'a> {
 
     fn dict(&mut self, depth: usize) -> Option<Value> {
         self.pos += 2;
-        let mut entries = Vec::new();
+        let first = self.entries.len();
+        let mut own: Option<Vec<(Name, Value)>> = None;
         loop {
             self.skip_whitespace();
             if self.rest().starts_with(b">>") {
                 self.pos += 2;
-                return Some(Value::Dict(Dict(entries.into())));
+                return Some(Value::Dict(Dict(match own {
+                    Some(entries) => entries.into(),
+                    None => self.entries.drain(first..).collect(),
+                })));
             }
             if self.peek()? != b'/' {
                 return None;
             }
             let key = self.name()?;
             let value = self.value(depth + 1)?;
-            entries.push((key, value));
+            match &mut own {
+                _ if self.skipping => {}
+                Some(entries) => entries.push((key, value)),
+                None => {
+                    self.entries.push((key, value));
+                    if self.entries.len() - first > SHARED {
+                        own = Some(self.entries.split_off(first));
+                    }
+                }
+            }
         }
     }
 
@@ -256,10 +330,14 @@ impl<'a> Parser<'a> {
     pub fn name(&mut self) -> Option<Name> {
         self.pos += 1;
         let start = self.pos;
-        let length = self.rest().iter().take_while(|&&b| is_regular(b)).count();
-        let raw = &self.data[start..start + length];
-        self.pos += length;
-        if !raw.contains(&b'#') {
+        let mut escaped = false;
+        while let Some(byte) = self.peek().filter(|&byte| is_regular(byte)) {
+            escaped |= byte == b'#';
+            self.pos += 1;
+        }
+        let raw = &self.data[start..self.pos];
+        let length = raw.len();
+        if !escaped {
             return Some(Name::new(raw, false));
         }
         let mut text = Vec::with_capacity(length);
@@ -288,7 +366,7 @@ impl<'a> Parser<'a> {
         let length = memchr::memchr(b'>', self.rest())?;
         let digits = &self.rest()[1..length];
         self.pos += length + 1;
-        if digits.len() > MAX_STRING * 2 {
+        if digits.len() > MAX_STRING * 2 || self.skipping {
             return Some(Value::String(None));
         }
         let mut nibbles = digits
@@ -326,7 +404,7 @@ impl<'a> Parser<'a> {
             }
         }
         let raw = &self.data[start..self.pos - 1];
-        if raw.len() > MAX_STRING {
+        if raw.len() > MAX_STRING || self.skipping {
             return Some(Value::String(None));
         }
         let bytes = if escapes { unescape(raw) } else { raw.to_vec() };
@@ -335,11 +413,23 @@ impl<'a> Parser<'a> {
 
     fn number(&mut self) -> Option<f64> {
         let start = self.pos;
-        while self
-            .peek()
-            .is_some_and(|b| matches!(b, b'+' | b'-' | b'.' | b'0'..=b'9'))
-        {
+        let mut integer = 0u64;
+        let mut digits_only = true;
+        while let Some(byte) = self.peek() {
+            match byte {
+                b'0'..=b'9' => {
+                    integer = integer
+                        .wrapping_mul(10)
+                        .wrapping_add(u64::from(byte - b'0'))
+                }
+                b'+' | b'-' | b'.' => digits_only = false,
+                _ => break,
+            }
             self.pos += 1;
+        }
+        // Most numbers are integers short enough to be exact.
+        if digits_only && (1..=15).contains(&(self.pos - start)) {
+            return Some(integer as f64);
         }
         std::str::from_utf8(&self.data[start..self.pos])
             .ok()?
@@ -431,6 +521,18 @@ mod tests {
     #[test]
     fn scalars() {
         assert_eq!(parse("null"), Some(Value::Null));
+        assert_eq!(parse("0012"), Some(Value::Number(12.0)));
+        assert_eq!(
+            parse("123456789012345"),
+            Some(Value::Number(123456789012345.0))
+        );
+        assert_eq!(
+            parse("12345678901234567890"),
+            Some(Value::Number(1.2345678901234567e19))
+        );
+        assert_eq!(parse("+.5"), Some(Value::Number(0.5)));
+        assert_eq!(parse("1.2.3"), None);
+        assert_eq!(parse("1-2"), None);
         assert_eq!(parse(" true "), Some(Value::Bool(true)));
         assert_eq!(parse("-12.5"), Some(Value::Number(-12.5)));
         assert_eq!(parse("% comment\n42"), Some(Value::Number(42.0)));
@@ -486,6 +588,59 @@ mod tests {
         assert!(dict.get(b"B").and_then(Value::as_dict).is_some());
         assert_eq!(parse("<< /A 1 "), None);
         assert_eq!(parse("<< 1 2 >>"), None);
+    }
+
+    #[test]
+    fn skipping_ends_where_parsing_does() {
+        for text in [
+            "<</A 1/B<</C[/D(x)]>>/A 2>> tail",
+            "[1 2 3 0 R (a \\) b) <41> /N#41me null true] tail",
+            "<< /A [1 2 >>",
+            "[ (unterminated ]",
+            "1.2.3",
+            "<< /A 1 /B >>",
+        ] {
+            let mut parsing = Parser::new(text.as_bytes(), 0, 1000);
+            let mut skipping = Parser::new(text.as_bytes(), 0, 1000);
+            assert_eq!(parsing.parse_value().is_some(), skipping.skip_value());
+            assert_eq!(parsing.pos, skipping.pos, "{text}");
+            assert_eq!(parsing.nodes_left, skipping.nodes_left, "{text}");
+        }
+        // What a failure leaves behind is not part of the next value.
+        let mut parser = Parser::new(b"[1 [2 (x] [3]", 0, 1000);
+        assert_eq!(parser.parse_value(), None);
+        parser.pos = 10;
+        assert_eq!(
+            parser.parse_value(),
+            Some(Value::Array(vec![Value::Number(3.0)].into()))
+        );
+    }
+
+    #[test]
+    fn large_arrays_and_dictionaries_read_as_small_ones() {
+        for count in [SHARED - 1, SHARED, SHARED + 1, SHARED + 2, 5 * SHARED] {
+            let array = format!("[7 [{}] 8]", "1 ".repeat(count));
+            let Some(Value::Array(outer)) = parse(&array) else {
+                panic!("not an array");
+            };
+            assert_eq!(outer.len(), 3);
+            assert_eq!(outer[1].as_array().map(<[Value]>::len), Some(count));
+            assert_eq!(outer[2], Value::Number(8.0));
+
+            let entries: String = (0..count).map(|n| format!("/K{n} {n} ")).collect();
+            let dict = format!("<< /A 1 /B << {entries} >> /C 3 >>");
+            let Some(Value::Dict(outer)) = parse(&dict) else {
+                panic!("not a dictionary");
+            };
+            assert_eq!(outer.0.len(), 3);
+            let inner = outer.get(b"B").and_then(Value::as_dict).unwrap();
+            assert_eq!(inner.0.len(), count);
+            let last = format!("K{}", count - 1);
+            assert_eq!(
+                inner.get(last.as_bytes()),
+                Some(&Value::Number(count as f64 - 1.0))
+            );
+        }
     }
 
     #[test]

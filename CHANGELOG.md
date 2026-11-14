@@ -61,7 +61,26 @@
   grows with the size of the file (one for every 8 bytes, 2 million at least), so that
   a large document of many objects is less likely to stop at `limit.complexity`.
 - The `evaluate` example measures refusal and false-refusal rates on files whose nature
-  is known, with the findings that decided each.
+  is known, with the findings that decided each. On CIC-Evasive-PDFMal2022 (9,107 clean
+  and 21,899 malicious files) 98.19 % of the malicious files are refused and 87.32 % of
+  the clean ones accepted; every clean file refused carries what it is refused for
+  (scripts, XFA forms, attachments, launch actions). See the README.
+- A PDF is no longer kept in memory as a tree of its values. An object is parsed where
+  it stands each time a check looks at it; only the values that references lead to are
+  kept. 100,000 small objects: 87 MB before, 22 MB now, and no slower. A file of 500,000
+  objects, which stopped at `limit.complexity`, is analyzed to its end in 94 MB.
+- Content streams are read a block at a time as they are inflated, through every filter
+  of the chain. A page stream of 200 MB once inflated: 256 MB before, 12 MB now.
+  Object streams, attachments, XFA packets and metadata are still decoded whole, within
+  `Limits::max_decompressed`.
+- `malmald --spool-dir <DIR>`: files of 1 MiB and more are written to unnamed files in
+  `DIR` while they are scanned and mapped from there, so that the memory of the daemon
+  does not grow with the files it is sent. The files are opened before the sandbox
+  closes, one for each worker, and used again: the sandbox allows nothing more than it
+  did. A 1 GB file is scanned over each of the four endpoints by a daemon limited to
+  96 MB. Without the option every file is held in memory, as before.
+- `--max-decompressed` and `--max-pixels` for both commands, which with `--max-size` and
+  `--workers` decide what a request can cost in memory.
 - `malmal_sanitize` in the C interface and `Scanner.sanitize` in the Python binding;
   `malmal_scanner_new_with_passwords` and `Scanner(pdf_passwords=...)` for encrypted PDFs.
 - `malmald --connections`. Every connection has its own thread, and `--workers` now counts
@@ -90,7 +109,27 @@
   the `cdr` feature; `svg-hush` with `cdr-svg`; `hayro` with `cdr-pdf`; `memmap2` in
   `malmal-cli`.
 
+### Fixed
+
+- `pdf.javascript` and `pdf.embedded_file` were reported for name trees that list
+  nothing, `pdf.embedded_file` for the packets of an XFA form and for the rights of a
+  signature (`/EF` as an array). 428 of the 9,107 clean files of CIC-Evasive-PDFMal2022
+  were refused for one of these.
+- `sanitize` held the pixels of an image twice while writing it: a PNG at the limits
+  took 494 MB and takes 250 MB.
+- A PDF of thousands of streams that all run to one `endstream` was read once for each
+  of them: 8 s for a file of 800 KB. The work is now cut off with `limit.complexity`,
+  and the time limit is checked between streams.
+
 ### Behaviour to check when upgrading
+
+- A link to a file on the reader's own machine that is not a program (`file:///C|/…`)
+  is no longer `pdf.dangerous_uri`; a network share or a program still is.
+- `limit.complexity` counts objects and the values that references lead to, one for
+  every 16 bytes of the file and two million at least, and no longer every value in the
+  file. Documents of many objects that were refused are now analyzed.
+- The address-space limit of the sandboxed daemon grows with `--workers`, `--max-size`
+  and `--max-decompressed` beyond their defaults.
 
 - `malmal` and `malmald` exit with status 3 when a scan runs for six times the scan
   timeout. Run the daemon under a supervisor that restarts it, or pass `--hard-timeout 0`.

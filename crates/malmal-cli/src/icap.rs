@@ -20,6 +20,7 @@ use std::io::{self, BufRead, Read, Write};
 
 use malmal::{ScanHints, Verdict};
 
+use crate::input::Incoming;
 use crate::serve::{Line, MAX_HEADER_LEN, Service, percent_decode, read_line, signature};
 
 /// Longest encapsulated HTTP header section.
@@ -134,7 +135,11 @@ enum Chunks {
 /// Append chunks to `body` up to the terminating one. Past `limit` bytes
 /// the chunks are read and dropped: a client still sending would not see a
 /// reply, only a connection closed on it.
-fn read_chunks(reader: &mut impl BufRead, body: &mut Vec<u8>, limit: u64) -> io::Result<Chunks> {
+fn read_chunks(
+    reader: &mut impl BufRead,
+    body: &mut Incoming<'_>,
+    limit: u64,
+) -> io::Result<Chunks> {
     // How much of a body that is too large is waited for.
     let patience = limit.saturating_mul(16);
     let mut dropped = 0u64;
@@ -163,7 +168,7 @@ fn read_chunks(reader: &mut impl BufRead, body: &mut Vec<u8>, limit: u64) -> io:
             }
             return Ok(Chunks::Malformed);
         }
-        if dropped > 0 || body.len() as u64 + size > limit {
+        if dropped > 0 || body.len().saturating_add(size) > limit {
             dropped = dropped.saturating_add(size);
             if dropped > patience {
                 return Ok(Chunks::TooLarge { read_to_end: false });
@@ -171,8 +176,8 @@ fn read_chunks(reader: &mut impl BufRead, body: &mut Vec<u8>, limit: u64) -> io:
             if io::copy(&mut reader.by_ref().take(size), &mut io::sink())? != size {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
-        } else if reader.by_ref().take(size).read_to_end(body)? as u64 != size {
-            return Err(io::ErrorKind::UnexpectedEof.into());
+        } else {
+            body.read_from(reader, size)?;
         }
         if !matches!(read_line(reader, MAX_CHUNK_LINE)?, Line::Text(line) if line.is_empty()) {
             return Ok(Chunks::Malformed);
@@ -434,7 +439,7 @@ pub fn icap(
         let mut head = vec![0; encapsulated.head_len()];
         reader.read_exact(&mut head)?;
 
-        let mut body = Vec::new();
+        let mut body = service.incoming();
         let preview = header("preview").is_some();
         if encapsulated.has_body() {
             let mut outcome = read_chunks(reader, &mut body, service.max_size())?;
@@ -460,6 +465,7 @@ pub fn icap(
             }
         }
 
+        let body = body.finish()?;
         let kind = if request { "req" } else { "res" };
         let section = encapsulated.section(&head, &format!("{kind}-hdr"));
         match judge(service, request, &String::from_utf8_lossy(section), &body) {
@@ -473,7 +479,7 @@ pub fn icap(
                 headers: String::new(),
                 kind,
                 head: section,
-                body: encapsulated.has_body().then_some(&body),
+                body: encapsulated.has_body().then_some(&body[..]),
             }
             .write(&mut writer)?,
         }

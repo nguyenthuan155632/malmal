@@ -273,7 +273,7 @@ fn sanitize(args: &Args, scanner: &malmal::Scanner) -> ExitCode {
     if let Err(message) = sandbox::enter(
         args.common.sandbox,
         &readable,
-        options::memory_limit(scanner.limits().max_file_size),
+        options::memory_limit(scanner.limits(), 1),
     ) {
         return fail(message);
     }
@@ -374,7 +374,7 @@ fn main() -> ExitCode {
     if let Err(message) = sandbox::enter(
         args.common.sandbox,
         &readable,
-        options::memory_limit(scanner.limits().max_file_size),
+        options::memory_limit(scanner.limits(), 1),
     ) {
         eprintln!("malmal: {message}");
         return ExitCode::from(EXIT_ERROR);

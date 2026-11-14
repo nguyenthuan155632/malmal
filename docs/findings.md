@@ -37,7 +37,7 @@ A scan that stopped at a limit has not cleared the file, so none of these is eve
 | `limit.decompression` | Medium | Compressed data inside the file expands past `Limits::max_decompressed`: a decompression bomb, or a limit set too low. |
 | `limit.depth` | Medium | Files are embedded in files deeper than `Limits::max_depth`. |
 | `limit.time` | Medium | The scan took longer than `Limits::max_duration`. |
-| `limit.complexity` | Medium | The structure costs far more to walk than the file's size justifies. |
+| `limit.complexity` | Medium | The structure costs far more to walk than the file's size justifies: more objects than one for every 16 bytes of a PDF (two million in any file), references that lead to more values than that, or streams that overlap so that reading them all is many times the file. |
 
 ## Raster images
 
@@ -74,13 +74,13 @@ Also applies to Illustrator files saved since version 9, which are PDFs.
 
 | Code | Severity | Meaning |
 |---|---|---|
-| `pdf.javascript` | High | JavaScript in an action, a name tree or the scripts of an XFA form. |
+| `pdf.javascript` | High | JavaScript in an action, a name tree or the scripts of an XFA form. A name tree of scripts that lists none, which Acrobat writes into many documents, is not reported; one that cannot be read is. |
 | `pdf.launch` | High | An action that starts a program or opens a file. |
 | `pdf.postscript` | High | PostScript handed to an interpreter: a PostScript XObject, a form XObject with a PostScript alternative, the `PS` operator in page content or in the default appearance string (`/DA`) of a form, or a calculator function (`/FunctionType 4`) that holds anything but the operators the format allows. |
 | `pdf.open_action` | Medium / High | An action runs when the document opens. High when it leads to JavaScript or a launch; a plain jump to a page is not reported. |
 | `pdf.additional_action` | Medium / High | An action runs on a page or document event. Same rule as `pdf.open_action`. |
 | `pdf.obfuscated_name` | High | A keyword such as `/JavaScript` written with `#xx` escapes, which no PDF writer does. |
-| `pdf.embedded_file` | Medium | The document carries attachments. Each one is scanned too, and what is found in it is reported with the prefix `embedded file:`. |
+| `pdf.embedded_file` | Medium | The document carries attachments. Each one is scanned too, and what is found in it is reported with the prefix `embedded file:`. Not reported: an empty tree of attachments, the packets of an XFA form (which Adobe's programs store as streams of the same type; the form is `pdf.xfa`), and the rights over attachments that a signature grants (`/EF` as an array). |
 | `pdf.rich_media` | Medium | Embedded Flash, video, sound or 3D content: `RichMedia`, `Movie`, `Sound` and `Screen` annotations, `3D`, `U3D` and `PRC` artwork. |
 | `pdf.xfa` | Medium | An XFA form. Its packets are searched for scripts, which are reported as `pdf.javascript`. |
 | `pdf.encrypted` | Info / Medium | The document is encrypted. Info when the empty password or one given with `pdf_passwords` opens it: the content was decrypted and inspected. Medium when no password at hand opens it, so its streams could not be inspected. |
@@ -89,7 +89,7 @@ Also applies to Illustrator files saved since version 9, which are PDFs.
 | `pdf.submit_form` | Low | A form action that sends or fetches data. |
 | `pdf.remote_goto` | Low | An action that opens another document. |
 | `pdf.uri` | Info | Links to external addresses. |
-| `pdf.dangerous_uri` | High / Medium | A link that is not to a web page. High when it runs a script (`javascript:`, `vbscript:`, `data:`) or starts a protocol handler with a history of exploits (`ms-msdt:` and the other `ms-*:`, `search-ms:`, `mhtml:`, `jar:`, `shell:`). Medium when it opens a file on the reader's machine or a network share (`file:`, `smb:`, `\\server\share`, `C:\...`), which hands the reader's Windows credentials to that server. The address is read as a browser reads it: in either case, in UTF-16, with tabs and line breaks dropped. Also reported for the base address of the document (`/URI << /Base >>`). |
+| `pdf.dangerous_uri` | High / Medium | A link that is not to a web page. High when it runs a script (`javascript:`, `vbscript:`, `data:`) or starts a protocol handler with a history of exploits (`ms-msdt:` and the other `ms-*:`, `search-ms:`, `mhtml:`, `jar:`, `shell:`). Medium when it opens a network share (`file://server/share`, `smb:`, `\\server\share`), which is sent the reader's Windows credentials, or a program or script on the reader's own machine (`file:///C:/…/x.exe`, `C:\…\x.bat`). A link to any other local file is what converting a saved web page leaves behind (`file:///C|/book/index.html`); it is as common in harmless documents as in the others and is reported as `pdf.uri` only. The address is read as a browser reads it: in either case, in UTF-16, with tabs and line breaks dropped. Also reported for the base address of the document (`/URI << /Base >>`). |
 | `pdf.external_ref` | Medium | Content that is read from outside the file when it is rendered: a stream whose data is in another file (`/F`, `/FFilter`), a form that draws a page of another document (`/Ref`), a file specification that names a URL (`/FS /URL`), OPI comments. What is printed is then not what was scanned, and the renderer opens a path the file chose. |
 | `pdf.xml_entity` | High / Medium | XML in the document (XMP metadata, an XFA packet) with a document type declaration. High when it declares entities: XXE and entity expansion in the XML parsers of readers and server tools. UTF-16 and UTF-32 text is read too. |
 | `pdf.xml_external_ref` | Medium | XML in the document that makes its parser fetch something: XInclude, `<?xml-stylesheet?>`, an XFA web service connection. |

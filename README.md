@@ -459,12 +459,13 @@ deployment should pass; `--no-sandbox` turns confinement off. Linux only.
 | Option | Default | What it bounds |
 |---|---|---|
 | `--max-size <BYTES>` | 64 MB | The file; the daemon refuses a larger one outright |
+| `--max-decompressed <BYTES>` | 256 MB | What the compressed data in one file may expand to, and the pixels of an image being rebuilt |
+| `--max-pixels <N>` | 2^28 | The pixels an image may declare |
 | `--scan-timeout <S>` | 10 | One scan, checked between steps of the analysis |
 | `--hard-timeout <S>` | 6 × the above | A scan that does not end: the process exits with status 3 |
 
-From Rust, `Limits` holds these and the caps on decompressed data (256 MB), nesting depth
-(4) and pixel count (2^28). The hard timeout exists in the commands only; see
-[Known limits](#known-limits).
+From Rust, `Limits` holds these and the nesting depth (4). The hard timeout exists in
+the commands only; see [Known limits](#known-limits).
 
 **Large files.** `malmal scan` maps the file rather than reading it, so the memory a scan
 needs is what the analysis keeps, not the size of the file: a 1 GB PDF is scanned in a
@@ -473,21 +474,26 @@ is sized for uploads to a web application.
 
 | File | Size | Time | With `--no-hash` | Memory besides the mapped file |
 |---|---:|---:|---:|---:|
-| PDF, mostly images | 60 MB | 0.3 s | 0.03 s | 12 MB |
-| PDF, mostly images | 1 GB | 4.4 s | 0.42 s | 12 MB |
-| PDF, 100,000 small objects | 10 MB | 0.2 s | 0.2 s | 87 MB |
-| PDF, one page stream of 200 MB once inflated | 7 MB | 0.6 s | 0.6 s | 244 MB |
+| PDF, mostly images | 60 MB | 0.26 s | 0.03 s | 4 MB |
+| PDF, mostly images | 1 GB | 4.5 s | 0.41 s | 4 MB |
+| PDF, 100,000 small objects | 10 MB | 0.18 s | 0.18 s | 12 MB |
+| PDF, 500,000 small objects | 51 MB | 0.89 s | 0.88 s | 42 MB |
+| PDF, one page stream of 200 MB once inflated | 8 MB | 0.63 s | 0.63 s | 5 MB |
 
 Measured on a six-core desktop of 2018, with the file in the page cache. The time of a
 large file is the time of its SHA-256: that processor has no instructions for it and
 hashes 230 MB a second, and nothing else in a scan is that slow. The hash runs beside
 the analysis, and `--no-hash` (`ScannerBuilder::without_hash`) leaves it out where
 nothing records it; a blocklist brings it back. On a processor with SHA instructions,
-which is every current server, hashing is several times faster. What a scan keeps grows
-with the number of objects in a PDF (about 40 bytes for each value in them) and with the
-size of the stream being inflated, which `Limits::max_decompressed` bounds. The daemon
-receives a file over a socket and holds it whole: there, `--workers` times `--max-size`
-is the bound.
+which is every current server, hashing is several times faster. The memory is the peak
+resident size less the file, which a scan reads to its end. What a scan keeps grows with
+the number of objects in a PDF (90 to 130 bytes for each in the files above, and more
+for the values that references lead to); page content is inflated and read a block at a
+time, while object streams, attachments, XFA forms and metadata are still inflated
+whole, within `Limits::max_decompressed`. The daemon receives a file over a socket and holds it in
+memory unless `--spool-dir` is given; then files of 1 MiB and more go to unnamed files
+there, and are mapped like the files `malmal scan` reads (see
+[docs/integration.md](docs/integration.md#memory)).
 
 **The daemon.** `--workers` (4) is the number of requests worked on at once and is what
 bounds memory and processors; `--connections` (256) is the number of connections kept
@@ -534,6 +540,28 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
   at once on files whose nature is known: how many malicious ones are refused, how many
   clean ones with them, and which findings decided. `--tsv FILE` records every verdict, to
   diff between two versions. The example names two public sets of real PDF files.
+
+On CIC-Evasive-PDFMal2022, 9,107 clean and 21,899 malicious PDF files:
+
+| | Default policy | Strict policy |
+|---|---:|---:|
+| Malicious files refused | 98.19 % | 98.19 % |
+| of them as `malicious` | 96.71 % | 98.16 % |
+| Clean files accepted | 87.32 % | 87.32 % |
+
+Every one of the 1,155 clean files refused carries what it is refused for, and none is
+refused for a limit or for being malformed: scripts (660), XFA forms without a script
+(260), attachments (207, mostly the Word source of the document or the job options of
+the program that made it), launch actions (12), 3D and media (9), data after `%%EOF`
+(4), a password that is not known, OPI comments and a page of 44 million points (one
+each). A service whose users send tax forms or documents with attachments lowers
+`pdf.xfa` or `pdf.embedded_file` with `Policy::with_override`; `survey` on its own files
+says whether it has to.
+
+Of the 396 malicious files accepted, 379 are a picture and a link to an ordinary web
+address, which is what an invoice is too: telling them apart takes knowing the address,
+not the file. The other 17 have no link and no active content. The set took 9 seconds on
+six cores.
 - `fuzz/` has one target per format (`cargo fuzz list`).
 - `cargo run --release --example throughput -- FILE...` measures throughput.
 
@@ -572,6 +600,9 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
   encrypted document, the ones that are written in the object itself.
 - **XFA forms are searched for scripts and for XML that reaches outside**, and nothing
   else.
+- **A PDF that only links to a harmful page is not found.** `pdf.uri` says that a
+  document has links; whether an address is one to keep users from is a question for a
+  reputation service.
 - **What a PDF check does not follow.** Recursion is found between form XObjects, not
   through tiling patterns, soft masks or Type 3 glyphs. Loops in the page tree and in
   chains of bookmarks or actions are not looked for, nor are embedded fonts and colour

@@ -9,13 +9,14 @@ use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use malmal_cli::icap;
+use malmal_cli::input::Spool;
 use malmal_cli::options::{self, Common};
 use malmal_cli::sandbox;
 use malmal_cli::serve::{self, Service, Slots};
@@ -33,7 +34,10 @@ Options:
   --icap <ADDR>        ICAP for proxies (OPTIONS, REQMOD, RESPMOD)
   --workers <N>        Requests worked on at once [default: 4]
   --connections <N>    Connections kept open at once [default: 256]
-  --timeout <SECONDS>  Idle time before a connection is dropped [default: 30]";
+  --timeout <SECONDS>  Idle time before a connection is dropped [default: 30]
+  --spool-dir <DIR>    Keep files of 1 MiB and more in unnamed files in DIR
+                       while they are scanned, and not in memory; DIR must
+                       be on a disk [default: every file in memory]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Protocol {
@@ -59,6 +63,7 @@ struct Args {
     workers: usize,
     connections: usize,
     timeout: Duration,
+    spool_dir: Option<PathBuf>,
     common: Common,
 }
 
@@ -74,6 +79,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut workers = 4;
     let mut connections = 256;
     let mut timeout = 30;
+    let mut spool_dir = None;
     let mut common = Common::default();
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
@@ -103,6 +109,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     .filter(|&n| n > 0)
                     .ok_or("--timeout needs a positive number of seconds")?
             }
+            "--spool-dir" => spool_dir = Some(PathBuf::from(value("--spool-dir")?)),
             other => {
                 if !common.parse(other, &mut args)? {
                     return Err(format!("unknown option {other:?}"));
@@ -118,6 +125,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         workers,
         connections,
         timeout: Duration::from_secs(timeout),
+        spool_dir,
         common,
     })
 }
@@ -275,13 +283,24 @@ fn main() -> ExitCode {
         }
     };
 
+    // One file for each request worked on at once, opened here and used
+    // over and over: the sandbox has no directory to allow.
+    let spool = match &args.spool_dir {
+        Some(dir) => match Spool::open(dir, args.workers) {
+            Ok(spool) => Some(spool),
+            Err(error) => {
+                eprintln!("malmald: {}: {error}", dir.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
     // The sockets are open; the file system is not needed again, and the
-    // sandbox forbids opening any more of them.
-    match sandbox::enter(
-        args.common.sandbox,
-        &[],
-        options::memory_limit(scanner.limits().max_file_size),
-    ) {
+    // sandbox forbids opening any more of them. Every request worked on
+    // has its file mapped or held whole.
+    let memory = options::memory_limit(scanner.limits(), args.workers as u64);
+    match sandbox::enter(args.common.sandbox, &[], memory) {
         Ok(status) => {
             let endpoints: Vec<String> = listeners
                 .iter()
@@ -302,6 +321,10 @@ fn main() -> ExitCode {
 
     let watchdog = args.common.watchdog("malmald");
     let service = Service::new(scanner).watched_by(watchdog);
+    let service = match spool {
+        Some(spool) => service.spooling_to(spool),
+        None => service,
+    };
     let service = Arc::new(service.at_once(args.workers));
     let connections = Slots::new(args.connections);
     let mut handles = Vec::new();

@@ -2,7 +2,8 @@
 //! in a dictionary add up to, and where in the file an object or a signature
 //! of another format stands. They run once every object is known, object
 //! streams included, and once the document has been opened if it is
-//! encrypted.
+//! encrypted. An object that will read the same then as when it is walked
+//! is looked at during that walk, while its value is at hand: see [`Early`].
 
 use std::ops::Range;
 
@@ -11,9 +12,9 @@ use memchr::memmem;
 use super::crypt::StreamKind;
 use super::filters::DecodeError;
 use super::parser::{Dict, Name, Value, is_regular, is_whitespace};
-use super::{Document, Object, Output, for_each_operator, postscript};
+use super::{Document, Object, Output, content, postscript};
 use crate::limits::{Budget, LimitExceeded};
-use crate::report::Severity;
+use crate::report::{Finding, Severity};
 
 /// A page side longer than this, in points and after `/UserUnit`, is no
 /// page: 400 inches, twice what the format allows without a user unit.
@@ -76,43 +77,91 @@ const CALCULATOR: [&[u8]; 42] = [
     b"xor",
 ];
 
-struct Pass<'p, 'a> {
-    doc: &'p Document<'a>,
+pub(super) struct Pass<'p, 'a> {
+    pub doc: &'p Document<'a>,
     /// Strings and streams are plaintext: the document is not encrypted, or
     /// it has been opened.
-    readable: bool,
-    max_pixels: u64,
+    pub readable: bool,
+    pub max_pixels: u64,
 }
 
+/// What the objects looked at ahead of their turn hold, to be reported when
+/// their turn comes: the findings in the order they were made, and the
+/// object each came from.
+#[derive(Default)]
+pub(super) struct Early {
+    findings: Vec<Finding>,
+    objects: Vec<usize>,
+}
+
+impl Early {
+    /// Look at the object at `index`, whose value is `value`, in a document
+    /// that can be read.
+    pub fn visit(&mut self, doc: &Document<'_>, index: usize, value: &Value, max_pixels: u64) {
+        let pass = Pass {
+            doc,
+            readable: true,
+            max_pixels,
+        };
+        let mut out = Output {
+            findings: &mut self.findings,
+            embedded: Vec::new(),
+            contents: Vec::new(),
+            xfa: Vec::new(),
+            file_streams: Vec::new(),
+            encrypt_sources: Vec::new(),
+        };
+        let object = &doc.objects[index];
+        pass.visit(object, value, object.is_stream(), &mut out);
+        self.objects.resize(self.findings.len(), index);
+    }
+}
+
+/// Look at every object, or at its findings in `early` for the objects from
+/// `seen_from` on, which have been looked at.
 pub(super) fn inspect(
-    doc: &Document<'_>,
-    readable: bool,
-    max_pixels: u64,
+    pass: &Pass<'_, '_>,
+    early: Early,
+    seen_from: usize,
     budget: &mut Budget,
     out: &mut Output<'_>,
 ) {
-    let pass = Pass {
-        doc,
-        readable,
-        max_pixels,
-    };
+    let doc = pass.doc;
+    let readable = pass.readable;
+    let mut early = early.objects.into_iter().zip(early.findings).peekable();
+    let mut streams = Vec::new();
     for (count, object) in doc.objects.iter().enumerate() {
         if count % 256 == 0
             && let Err(limit) = budget.check_time()
         {
             return out.limit(limit);
         }
-        let is_stream = object.stream_start.is_some();
-        pass.visit(object, &object.value, is_stream, out);
-        if readable
-            && is_stream
-            && let Err(limit) = pass.stream(object, budget, out)
-        {
+        let value = if count < seen_from {
+            let value = doc.value(object);
+            pass.visit(object, &value, object.is_stream(), out);
+            value
+        } else {
+            while let Some((_, finding)) = early.next_if(|(index, _)| *index <= count) {
+                out.add(finding);
+            }
+            if !object.is_stream() {
+                continue;
+            }
+            doc.value(object)
+        };
+        let (Some(start), Some(dict)) = (object.stream_start(), value.as_dict()) else {
+            continue;
+        };
+        streams.extend(
+            doc.stream_data(object, dict)
+                .map(|data| start..start + data.len()),
+        );
+        if readable && let Err(limit) = pass.stream(object, dict, budget, out) {
             return out.limit(limit);
         }
     }
 
-    let streams = stream_ranges(doc);
+    let streams = merged(streams);
     conflicting_objects(doc, &streams, out);
     foreign_signatures(doc.data, &streams, out);
 }
@@ -144,7 +193,7 @@ impl Pass<'_, '_> {
         }
         let raw = self.doc.resolve(Some(value)).as_string()?;
         // Strings in an object stream are covered by the stream's encryption.
-        match (&self.doc.crypt, object.packed) {
+        match (&self.doc.crypt, object.packed()) {
             (Some(crypt), false) => {
                 crypt.decrypt(object.number, object.generation, StreamKind::Ordinary, raw)
             }
@@ -156,9 +205,10 @@ impl Pass<'_, '_> {
         self.doc.resolve(dict.get(key)).as_number()
     }
 
-    fn dict(&self, object: &Object, dict: &Dict, stream_dict: bool, out: &mut Output<'_>) {
+    fn dict(&self, object: &Object, whole: &Dict, stream_dict: bool, out: &mut Output<'_>) {
         let doc = self.doc;
         let offset = object.offset;
+        let dict = &Keys::of(whole);
         let is = |key: &[u8], name: &[u8]| doc.name_is(dict.get(key), name);
         let present = |key: &[u8]| !matches!(doc.resolve(dict.get(key)), Value::Null);
 
@@ -207,7 +257,7 @@ impl Pass<'_, '_> {
         }
         for value in dict.all(b"DA") {
             if let Some(appearance) = self.string(object, value)
-                && for_each_operator(&appearance, |token, _| token == b"PS")
+                && content::scan(&appearance).postscript
             {
                 postscript(
                     "default appearance string uses the PostScript operator",
@@ -219,7 +269,7 @@ impl Pass<'_, '_> {
 
         if is(b"Subtype", b"Image")
             && let (Some(width), Some(height)) =
-                (self.number(dict, b"Width"), self.number(dict, b"Height"))
+                (self.number(whole, b"Width"), self.number(whole, b"Height"))
             && width * height > self.max_pixels as f64
         {
             out.report(
@@ -230,7 +280,7 @@ impl Pass<'_, '_> {
             );
         }
         if is(b"Type", b"Page") || is(b"Type", b"Pages") {
-            self.page_boxes(dict, offset, out);
+            self.page_boxes(whole, offset, out);
         }
 
         let filters = match doc.resolve(dict.get(b"Filter")) {
@@ -358,20 +408,18 @@ impl Pass<'_, '_> {
     fn stream(
         &self,
         object: &Object,
+        dict: &Dict,
         budget: &mut Budget,
         out: &mut Output<'_>,
     ) -> Result<(), LimitExceeded> {
         let doc = self.doc;
-        let Some(dict) = object.value.as_dict() else {
-            return Ok(());
-        };
         let is = |key: &[u8], name: &[u8]| doc.name_is(dict.get(key), name);
         let is_xml = is(b"Type", b"Metadata") || is(b"Subtype", b"XML");
         let is_calculator = self.number(dict, b"FunctionType") == Some(4.0);
         if !is_xml && !is_calculator {
             return Ok(());
         }
-        let content = match doc.decode(object, budget) {
+        let content = match doc.decode(object, dict, budget) {
             Ok(content) => content,
             Err(DecodeError::Limit) => return Err(LimitExceeded::Decompression),
             // Nothing reads what cannot be decoded.
@@ -391,6 +439,62 @@ impl Pass<'_, '_> {
     }
 }
 
+/// A dictionary, and which of the keys that [`Pass::dict`] asks for it has.
+/// Going through the entries for each key in turn is most of what a
+/// document of many small objects costs; nearly every answer is no.
+struct Keys<'d> {
+    dict: &'d Dict,
+    seen: u32,
+}
+
+impl<'d> Keys<'d> {
+    /// One bit for each key asked for, and one for all the others.
+    fn bit(key: &[u8]) -> u32 {
+        let index = match key {
+            b"F" => 0,
+            b"FFilter" => 1,
+            b"FDecodeParms" => 2,
+            b"Subtype" => 3,
+            b"Ref" => 4,
+            b"FS" => 5,
+            b"OPI" => 6,
+            b"Type" => 7,
+            b"S" => 8,
+            b"URI" => 9,
+            b"DA" => 10,
+            b"Filter" => 11,
+            b"DecodeParms" => 12,
+            b"DP" => 13,
+            b"Rect" => 14,
+            b"Print" => 15,
+            b"View" => 16,
+            b"ByteRange" => 17,
+            _ => 31,
+        };
+        1 << index
+    }
+
+    fn of(dict: &'d Dict) -> Self {
+        let seen = dict
+            .0
+            .iter()
+            .fold(0, |seen, (key, _)| seen | Self::bit(key.text()));
+        Self { dict, seen }
+    }
+
+    fn get(&self, key: &[u8]) -> Option<&'d Value> {
+        if self.seen & Self::bit(key) == 0 {
+            return None;
+        }
+        self.dict.get(key)
+    }
+
+    fn all(&self, key: &'d [u8]) -> impl Iterator<Item = &'d Value> + use<'d> {
+        let present = self.seen & Self::bit(key) != 0;
+        present.then(|| self.dict.all(key)).into_iter().flatten()
+    }
+}
+
 fn check_length(name: &Name, offset: usize, out: &mut Output<'_>) {
     if name.text().len() > MAX_NAME {
         out.malformed("name longer than the format allows", offset);
@@ -401,10 +505,42 @@ fn print_only(message: &str, offset: usize, out: &mut Output<'_>) {
     out.report("pdf.print_only", Severity::Info, message, offset);
 }
 
-/// Whether a link's address runs a script or reaches for the reader's own
-/// machine or a network share, read the way a browser reads it: tabs and
-/// line breaks dropped, leading spaces and control characters ignored,
-/// letters in either case, UTF-16 accepted.
+/// What a file name ends with when opening the file runs it.
+const PROGRAMS: [&[u8]; 24] = [
+    b".app",
+    b".bat",
+    b".cmd",
+    b".com",
+    b".command",
+    b".cpl",
+    b".dll",
+    b".exe",
+    b".hta",
+    b".jar",
+    b".js",
+    b".jse",
+    b".lnk",
+    b".msi",
+    b".pif",
+    b".ps1",
+    b".reg",
+    b".scr",
+    b".sh",
+    b".url",
+    b".vbe",
+    b".vbs",
+    b".wsf",
+    b".wsh",
+];
+
+/// Whether a link's address runs a script, reaches for a network share or
+/// opens a program on the reader's own machine, read the way a browser
+/// reads it: tabs and line breaks dropped, leading spaces and control
+/// characters ignored, letters in either case, UTF-16 accepted.
+///
+/// A link to any other file on the reader's machine is what converting a
+/// saved web page leaves behind (`file:///C|/book/index.html`), and is as
+/// common in documents that mean no harm as in the others.
 fn dangerous_address(raw: &[u8]) -> Option<(Severity, &'static str)> {
     let text: Vec<u8> = match raw {
         [0xFE, 0xFF, rest @ ..] => rest
@@ -423,12 +559,23 @@ fn dangerous_address(raw: &[u8]) -> Option<(Severity, &'static str)> {
         .map(|byte| byte.to_ascii_lowercase())
         .collect();
 
-    let local = (
+    let share = (
         Severity::Medium,
-        "link opens a file on the reader's machine or a network share",
+        "link opens a network share, which is sent the reader's Windows credentials",
     );
+    let program = (
+        Severity::Medium,
+        "link opens a program or script on the reader's machine",
+    );
+    // Windows takes no notice of dots and spaces at the end of a name.
+    let runs = |path: &[u8]| {
+        let end = path.iter().position(|&byte| matches!(byte, b'?' | b'#'));
+        let name = path[..end.unwrap_or(path.len())].trim_ascii_end();
+        let name = name.strip_suffix(b".").unwrap_or(name).trim_ascii_end();
+        PROGRAMS.iter().any(|ending| name.ends_with(ending))
+    };
     if text.starts_with(b"\\\\") {
-        return Some(local);
+        return Some(share);
     }
     let length = text.iter().position(|&byte| byte == b':')?;
     let scheme = &text[..length];
@@ -451,9 +598,23 @@ fn dangerous_address(raw: &[u8]) -> Option<(Severity, &'static str)> {
             Severity::High,
             "link starts a protocol handler with a history of exploits",
         )),
-        b"file" | b"smb" | b"cifs" => Some(local),
+        b"smb" | b"cifs" => Some(share),
+        b"file" => {
+            // Two slashes are followed by a host, four or more by the host
+            // of a share; a host that is a drive letter is none.
+            let path = &text[length + 1..];
+            let is_slash = |byte: &u8| matches!(byte, b'/' | b'\\');
+            let slashes = path.iter().take_while(|byte| is_slash(byte)).count();
+            let host = path[slashes..].split(is_slash).next().unwrap_or_default();
+            let local = matches!(host, b"" | b"localhost" | [_, b':' | b'|']);
+            if slashes >= 4 || (slashes == 2 && !local) {
+                Some(share)
+            } else {
+                runs(path).then_some(program)
+            }
+        }
         // A drive letter.
-        [letter] if letter.is_ascii_alphabetic() => Some(local),
+        [letter] if letter.is_ascii_alphabetic() => runs(&text).then_some(program),
         _ => None,
     }
 }
@@ -541,16 +702,7 @@ fn is_calculator_program(program: &[u8]) -> bool {
 
 /// Where the data of each stream lies, in file order and without overlaps.
 /// What stands there is the stream's, whatever it looks like.
-fn stream_ranges(doc: &Document<'_>) -> Vec<Range<usize>> {
-    let mut ranges: Vec<Range<usize>> = doc
-        .objects
-        .iter()
-        .filter(|object| !object.packed)
-        .filter_map(|object| {
-            let start = object.stream_start?;
-            Some(start..start + doc.stream_data(object)?.len())
-        })
-        .collect();
+fn merged(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
     ranges.sort_unstable_by_key(|range| range.start);
     let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
     for range in ranges {
@@ -603,7 +755,7 @@ fn conflicting_objects(doc: &Document<'_>, streams: &[Range<usize>], out: &mut O
     let mut order: Vec<&Object> = doc
         .objects
         .iter()
-        .filter(|object| !object.packed && !inside(streams, object.offset))
+        .filter(|object| !object.packed() && !inside(streams, object.offset))
         .collect();
     order.sort_unstable_by_key(|object| (object.number, object.generation, object.offset));
     let mut ends: Option<Vec<usize>> = None;
@@ -615,9 +767,15 @@ fn conflicting_objects(doc: &Document<'_>, streams: &[Range<usize>], out: &mut O
         let ends = ends.get_or_insert_with(|| find_outside(doc.data, streams, b"%%EOF").collect());
         let next_end = ends.partition_point(|&end| end < first.offset);
         let same_revision = ends.get(next_end).is_none_or(|&end| end > second.offset);
-        if same_revision
-            && (first.value != second.value || doc.stream_data(first) != doc.stream_data(second))
-        {
+        let differ = || {
+            let (one, other) = (doc.value(first), doc.value(second));
+            let data = |object: &Object, value: &Value| {
+                let dict = value.as_dict()?;
+                doc.stream_data(object, dict)
+            };
+            one != other || data(first, &one) != data(second, &other)
+        };
+        if same_revision && differ() {
             return out.report(
                 "pdf.conflicting_objects",
                 Severity::Medium,
@@ -691,6 +849,12 @@ mod tests {
             b"tel:+15551234",
             b"",
             b"12:30 is the time",
+            // Files on the reader's own machine that do not run.
+            b"file:///etc/passwd",
+            b"file:///C|/book/index.html",
+            b"file://localhost/home/reader/notes.txt",
+            b"file://C:/app/scripts/exit.jsp%3fdest=http:/example.com/",
+            b"C:\\Users\\reader\\report.docx",
         ] {
             assert_eq!(verdict(harmless), None, "{harmless:?}");
         }
@@ -707,10 +871,15 @@ mod tests {
             assert_eq!(verdict(script), Some(Severity::High), "{script:?}");
         }
         for local in [
-            &b"file:///etc/passwd"[..],
-            b"\\\\host\\share\\file",
+            &b"\\\\host\\share\\file"[..],
             b"smb://host/share",
+            b"file://host/share/file.txt",
+            b"file:////host/share/file.txt",
+            b"FILE:\\\\\\\\host\\share",
             b"C:\\Windows\\system32\\calc.exe",
+            b"file:///C:/Windows/System32/calc.exe . ",
+            b"file:///C|/tools/run.BAT?x=1",
+            b"file:/tmp/x.sh",
         ] {
             assert_eq!(verdict(local), Some(Severity::Medium), "{local:?}");
         }

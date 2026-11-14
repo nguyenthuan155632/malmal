@@ -585,6 +585,151 @@ fn idle_connections_do_not_keep_others_waiting() {
     drop(kept);
 }
 
+/// A PDF of `size` bytes or a little more, most of them one image, with a
+/// script behind the image if `scripted`.
+fn large_pdf(size: usize, scripted: bool) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+        2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n"
+        .to_vec();
+    pdf.extend_from_slice(
+        format!("3 0 obj\n<< /Subtype /Image /Width 9 /Height 9 /Length {size} >>\nstream\n")
+            .as_bytes(),
+    );
+    pdf.extend((0..size).map(|index| (index % 251) as u8));
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    if scripted {
+        pdf.extend_from_slice(b"4 0 obj\n<< /S /JavaScript /JS (app.alert(1)) >>\nendobj\n");
+    }
+    pdf.extend_from_slice(b"trailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n");
+    pdf
+}
+
+/// Files too large to stay in memory go through the spool, whatever the
+/// endpoint, with the sandbox closed and nothing left in the directory.
+#[test]
+fn daemon_spools_large_files() {
+    use std::io::Read;
+    use std::net::{Shutdown, TcpStream};
+
+    let dir = scratch("spool");
+    let spool = dir.join("spool");
+    fs::create_dir(&spool).unwrap();
+    let socket = dir.join("malmal.sock");
+    let sandbox = if sandbox_available(&dir) {
+        "--require-sandbox"
+    } else {
+        "--no-sandbox"
+    };
+    let mut child = Command::new(MALMALD)
+        .arg("--socket")
+        .arg(&socket)
+        .args(["--http", "127.0.0.1:0", "--clamd", "127.0.0.1:0"])
+        .args(["--icap", "127.0.0.1:0", "--workers", "2", "--timeout", "20"])
+        .arg("--spool-dir")
+        .arg(&spool)
+        .arg(sandbox)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut banner = String::new();
+    BufReader::new(child.stderr.take().unwrap())
+        .read_line(&mut banner)
+        .unwrap();
+    let _daemon = Daemon(child);
+    let address = |protocol: &str| {
+        let end = banner.find(&format!(" ({protocol})")).unwrap();
+        let start = banner[..end].rfind(' ').unwrap() + 1;
+        banner[start..end].to_string()
+    };
+    let (http, clamd, icap) = (address("http"), address("clamd"), address("icap"));
+    // Nothing in the spool has a name, before a request or after.
+    assert_eq!(fs::read_dir(&spool).unwrap().count(), 0);
+
+    let exchange = |address: &str, parts: &[&[u8]]| {
+        let mut stream = TcpStream::connect(address).unwrap();
+        for part in parts {
+            stream.write_all(part).unwrap();
+        }
+        stream.shutdown(Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).unwrap();
+        reply
+    };
+    for round in 0..2 {
+        for (scripted, verdict) in [(false, "clean"), (true, "malicious")] {
+            let pdf = large_pdf(3 << 20, scripted);
+
+            let mut stream = UnixStream::connect(&socket).unwrap();
+            let reply = request(&mut stream, &format!(r#"{{"size": {}}}"#, pdf.len()), &pdf);
+            assert_eq!(reply["report"]["verdict"], verdict, "round {round}");
+            assert_eq!(reply["report"]["size"], pdf.len());
+
+            let head = format!(
+                "POST /scan HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                pdf.len()
+            );
+            let reply = exchange(&http, &[head.as_bytes(), &pdf]);
+            assert!(
+                reply.contains(&format!(r#""verdict":"{verdict}""#)),
+                "{reply}"
+            );
+
+            // In chunks, the first of them small.
+            let (first, rest) = pdf.split_at(1000);
+            let reply = exchange(
+                &clamd,
+                &[
+                    b"zINSTREAM\0",
+                    &(first.len() as u32).to_be_bytes(),
+                    first,
+                    &(rest.len() as u32).to_be_bytes(),
+                    rest,
+                    &[0; 4],
+                ],
+            );
+            let expected = if scripted {
+                "stream: Malmal.Malicious.pdf.javascript FOUND\0"
+            } else {
+                "stream: OK\0"
+            };
+            assert_eq!(reply, expected);
+
+            let http_head = "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\n\r\n";
+            let icap_head = format!(
+                "RESPMOD icap://{icap}/scan ICAP/1.0\r\nAllow: 204\r\n\
+                 Encapsulated: res-hdr=0, res-body={}\r\n\r\n{http_head}{:x}\r\n",
+                http_head.len(),
+                pdf.len()
+            );
+            let reply = exchange(&icap, &[icap_head.as_bytes(), &pdf, b"\r\n0\r\n\r\n"]);
+            if scripted {
+                assert!(
+                    reply.contains("Threat=Malmal.Malicious.pdf.javascript"),
+                    "{reply}"
+                );
+            } else {
+                assert!(
+                    reply.starts_with("ICAP/1.0 204 No Modifications"),
+                    "{reply}"
+                );
+            }
+        }
+    }
+    assert_eq!(fs::read_dir(&spool).unwrap().count(), 0);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn daemon_refuses_a_spool_it_cannot_open() {
+    let output = Command::new(MALMALD)
+        .args(["--http", "127.0.0.1:0", "--spool-dir", "/nonexistent/spool"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stderr).unwrap();
+    assert!(text.starts_with("malmald: /nonexistent/spool: "), "{text}");
+}
+
 #[test]
 fn daemon_needs_an_endpoint() {
     let output = Command::new(MALMALD).output().unwrap();
