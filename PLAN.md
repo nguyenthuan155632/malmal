@@ -397,8 +397,17 @@ Taken from a comparison with quelda (github.com/tranhuucanh/quelda), a PDF scann
       blocks through the whole filter chain.
 - [x] What a request can cost in memory, measured with hostile files, and the options
       that bound it (`--max-decompressed`, `--max-pixels`).
-- [ ] Not done: PDF Insecurity (not downloaded); a ceiling on the daemon's memory that
-      holds whatever arrives (requests are not made to wait for memory);
+- [x] Every loop in the scan whose length the file decides, listed with what bounds it;
+      the ones measured to grow with the square of the file, or to run past the time
+      limit, bounded: PDF trailers, unparsable objects, object streams, form calls,
+      `/Encrypt` sources; SVG references and CSS addresses; PostScript strings and
+      resources; icon images; tails of payload tags. Decode output of failed PDF filters
+      and of PostScript ASCII85 strings counted against `--max-decompressed`.
+- [x] The daemon's workers held only by scans; `--file-budget` for the files held at
+      once, `--min-rate` for clients that send or read slowly; multipart boundaries found
+      in linear time; spool writes buffered. Soaked over the four endpoints.
+- [ ] Not done: PDF Insecurity (not downloaded); a ceiling on what scans take in memory
+      (scans are not made to wait for memory; `--file-budget` counts the files only);
       reading object streams, attachments, XFA and metadata in blocks; recursion through
       patterns, soft masks and glyphs; page tree and bookmark loops; embedded fonts and
       colour profiles; presets and locked rules.

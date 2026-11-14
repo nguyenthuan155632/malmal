@@ -19,7 +19,8 @@ name = "malmald"
 path = "src/bin/malmald.rs"
 
 [dependencies]
-malmal = { path = "../malmal", version = "0.2.0" }
+malmal = { path = "../malmal", version = "0.3.0" }
+memchr = "2.8.3"
 memmap2 = "0.9"
 serde.workspace = true
 serde_json.workspace = true

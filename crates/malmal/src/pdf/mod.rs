@@ -15,7 +15,7 @@ pub(crate) mod parser;
 
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use memchr::memmem;
 
@@ -395,8 +395,13 @@ impl Output<'_> {
         }
     }
 
+    /// Only the first [`MAX_ENCRYPT_SOURCES`] are ever tried, so no more are
+    /// kept: a file that names `/Encrypt` in every object would otherwise
+    /// make this the square of its objects.
     fn encrypted(&mut self, offset: usize) {
-        if !self.encrypt_sources.contains(&offset) {
+        if self.encrypt_sources.len() < MAX_ENCRYPT_SOURCES
+            && !self.encrypt_sources.contains(&offset)
+        {
             self.encrypt_sources.push(offset);
         }
     }
@@ -433,9 +438,27 @@ pub(crate) fn analyze(
     check_header(data, &mut out);
     discover_objects(&mut doc, budget, &mut out);
 
-    for at in memmem::find_iter(data, b"trailer") {
-        let mut parser = Parser::new(data, at + b"trailer".len(), doc.nodes_left.get());
-        if let Some(trailer) = parser.parse_value() {
+    // A trailer is read to where its value ends, which for one whose string
+    // never closes is the end of the file: the same bound on that work as
+    // for objects.
+    let work_limit = data.len() as u64 * 8 + (1 << 20);
+    let mut work = 0u64;
+    for (count, at) in memmem::find_iter(data, b"trailer").enumerate() {
+        if count % 256 == 0
+            && let Err(limit) = budget.check_time()
+        {
+            out.limit(limit);
+            break;
+        }
+        let start = at + b"trailer".len();
+        let mut parser = Parser::new(data, start, doc.nodes_left.get());
+        let trailer = parser.parse_value();
+        work += (parser.pos - start) as u64;
+        if work > work_limit {
+            out.limit(LimitExceeded::Complexity);
+            break;
+        }
+        if let Some(trailer) = trailer {
             walk(&doc, &trailer, at, &mut out);
         }
     }
@@ -634,6 +657,7 @@ fn discover_objects(doc: &mut Document<'_>, budget: &Budget, out: &mut Output<'_
     // by a small multiple of the file size.
     let work_limit = data.len() as u64 * 8 + (1 << 20);
     let mut work = 0u64;
+    let mut fallback = Fallback::default();
     for (count, at) in memmem::find_iter(data, b"obj").enumerate() {
         if count % 256 == 0
             && let Err(limit) = budget.check_time()
@@ -663,7 +687,7 @@ fn discover_objects(doc: &mut Document<'_>, budget: &Budget, out: &mut Output<'_
 
         if !is_value {
             out.malformed("object could not be parsed", offset);
-            fallback_names(&data[body..], offset, out);
+            fallback.names(data, body, offset, out);
             continue;
         }
         parser.skip_whitespace();
@@ -763,11 +787,17 @@ fn expand_object_streams(doc: &mut Document<'_>, budget: &mut Budget, out: &mut 
             };
             entries.push((number, first.saturating_add(relative)));
         }
+        // Entries may all point at one large value; reading it for each of
+        // them is bounded as reading the objects of the file is.
+        let work_limit = decoded.len() as u64 * 8 + (1 << 20);
+        let mut work = 0u64;
+        let mut unparsed = Vec::new();
         for (number, start) in entries {
             let nodes_left = doc.nodes_left.get();
             let mut parser = Parser::new(&decoded, start, nodes_left);
             let is_value = parser.skip_value();
-            if parser.nodes_left == 0 || nodes_left <= 1 {
+            work += parser.pos.saturating_sub(start) as u64;
+            if parser.nodes_left == 0 || nodes_left <= 1 || work > work_limit {
                 return out.limit(LimitExceeded::Complexity);
             }
             match (is_value, u32::try_from(number)) {
@@ -786,9 +816,17 @@ fn expand_object_streams(doc: &mut Document<'_>, budget: &mut Budget, out: &mut 
                 }
                 _ => {
                     out.malformed("object inside an object stream could not be parsed", offset);
-                    fallback_names(decoded.get(start..).unwrap_or(&[]), offset, out);
+                    unparsed.push(start);
                 }
             }
+        }
+        // Every one is reported at the stream's offset, so the order they
+        // are looked at in is free: the order they start in.
+        unparsed.sort_unstable();
+        unparsed.dedup();
+        let mut fallback = Fallback::default();
+        for start in unparsed {
+            fallback.names(&decoded, start, offset, out);
         }
         streams.push(decoded);
     }
@@ -1028,7 +1066,7 @@ fn embedded_file(offset: usize, out: &mut Output<'_>) {
 /// packets that type. The form is reported as one, and its packets are
 /// searched as packets and as files.
 fn report_file_streams(doc: &Document<'_>, out: &mut Output<'_>) {
-    let packets: Vec<usize> = out
+    let packets: HashSet<usize> = out
         .xfa
         .iter()
         .filter_map(|number| doc.by_number.get(number))
@@ -1092,44 +1130,85 @@ fn classify_action(doc: &Document<'_>, value: &Value) -> Action {
     }
 }
 
-/// For an object the parser rejected: readers are more forgiving than this
-/// parser, so every name token in the object is still checked by itself.
-fn fallback_names(region: &[u8], offset: usize, out: &mut Output<'_>) {
-    let end = [b"endobj".as_slice(), b"stream"]
-        .iter()
-        .filter_map(|keyword| memmem::find(region, keyword))
-        .min()
-        .unwrap_or(region.len())
-        .min(FALLBACK_WINDOW);
-    let mut parser = Parser::new(&region[..end], 0, usize::MAX);
-    while let Some(slash) = memchr::memchr(b'/', parser.rest()) {
-        parser.pos += slash;
-        let Some(name) = parser.name() else {
-            break;
-        };
-        check_name(&name, offset, out);
-        match name.text() {
-            b"JS" | b"JavaScript" => javascript(offset, out),
-            b"Launch" => launch(offset, out),
-            b"OpenAction" => out.report(
-                "pdf.open_action",
-                Severity::Medium,
-                "performs an action when opened",
-                offset,
-            ),
-            b"AA" => out.report(
-                "pdf.additional_action",
-                Severity::Medium,
-                "performs an action on a document or page event",
-                offset,
-            ),
-            b"EmbeddedFile" | b"EmbeddedFiles" | b"EF" => embedded_file(offset, out),
-            b"RichMedia" => rich_media(offset, out),
-            b"XFA" => xfa(offset, out),
-            b"Encrypt" => out.encrypted(offset),
-            b"Subtype2" => postscript("embeds a PostScript XObject", offset, out),
-            _ => {}
+/// Where the names of objects the parser rejected have been looked for in
+/// one source, for objects taken in the order they start. Each region runs
+/// from an object to the next `endobj` or `stream`; regions of objects close
+/// together overlap, and what was read for one is not read again for the
+/// next, nor is the next keyword looked for again from each of them.
+#[derive(Default)]
+struct Fallback {
+    /// Where the next region starts reading: the last name read, which may
+    /// have been cut short by the end of its region.
+    resume: usize,
+    /// The next `endobj` and `stream` from where the last region started,
+    /// `usize::MAX` for none, and where that was.
+    ends: [usize; 2],
+    searched_from: Option<usize>,
+}
+
+impl Fallback {
+    /// For an object the parser rejected, whose value starts at `start` in
+    /// `source`: readers are more forgiving than this parser, so every name
+    /// token in the object is still checked by itself.
+    fn names(&mut self, source: &[u8], start: usize, offset: usize, out: &mut Output<'_>) {
+        if self.searched_from.is_none_or(|from| from > start) {
+            *self = Self::default();
         }
+        for (end, keyword) in self.ends.iter_mut().zip([&b"endobj"[..], b"stream"]) {
+            if self.searched_from.is_none() || (*end != usize::MAX && *end < start) {
+                *end = source
+                    .get(start..)
+                    .and_then(|rest| memmem::find(rest, keyword))
+                    .map_or(usize::MAX, |at| start + at);
+            }
+        }
+        self.searched_from = Some(start);
+        let end = self.ends[0]
+            .min(self.ends[1])
+            .min(start.saturating_add(FALLBACK_WINDOW))
+            .min(source.len());
+        let from = start.max(self.resume);
+        if from >= end {
+            return;
+        }
+        self.resume = end;
+        let region = &source[from..end];
+        let mut parser = Parser::new(region, 0, usize::MAX);
+        while let Some(slash) = memchr::memchr(b'/', parser.rest()) {
+            parser.pos += slash;
+            self.resume = from + parser.pos;
+            let Some(name) = parser.name() else {
+                break;
+            };
+            fallback_name(&name, offset, out);
+        }
+    }
+}
+
+/// See [`Fallback::names`].
+fn fallback_name(name: &Name, offset: usize, out: &mut Output<'_>) {
+    check_name(name, offset, out);
+    match name.text() {
+        b"JS" | b"JavaScript" => javascript(offset, out),
+        b"Launch" => launch(offset, out),
+        b"OpenAction" => out.report(
+            "pdf.open_action",
+            Severity::Medium,
+            "performs an action when opened",
+            offset,
+        ),
+        b"AA" => out.report(
+            "pdf.additional_action",
+            Severity::Medium,
+            "performs an action on a document or page event",
+            offset,
+        ),
+        b"EmbeddedFile" | b"EmbeddedFiles" | b"EF" => embedded_file(offset, out),
+        b"RichMedia" => rich_media(offset, out),
+        b"XFA" => xfa(offset, out),
+        b"Encrypt" => out.encrypted(offset),
+        b"Subtype2" => postscript("embeds a PostScript XObject", offset, out),
+        _ => {}
     }
 }
 
@@ -1252,110 +1331,320 @@ fn scan_content_streams(doc: &Document<'_>, budget: &mut Budget, out: &mut Outpu
 
 /// A form that draws itself, directly or through other forms. A renderer
 /// follows the calls until it runs out of stack or of time.
+///
+/// The calls go through the names a form draws, each looked up in a table
+/// of XObjects: a form calls the forms its table lists under that name.
+/// Forms that share a table share what each name in it leads to, so the
+/// graph walked has a node for each table and name between the forms, and
+/// as many edges as there are names drawn and entries listed. Joining every
+/// form to every form it calls would be their product.
 fn draw_recursion(doc: &Document<'_>, draws: &HashMap<usize, Vec<Drawn>>, out: &mut Output<'_>) {
-    // The forms that `table` lists under the names that `form` draws.
-    let called = |form: usize, table: &Dict, targets: &mut Vec<usize>| {
-        for name in &draws[&form] {
-            let listed = table.0.iter().filter(|(key, _)| name.is(key.text()));
-            targets.extend(
-                listed
-                    .filter_map(|(_, item)| as_ref(item))
-                    .filter_map(|number| doc.by_number.get(&number).map(|&index| index as usize))
-                    .filter(|target| draws.contains_key(target)),
-            );
-        }
-    };
-    let mut calls: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut graph = Calls::default();
     // Forms without resources of their own draw with those of whatever
     // draws them: any dictionary of XObjects in the document may apply.
     let mut borrowing = Vec::new();
-    for &index in draws.keys() {
+    let mut forms: Vec<usize> = draws.keys().copied().collect();
+    forms.sort_unstable();
+    for &index in &forms {
         let value = doc.value(&doc.objects[index]);
         let Some(dict) = value.as_dict() else {
             continue;
         };
-        let own = doc
-            .resolve(dict.get(b"Resources"))
-            .as_dict()
-            .and_then(|resources| doc.resolve(resources.get(b"XObject")).as_dict());
-        let targets = calls.entry(index).or_default();
+        let resources = dict.get(b"Resources");
+        let own = doc.resolve(resources).as_dict().and_then(|resources_dict| {
+            let item = resources_dict.get(b"XObject");
+            let table = doc.resolve(item).as_dict()?;
+            // A table reached through a reference is kept, and may be
+            // shared; one written in the form is the form's alone.
+            let shared =
+                matches!(resources, Some(Value::Ref(_))) || matches!(item, Some(Value::Ref(_)));
+            Some((table, shared))
+        });
+        graph.forms.entry(index).or_default();
         match own {
-            Some(table) => called(index, table, targets),
+            Some((table, shared)) => {
+                let id = if shared {
+                    TableId::Kept(std::ptr::from_ref(table) as usize)
+                } else {
+                    TableId::Own(index)
+                };
+                graph
+                    .tables
+                    .entry(id)
+                    .or_insert_with(|| TableIndex::of(doc, table, draws, None));
+                graph.draw(index, id, &draws[&index]);
+            }
             None => borrowing.push(index),
         }
     }
     if !borrowing.is_empty() {
+        let mut wanted = Wanted::default();
+        for index in &borrowing {
+            wanted.add(&draws[index]);
+        }
+        let mut every = TableIndex::default();
+        let mut kept = HashSet::new();
         for object in &doc.objects {
             let value = doc.value(object);
-            let mut tables = Vec::new();
-            xobject_tables(doc, &value, &mut tables);
-            for table in tables {
-                for &index in &borrowing {
-                    called(index, table, calls.entry(index).or_default());
-                }
-            }
+            every.add_tables(doc, &value, draws, &wanted, &mut kept);
+        }
+        every.finish();
+        graph.tables.insert(TableId::Every, every);
+        for index in borrowing {
+            graph.draw(index, TableId::Every, &draws[&index]);
         }
     }
+    if let Some(form) = graph.cycle() {
+        out.report(
+            "pdf.draw_recursion",
+            Severity::Medium,
+            "form draws itself; rendering it never ends",
+            doc.objects[form].offset,
+        );
+    }
+}
 
-    // Depth-first over the calls, with the forms on the current path marked.
-    #[derive(Clone, Copy, PartialEq)]
-    enum State {
-        OnPath,
-        Done,
-    }
-    let mut states: HashMap<usize, State> = HashMap::new();
-    for &start in calls.keys() {
-        if states.contains_key(&start) {
-            continue;
+/// Which table of XObjects a name is looked up in.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum TableId {
+    /// One reached through a reference, which is kept where it is: by its
+    /// address.
+    Kept(usize),
+    /// One written in the form at this index.
+    Own(usize),
+    /// Every table in the document, for forms that have none.
+    Every,
+}
+
+/// The names a form draws, as the table it draws from is searched for them.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Key {
+    Name(Vec<u8>),
+    /// A name too long to have been kept: any key that may have been as
+    /// long.
+    Long,
+}
+
+impl Key {
+    fn of(drawn: &Drawn) -> Self {
+        match drawn {
+            Drawn::Name(name) => Self::Name(name.clone()),
+            Drawn::Long => Self::Long,
         }
-        states.insert(start, State::OnPath);
-        let mut path = vec![(start, 0usize)];
-        while let Some((form, next)) = path.last_mut() {
-            let form = *form;
-            let Some(&target) = calls[&form].get(*next) else {
-                states.insert(form, State::Done);
-                path.pop();
-                continue;
-            };
-            *next += 1;
-            match states.get(&target) {
-                Some(State::OnPath) => {
-                    return out.report(
-                        "pdf.draw_recursion",
-                        Severity::Medium,
-                        "form draws itself; rendering it never ends",
-                        doc.objects[target].offset,
-                    );
+    }
+}
+
+/// The names that forms without tables of their own draw: the only ones
+/// looked for in every table.
+#[derive(Default)]
+struct Wanted {
+    names: HashSet<Vec<u8>>,
+    long: bool,
+}
+
+impl Wanted {
+    fn add(&mut self, drawn: &[Drawn]) {
+        for name in drawn {
+            match name {
+                Drawn::Name(name) => {
+                    self.names.insert(name.clone());
                 }
-                Some(State::Done) => {}
-                None => {
-                    states.insert(target, State::OnPath);
-                    path.push((target, 0));
-                }
+                Drawn::Long => self.long = true,
             }
         }
     }
 }
 
-/// Collect every dictionary stored under `/XObject` in `value`.
-fn xobject_tables<'v>(doc: &'v Document<'_>, value: &'v Value, tables: &mut Vec<&'v Dict>) {
-    match value {
-        Value::Dict(dict) => {
-            for (key, item) in &dict.0 {
-                if key.text() == b"XObject"
-                    && let Some(table) = doc.resolve(Some(item)).as_dict()
-                {
-                    tables.push(table);
+/// What each name of a table leads to: the forms, among those that draw
+/// anything, that it lists under that name.
+#[derive(Default)]
+struct TableIndex {
+    names: HashMap<Vec<u8>, Vec<usize>>,
+    /// The forms listed under names a name too long to be kept may be.
+    long: Vec<usize>,
+}
+
+impl TableIndex {
+    fn of(
+        doc: &Document<'_>,
+        table: &Dict,
+        draws: &HashMap<usize, Vec<Drawn>>,
+        wanted: Option<&Wanted>,
+    ) -> Self {
+        let mut index = Self::default();
+        index.add(doc, table, draws, wanted);
+        index.finish();
+        index
+    }
+
+    fn add(
+        &mut self,
+        doc: &Document<'_>,
+        table: &Dict,
+        draws: &HashMap<usize, Vec<Drawn>>,
+        wanted: Option<&Wanted>,
+    ) {
+        for (key, item) in &table.0 {
+            let Some(target) = as_ref(item)
+                .and_then(|number| doc.by_number.get(&number))
+                .map(|&index| index as usize)
+                .filter(|target| draws.contains_key(target))
+            else {
+                continue;
+            };
+            let key = key.text();
+            if wanted.is_none_or(|wanted| wanted.names.contains(key)) {
+                self.names.entry(key.to_vec()).or_default().push(target);
+            }
+            if wanted.is_none_or(|wanted| wanted.long) && Drawn::Long.is(key) {
+                self.long.push(target);
+            }
+        }
+    }
+
+    /// Every dictionary stored under `/XObject` in `value`. One reached
+    /// through a reference is added once, however many objects name it.
+    fn add_tables(
+        &mut self,
+        doc: &Document<'_>,
+        value: &Value,
+        draws: &HashMap<usize, Vec<Drawn>>,
+        wanted: &Wanted,
+        kept: &mut HashSet<usize>,
+    ) {
+        match value {
+            Value::Dict(dict) => {
+                for (key, item) in &dict.0 {
+                    if key.text() == b"XObject"
+                        && let Some(table) = doc.resolve(Some(item)).as_dict()
+                        && (!matches!(item, Value::Ref(_))
+                            || kept.insert(std::ptr::from_ref(table) as usize))
+                    {
+                        self.add(doc, table, draws, Some(wanted));
+                    }
+                    self.add_tables(doc, item, draws, wanted, kept);
                 }
-                xobject_tables(doc, item, tables);
+            }
+            Value::Array(items) => {
+                for item in items {
+                    self.add_tables(doc, item, draws, wanted, kept);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finish(&mut self) {
+        for targets in self.names.values_mut().chain([&mut self.long]) {
+            targets.sort_unstable();
+            targets.dedup();
+        }
+    }
+
+    fn targets(&self, key: &Key) -> &[usize] {
+        match key {
+            Key::Name(name) => self.names.get(name).map_or(&[], Vec::as_slice),
+            Key::Long => &self.long,
+        }
+    }
+}
+
+/// The calls between forms, through the names they draw.
+#[derive(Default)]
+struct Calls {
+    /// For each form that draws anything, the names it draws, as nodes.
+    forms: HashMap<usize, Vec<usize>>,
+    tables: HashMap<TableId, TableIndex>,
+    /// Each table and name a form draws from, once.
+    nodes: HashMap<(TableId, Key), usize>,
+    /// What each of those is looked up in, and for what.
+    lookups: Vec<(TableId, Key)>,
+}
+
+impl Calls {
+    /// `form` draws `names` from `table`.
+    fn draw(&mut self, form: usize, table: TableId, names: &[Drawn]) {
+        let mut nodes = Vec::with_capacity(names.len());
+        for name in names {
+            let key = (table, Key::of(name));
+            let next = self.lookups.len();
+            let node = *self.nodes.entry(key.clone()).or_insert(next);
+            if node == next {
+                self.lookups.push(key);
+            }
+            nodes.push(node);
+        }
+        nodes.sort_unstable();
+        nodes.dedup();
+        self.forms.insert(form, nodes);
+    }
+
+    fn called(&self, node: usize) -> &[usize] {
+        let (table, key) = &self.lookups[node];
+        self.tables[table].targets(key)
+    }
+
+    /// A form on a cycle of calls, if there is one: depth first, with what
+    /// is on the current path marked.
+    fn cycle(&self) -> Option<usize> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum State {
+            OnPath,
+            Done,
+        }
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum At {
+            Form(usize),
+            Name(usize),
+        }
+        let mut states: HashMap<At, State> = HashMap::new();
+        let mut starts: Vec<usize> = self.forms.keys().copied().collect();
+        starts.sort_unstable();
+        for start in starts {
+            if states.contains_key(&At::Form(start)) {
+                continue;
+            }
+            states.insert(At::Form(start), State::OnPath);
+            let mut path = vec![(At::Form(start), 0usize)];
+            while let Some(&mut (at, ref mut next)) = path.last_mut() {
+                let following = match at {
+                    At::Form(form) => self
+                        .forms
+                        .get(&form)
+                        .and_then(|names| names.get(*next))
+                        .map(|&node| At::Name(node)),
+                    At::Name(node) => self.called(node).get(*next).map(|&form| At::Form(form)),
+                };
+                let Some(target) = following else {
+                    states.insert(at, State::Done);
+                    path.pop();
+                    continue;
+                };
+                *next += 1;
+                match states.get(&target) {
+                    Some(State::OnPath) => {
+                        // The cycle closes at a form, or at a name that the
+                        // form after it on the path was found through.
+                        return match target {
+                            At::Form(form) => Some(form),
+                            At::Name(_) => path
+                                .iter()
+                                .skip_while(|(on, _)| *on != target)
+                                .find_map(|(on, _)| match on {
+                                    At::Form(form) => Some(*form),
+                                    At::Name(_) => None,
+                                }),
+                        };
+                    }
+                    Some(State::Done) => {}
+                    None => {
+                        states.insert(target, State::OnPath);
+                        path.push((target, 0));
+                    }
+                }
             }
         }
-        Value::Array(items) => {
-            for item in items {
-                xobject_tables(doc, item, tables);
-            }
-        }
-        _ => {}
+        None
     }
 }
 
@@ -2505,5 +2794,72 @@ mod tests {
                 .copied(),
         );
         assert_eq!(codes(&scripted), ["pdf.javascript", "limit.complexity"]);
+    }
+
+    /// Structures repeated to make a scanner read each part of a file again
+    /// for each repetition: each is read a few times at most.
+    #[test]
+    fn repeated_structures_cost_what_the_file_does() {
+        let started = std::time::Instant::now();
+        let file = |body: &[u8]| [b"%PDF-1.7\n".as_slice(), body, b"\n%%EOF\n"].concat();
+
+        // Trailers whose strings never close, each read to the end.
+        let trailers =
+            file(&[&b"1 0 obj << >> endobj\n"[..], &b"trailer(".repeat(200_000)].concat());
+        assert!(codes(&trailers).contains(&"limit.complexity"));
+
+        // Broken objects, each of whose names was looked for up to the next
+        // `endobj`, which there is none of. The last name is still found.
+        let broken = file(&[b"1 0 obj >\n".repeat(100_000), b"2 0 obj > /JS\n".to_vec()].concat());
+        assert_eq!(codes(&broken), ["pdf.malformed", "pdf.javascript"]);
+
+        // `/Encrypt` in every object.
+        let named: Vec<u8> = (0..200_000)
+            .flat_map(|n| format!("{n} 0 obj << /Encrypt 1 >> endobj\n").into_bytes())
+            .collect();
+        assert!(codes(&file(&named)).contains(&"pdf.encrypted"));
+
+        // An object stream whose entries all point at one large array.
+        let entries = 20_000;
+        let index: String = (0..entries).map(|n| format!("{} 0 ", n + 10)).collect();
+        let array = format!("[{}]", "0 ".repeat(50_000));
+        let packed = compress_to_vec_zlib(format!("{index}{array}").as_bytes(), 6);
+        let entries_object = stream(
+            &format!(
+                "/Type /ObjStm /N {entries} /First {} /Filter /FlateDecode",
+                index.len()
+            ),
+            &packed,
+        );
+        let overlapping = pdf(&[PLAIN_CATALOG, PAGES, PAGE, &entries_object]);
+        assert!(codes(&overlapping).contains(&"limit.complexity"));
+
+        // Forms without resources, each drawing a name that one large table
+        // lists for all of them.
+        let forms = 2_000;
+        let table: String = (0..20_000)
+            .map(|n| format!("/X0 {} 0 R ", 2 + n % forms))
+            .collect();
+        let mut body = format!("1 0 obj << /Resources << /XObject << {table} >> >> >> endobj\n");
+        for n in 0..forms {
+            body += &format!(
+                "{} 0 obj << /Subtype /Form /Length 6 >>\nstream\n/X0 Do\nendstream endobj\n",
+                n + 2
+            );
+        }
+        assert_eq!(codes(&file(body.as_bytes())), ["pdf.draw_recursion"]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn forms_that_share_their_resources_draw_through_them() {
+        let resources = b"<< /XObject << /A 5 0 R /B 6 0 R >> >>";
+        let form = |content: &[u8]| stream("/Subtype /Form /Resources 4 0 R", content);
+        let (first, second) = (form(b"/B Do"), form(b"/A Do"));
+        let objects = [PLAIN_CATALOG, PAGES, PAGE, &resources[..], &first, &second];
+        assert_eq!(codes(&pdf(&objects)), ["pdf.draw_recursion"]);
+        let leaf = form(b"0 0 9 9 re f");
+        let objects = [PLAIN_CATALOG, PAGES, PAGE, &resources[..], &first, &leaf];
+        assert_eq!(codes(&pdf(&objects)), [""; 0]);
     }
 }

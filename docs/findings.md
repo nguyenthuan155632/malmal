@@ -38,7 +38,7 @@ A scan that stopped at a limit has not cleared the file, so none of these is eve
 | `limit.decompression` | Medium | Compressed data inside the file expands past `Limits::max_decompressed`: a decompression bomb, or a limit set too low. |
 | `limit.depth` | Medium | Files are embedded in files deeper than `Limits::max_depth`. |
 | `limit.time` | Medium | The scan took longer than `Limits::max_duration`. |
-| `limit.complexity` | Medium | The structure costs far more to walk than the file's size justifies: more objects than one for every 16 bytes of a PDF (two million in any file), references that lead to more values than that, or streams that overlap so that reading them all is many times the file. |
+| `limit.complexity` | Medium | The structure costs far more to walk than the file's size justifies: more objects than one for every 16 bytes of a PDF (two million in any file), references that lead to more values than that, streams that overlap so that reading them all is many times the file, trailers or object streams that take more than eight times their size to read, or PostScript strings that never close and cannot be told apart from others that do not. |
 
 ## Raster images
 

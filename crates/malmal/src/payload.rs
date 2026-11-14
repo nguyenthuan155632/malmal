@@ -51,13 +51,15 @@ const NOT_AN_EXPRESSION_START: &[u8] = b"<>?=;)]},:/*%^|";
 const HALT_COMPILER: &[u8] = b"__halt_compiler";
 
 impl Tail {
-    fn accepts(self, rest: &[u8]) -> bool {
+    /// Whether what follows a pattern, from `at` in `data`, is this tail.
+    fn accepts(self, data: &[u8], at: usize, ahead: &mut Ahead) -> bool {
+        let rest = &data[at..];
         match self {
             Self::Any => true,
             Self::Whitespace => rest.first().is_none_or(u8::is_ascii_whitespace),
             Self::Directive => {
-                let text = leading_text(rest);
-                let Some(length) = find(text, b"%>") else {
+                let text = ahead.text(data, at);
+                let Some(length) = ahead.find(data, at, text.len(), b"%>") else {
                     return false;
                 };
                 let directive = text[..length].trim_ascii_start();
@@ -72,11 +74,11 @@ impl Tail {
                     && is_balanced(directive)
             }
             Self::Code(close) => {
-                let text = leading_text(rest);
+                let text = ahead.text(data, at);
                 let text_len = text.len();
                 let closed = [close, HALT_COMPILER]
                     .iter()
-                    .filter_map(|end| find(text, end))
+                    .filter_map(|end| ahead.find(data, at, text_len, end))
                     .min();
                 let code = match closed {
                     Some(length) => &text[..length],
@@ -93,14 +95,58 @@ impl Tail {
     }
 }
 
-/// The printable ASCII that `rest` starts with, up to a fixed window.
-fn leading_text(rest: &[u8]) -> &[u8] {
-    let window = &rest[..rest.len().min(CODE_TAIL_WINDOW)];
-    let length = window
-        .iter()
-        .position(|b| !(b.is_ascii_graphic() || b.is_ascii_whitespace()))
-        .unwrap_or(window.len());
-    &window[..length]
+/// What the tails of the patterns found so far have looked ahead at, for
+/// the patterns after them, which come later in the file. A tail reads up
+/// to [`CODE_TAIL_WINDOW`] bytes; a file made of patterns, a few bytes
+/// apart, would have each of its bytes read for each pattern before it.
+#[derive(Default)]
+struct Ahead {
+    /// A run of printable text: where it was read from, and where it ends.
+    text: (usize, usize),
+    /// The next of each closing sequence from where it was last looked
+    /// for, `usize::MAX` for none: (sequence, from, at).
+    found: Vec<(&'static [u8], usize, usize)>,
+}
+
+impl Ahead {
+    /// The printable ASCII that `data` has from `at` on, up to a fixed
+    /// window.
+    fn text<'d>(&mut self, data: &'d [u8], at: usize) -> &'d [u8] {
+        let (from, end) = self.text;
+        if !(from <= at && at <= end && end > 0) {
+            let length = data[at..]
+                .iter()
+                .position(|b| !(b.is_ascii_graphic() || b.is_ascii_whitespace()))
+                .unwrap_or(data.len() - at);
+            self.text = (at, at + length);
+        }
+        &data[at..self.text.1.min(at + CODE_TAIL_WINDOW)]
+    }
+
+    /// Where `needle` first stands in the `length` bytes from `at`, all of
+    /// it inside them.
+    fn find(
+        &mut self,
+        data: &[u8],
+        at: usize,
+        length: usize,
+        needle: &'static [u8],
+    ) -> Option<usize> {
+        let entry = match self.found.iter().position(|(known, ..)| *known == needle) {
+            Some(index) => &mut self.found[index],
+            None => {
+                self.found.push((needle, usize::MAX, usize::MAX));
+                self.found.last_mut().expect("just pushed")
+            }
+        };
+        let (_, from, next) = entry;
+        if *from > at || (*next != usize::MAX && *next < at) {
+            *from = at;
+            *next = find(&data[at..], needle).map_or(usize::MAX, |found| at + found);
+        }
+        let found = next.checked_sub(at)?;
+        (*next != usize::MAX && found + needle.len() <= length).then_some(found)
+    }
 }
 
 /// Whether every bracket and quote in `code` is closed in order, as it is
@@ -213,6 +259,7 @@ const PATTERNS: &[Pattern] = &[
 /// Earliest hit of each payload kind present in `data`, ordered by offset.
 pub fn scan(data: &[u8], scope: Scope) -> Vec<PayloadHit> {
     let mut hits: Vec<PayloadHit> = Vec::new();
+    let mut ahead = Ahead::default();
     // Every pattern starts with one of these bytes; anything else is skipped
     // at memchr speed.
     for offset in memchr::memchr3_iter(b'<', b'j', b'J', data) {
@@ -227,7 +274,11 @@ pub fn scan(data: &[u8], scope: Scope) -> Vec<PayloadHit> {
             let matches = rest
                 .get(..pattern.bytes.len())
                 .is_some_and(|head| head.eq_ignore_ascii_case(pattern.bytes));
-            if matches && pattern.tail.accepts(&rest[pattern.bytes.len()..]) {
+            if matches
+                && pattern
+                    .tail
+                    .accepts(data, offset + pattern.bytes.len(), &mut ahead)
+            {
                 hits.push(PayloadHit {
                     kind: pattern.kind,
                     offset,
@@ -356,5 +407,30 @@ mod tests {
     fn clean_data_has_no_hits() {
         assert!(scan(b"", Scope::Binary).is_empty());
         assert!(scan(b"just a caption < 3", Scope::Binary).is_empty());
+    }
+
+    #[test]
+    fn tails_close_together_are_read_once() {
+        let started = std::time::Instant::now();
+        let mut data = b"<?=a(".repeat(400_000);
+        assert_eq!(kinds(&data, Scope::Binary), []);
+        // What follows the last one is still a tag.
+        data.extend_from_slice(b"\x00<?= system($x) ?>");
+        assert_eq!(kinds(&data, Scope::Binary), [PayloadKind::Php]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+
+        // A closing sequence past the printable run, or one that only
+        // starts inside it, is not the tag's.
+        assert_eq!(kinds(b"<%= run($x) \x00 %>", Scope::Binary), []);
+        assert_eq!(
+            kinds(b"<%= run($x) %", Scope::Binary),
+            [PayloadKind::Template]
+        );
+        // The second tag is closed by a sequence after the first one's.
+        assert_eq!(
+            kinds(b"<?= $ab ?><?= run() ?>", Scope::Binary),
+            [PayloadKind::Php]
+        );
+        assert_eq!(kinds(b"<?= $ab ?><?= $cd ?>", Scope::Binary), []);
     }
 }

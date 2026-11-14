@@ -130,7 +130,7 @@ pub(crate) fn run(
             .iter()
             .map(|(_, kind)| *kind != Kind::Predicted)
             .collect(),
-        failed: Cell::new(None),
+        over: Cell::new(None),
     };
     let mut source = Input::Slice(input);
     for (index, (decoder, kind)) in stages.into_iter().enumerate() {
@@ -158,8 +158,12 @@ pub(crate) fn run(
             Err(error) => break Err(error),
         }
     };
+    // What a stage produced before it failed was decoded all the same, and
+    // counts: a file of streams that fail at their last byte was otherwise
+    // decoded without end, and clean. One that went over the limit is not
+    // counted, as when it was decoded whole; the file is not clean.
     (
-        meter.before(meter.failed.get().unwrap_or(usize::MAX)),
+        meter.before(meter.over.get().unwrap_or(usize::MAX)),
         outcome,
     )
 }
@@ -179,8 +183,8 @@ struct Meter {
     limit: u64,
     produced: Vec<Cell<u64>>,
     counted: Vec<bool>,
-    /// The stage whose failure ended the chain.
-    failed: Cell<Option<usize>>,
+    /// The stage that went over the limit, if one did.
+    over: Cell<Option<usize>>,
 }
 
 impl Meter {
@@ -306,8 +310,8 @@ impl Stage<'_> {
             _ if self.meter.over(self.index) => Err(DecodeError::Limit),
             ended => ended,
         };
-        if ended.is_err() {
-            self.meter.failed.set(Some(self.index));
+        if ended == Err(DecodeError::Limit) {
+            self.meter.over.set(Some(self.index));
         }
         ended
     }
@@ -1136,6 +1140,45 @@ mod tests {
     }
 
     #[test]
+    fn what_a_failed_filter_produced_is_counted() {
+        // Rows of the Up predictor, the last with a tag that is none.
+        let mut rows = [2, 0, 0, 0].repeat(1000);
+        rows.extend_from_slice(&[9, 0, 0, 0]);
+        let compressed = compress_to_vec_zlib(&rows, 6);
+        let params = Params {
+            predictor: 12,
+            columns: 3,
+            ..Params::default()
+        };
+        let steps = [Step {
+            filter: b"FlateDecode",
+            params,
+        }];
+        let mut out = 0;
+        let (used, outcome) = run(&steps, &compressed, 1 << 20, &mut |b| out += b.len());
+        assert_eq!(outcome, Err(DecodeError::Corrupt));
+        assert!(used >= out as u64 && used >= 3000, "{used} {out}");
+        // And so is a later filter's that fails on what the first produced.
+        // Runs of 128 bytes, then a literal cut short.
+        let mut runs = [129, b'x'].repeat(50);
+        runs.extend_from_slice(&[5, b'a']);
+        let steps = [
+            Step {
+                filter: b"FlateDecode",
+                params: Params::default(),
+            },
+            Step {
+                filter: b"RunLengthDecode",
+                params: Params::default(),
+            },
+        ];
+        let compressed = compress_to_vec_zlib(&runs, 6);
+        let (used, outcome) = run(&steps, &compressed, 1 << 20, &mut |_| {});
+        assert_eq!(outcome, Err(DecodeError::Corrupt));
+        assert!(used >= 50 * 128, "{used}");
+    }
+
+    #[test]
     fn unknown_filters_are_unsupported() {
         assert_eq!(decode("JBIG2Decode", b""), Err(DecodeError::Unsupported));
         assert_eq!(decode("Crypt", b""), Err(DecodeError::Unsupported));
@@ -1346,12 +1389,21 @@ mod tests {
                 random.below(200) as u64,
                 0,
             ] {
-                assert_eq!(
-                    in_blocks(&steps, &data, limit),
-                    one_at_a_time(&steps, &data, limit),
+                let (used, outcome) = in_blocks(&steps, &data, limit);
+                let (expected_used, expected) = one_at_a_time(&steps, &data, limit);
+                let context = format!(
                     "round {round}: {names:?}, {} bytes, limit {limit}",
                     data.len()
                 );
+                assert_eq!(outcome, expected, "{context}");
+                // What a damaged filter produced before it gave out counts
+                // too, and decoded whole it is not seen.
+                match expected {
+                    Err(error) if error != DecodeError::Limit => {
+                        assert!(used >= expected_used, "{context}: {used} < {expected_used}")
+                    }
+                    _ => assert_eq!(used, expected_used, "{context}"),
+                }
             }
         }
     }

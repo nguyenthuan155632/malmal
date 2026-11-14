@@ -1,5 +1,7 @@
 //! Windows icons: a directory of images, each a PNG or a headerless bitmap.
 
+use std::collections::HashSet;
+
 use super::{Ctx, Layout, Malformed, le16, le32, png};
 
 const HEADER_LEN: usize = 6;
@@ -15,6 +17,11 @@ pub(crate) fn parse(data: &[u8], ctx: &mut Ctx<'_>) -> Result<Layout, Malformed>
 
     let mut end = directory_end;
     let mut largest = (0, 0);
+    // Entries may name one image many times over, or images that lie over
+    // one another: what is read of them is bounded by the file, as the
+    // images of an icon that does neither are.
+    let mut seen = HashSet::new();
+    let mut work = 0u64;
     for index in 0..count {
         let entry = HEADER_LEN + index * ENTRY_LEN;
         // The directory was bounds-checked above.
@@ -26,6 +33,13 @@ pub(crate) fn parse(data: &[u8], ctx: &mut Ctx<'_>) -> Result<Layout, Malformed>
             .and_then(|image_end| data.get(offset..image_end))
             .ok_or(Malformed::new(entry, "icon image is out of bounds"))?;
         end = end.max(offset + size);
+        if !seen.insert((offset, size)) {
+            continue;
+        }
+        work += size as u64;
+        if work > 2 * data.len() as u64 {
+            return Err(Malformed::new(entry, "icon images overlap"));
+        }
 
         let dimensions = if image.starts_with(PNG_SIGNATURE) {
             let layout = png::parse(image, ctx).map_err(|inner| Malformed {
@@ -138,5 +152,31 @@ mod tests {
         // A PNG image is held to the PNG rules.
         let png = ico(&[b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec()]);
         assert!(run(&png).is_err());
+    }
+
+    #[test]
+    fn one_image_named_many_times_is_read_once() {
+        let image = bitmap(16, 16);
+        let count = 1000;
+        let offset = HEADER_LEN + count * ENTRY_LEN;
+        let mut data = b"\0\0\x01\0".to_vec();
+        data.extend_from_slice(&(count as u16).to_le_bytes());
+        let entry = |size: usize| {
+            let mut entry = vec![16, 16, 0, 0, 1, 0, 32, 0];
+            entry.extend_from_slice(&(size as u32).to_le_bytes());
+            entry.extend_from_slice(&(offset as u32).to_le_bytes());
+            entry
+        };
+        let same = data.clone();
+        let mut same = [same, entry(image.len()).repeat(count), image.clone()].concat();
+        assert_eq!(run(&same).unwrap().dimensions, Some((16, 16)));
+
+        // Images that differ by a byte and lie over one another.
+        same.extend_from_slice(&[0; 1000]);
+        for index in 0..count {
+            let at = HEADER_LEN + index * ENTRY_LEN + 8;
+            same[at..at + 4].copy_from_slice(&((image.len() + index) as u32).to_le_bytes());
+        }
+        assert_eq!(run(&same).unwrap_err().reason, "icon images overlap");
     }
 }

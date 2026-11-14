@@ -9,13 +9,15 @@
 //! sections and inside declared data sections, and code that is decoded at
 //! run time is reported as such instead of being called clean.
 
+use std::collections::{BTreeMap, VecDeque};
+
 use memchr::memmem;
 use sha2::{Digest, Sha256};
 
 use crate::detect::FileType;
 use crate::image;
 use crate::limits::{Budget, LimitExceeded, Limits};
-use crate::pdf::filters::{self, Params};
+use crate::pdf::filters::{self, DecodeError, Params};
 use crate::pdf::parser::{is_regular, is_whitespace};
 use crate::report::{Finding, Severity};
 
@@ -159,6 +161,8 @@ pub(crate) fn analyze(
         budget,
         findings,
         tokens: 0,
+        string_work: work_allowed(program.len()),
+        hash_work: work_allowed(program.len()),
     };
     let text = program.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(program);
     let text = text.trim_ascii_start();
@@ -224,6 +228,40 @@ struct Scanner<'a> {
     budget: &'a mut Budget,
     findings: &'a mut Vec<Finding>,
     tokens: usize,
+    /// Bytes that strings whose parenthesis never closes may still be read
+    /// for. Each is read up to [`MAX_STRING_SOURCE`] bytes before it is
+    /// known not to be one, and binary data can hold one at every byte.
+    string_work: u64,
+    /// Bytes of resource bodies that may still be hashed to be told from
+    /// [`KNOWN_PROCSETS`]. A resource opened inside another runs to the
+    /// same end, and is hashed again.
+    hash_work: u64,
+}
+
+/// What each of the works above is allowed for a program of `length` bytes:
+/// a few times the program, which no ordinary one comes near.
+fn work_allowed(length: usize) -> u64 {
+    length as u64 * 4 + (4 * MAX_STRING_SOURCE) as u64
+}
+
+/// Where the keywords that end a resource stand in a program, found once:
+/// looking for them from each resource is the square of a program that
+/// opens many and closes none.
+#[derive(Default)]
+struct ResourceEnds(Option<Vec<usize>>);
+
+impl ResourceEnds {
+    /// The first end at or after `from`.
+    fn after(&mut self, data: &[u8], from: usize) -> Option<usize> {
+        let ends = self.0.get_or_insert_with(|| {
+            let mut ends: Vec<usize> = memmem::find_iter(data, b"%%EndResource")
+                .chain(memmem::find_iter(data, b"%%EndProcSet"))
+                .collect();
+            ends.sort_unstable();
+            ends
+        });
+        ends.get(ends.partition_point(|&end| end < from)).copied()
+    }
 }
 
 /// The two most recent tokens, as decoded strings when they were strings.
@@ -291,6 +329,8 @@ impl Scanner<'_> {
         let mut previous_name: &[u8] = b"";
         let mut no_a85_terminator = false;
         let mut inline_data = InlineData::default();
+        let mut resource_ends = ResourceEnds::default();
+        let mut parens = Parens::default();
         let mut pos = 0;
         while let Some(&byte) = data.get(pos) {
             self.tokens += 1;
@@ -312,9 +352,12 @@ impl Scanner<'_> {
                 b'%' => {
                     let line_end = pos + line_len(&data[pos..]);
                     let after_line = line_end + eol_len(&data[line_end..]);
-                    if let Some(length) =
-                        known_procset_len(&data[pos..line_end], &data[after_line..])
-                    {
+                    if let Some(length) = self.known_procset_len(
+                        &data[pos..line_end],
+                        data,
+                        after_line,
+                        &mut resource_ends,
+                    ) {
                         recent = [None, None];
                         pos = after_line + length;
                         continue;
@@ -334,7 +377,7 @@ impl Scanner<'_> {
                     };
                     continue;
                 }
-                b'(' => match literal_string(&data[pos..]) {
+                b'(' => match self.literal_string(data, pos, &mut parens) {
                     Some((decoded, length)) => {
                         pos += length;
                         string = Some(decoded);
@@ -353,14 +396,25 @@ impl Scanner<'_> {
                         Some(length) => {
                             let end = 2 + length;
                             let encoded = &data[pos + 2..pos + end];
-                            let decoded = filters::apply(
-                                b"ASCII85Decode",
-                                encoded,
-                                &Params::default(),
-                                usize::MAX,
-                            );
+                            // `z` stands for four bytes, so what comes out
+                            // can be more than what went in.
+                            let left =
+                                usize::try_from(self.budget.remaining()).unwrap_or(usize::MAX);
+                            let decoded =
+                                filters::apply(b"ASCII85Decode", encoded, &Params::default(), left);
                             pos += end + 2;
-                            string = Some(decoded.unwrap_or_default());
+                            string = Some(match decoded {
+                                Ok(decoded) => {
+                                    let _ = self.budget.consume(decoded.len() as u64);
+                                    decoded
+                                }
+                                Err(DecodeError::Limit) => {
+                                    let _ = self.budget.consume(u64::MAX);
+                                    self.limit_exceeded(LimitExceeded::Decompression);
+                                    Vec::new()
+                                }
+                                Err(_) => Vec::new(),
+                            });
                         }
                         None => {
                             no_a85_terminator = true;
@@ -522,7 +576,9 @@ impl Scanner<'_> {
     fn eexec(&mut self, rest: &[u8], base: usize) -> usize {
         let start = rest.len() - rest.trim_ascii_start().len();
         let body = &rest[start..];
-        let length = memmem::find(body, b"cleartomark")
+        // Nothing past the longest section read is looked through for its end.
+        let reach = body.len().min(MAX_EEXEC + b"cleartomark".len());
+        let length = memmem::find(&body[..reach], b"cleartomark")
             .unwrap_or(body.len())
             .min(MAX_EEXEC);
         let section = &body[..length];
@@ -555,9 +611,126 @@ impl Scanner<'_> {
         start + length
     }
 
+    /// Length of the resource that a `%%BeginResource:` or `%%BeginProcSet:`
+    /// comment opens, when it is one of [`KNOWN_PROCSETS`]; its body starts
+    /// at `start` in `data`. One left unhashed is analyzed as code.
+    fn known_procset_len(
+        &mut self,
+        comment: &[u8],
+        data: &[u8],
+        start: usize,
+        ends: &mut ResourceEnds,
+    ) -> Option<usize> {
+        if !(comment.starts_with(b"%%BeginResource:") || comment.starts_with(b"%%BeginProcSet:")) {
+            return None;
+        }
+        let length = ends.after(data, start)? - start;
+        self.hash_work = self.hash_work.checked_sub(length as u64)?;
+        is_known_procset(&data[start..start + length]).then_some(length)
+    }
+
+    /// The literal string at `at` in `data`, as [`literal_string`] reads
+    /// it. One that `parens` knows not to close is not read again. One it
+    /// knows nothing of is read while there is work left for strings that
+    /// do not close; when there is none, no such string is read any more:
+    /// the parentheses are stepped over and what is between them read as
+    /// code, and the program is not analyzed completely.
+    fn literal_string(
+        &mut self,
+        data: &[u8],
+        at: usize,
+        parens: &mut Parens,
+    ) -> Option<(Vec<u8>, usize)> {
+        let known = parens.closes(data, at);
+        if known == Some(false) {
+            return None;
+        }
+        let source = &data[at..];
+        let reach = source.len().min(MAX_STRING_SOURCE) as u64;
+        if known.is_none() && self.string_work < reach {
+            self.limit_exceeded(LimitExceeded::Complexity);
+            return None;
+        }
+        let found = literal_string(source);
+        if found.is_none() {
+            self.string_work = self.string_work.saturating_sub(reach);
+            parens.start(at);
+        }
+        found
+    }
+
     fn limit_exceeded(&mut self, limit: LimitExceeded) {
         if !self.findings.iter().any(|f| f.code == limit.code()) {
             self.findings.push(limit.finding());
+        }
+    }
+}
+
+/// Where the parentheses of a program close, found in one pass that starts
+/// at the first string that does not. Image data in ASCII85 is made of the
+/// characters of strings, parentheses among them, and holds hundreds of
+/// strings that never close; each would be read to the end of the program.
+/// A string that starts where the pass saw a parenthesis open is read from
+/// there as the pass read it, so the pass tells whether it closes.
+#[derive(Default)]
+struct Parens {
+    /// Where the pass started; nothing is known before a string fails.
+    from: Option<usize>,
+    /// How far it has read.
+    pos: usize,
+    /// Parentheses not closed yet that opened before the string last asked
+    /// about: no string will start there, so only their number is kept.
+    earlier: usize,
+    /// Where the others not closed yet opened, in order.
+    open: VecDeque<usize>,
+    /// Where the closed ones closed, from the string last asked about on.
+    closed: BTreeMap<usize, usize>,
+}
+
+impl Parens {
+    /// Start the pass at `at`, unless it has started already.
+    fn start(&mut self, at: usize) {
+        if self.from.is_none() {
+            self.from = Some(at);
+            self.pos = at;
+        }
+    }
+
+    /// Whether the string at `at` closes within [`MAX_STRING_SOURCE`]
+    /// bytes, as [`literal_string`] reads it; `None` when the pass does not
+    /// know, because it did not see a parenthesis open there.
+    fn closes(&mut self, data: &[u8], at: usize) -> Option<bool> {
+        if self.from.is_none_or(|from| at < from) {
+            return None;
+        }
+        // Strings are asked about in order; what lies before this one is
+        // kept no longer than the pass is ahead, and that is bounded.
+        while self.open.front().is_some_and(|&opened| opened < at) {
+            self.open.pop_front();
+            self.earlier += 1;
+        }
+        self.closed = self.closed.split_off(&at);
+        let reach = data.len().min(at + MAX_STRING_SOURCE);
+        while self.pos < reach && !self.closed.contains_key(&at) {
+            let byte = data[self.pos];
+            self.pos += 1;
+            match byte {
+                b'(' => self.open.push_back(self.pos - 1),
+                b')' => match self.open.pop_back() {
+                    Some(opened) => {
+                        self.closed.insert(opened, self.pos - 1);
+                    }
+                    None => self.earlier = self.earlier.saturating_sub(1),
+                },
+                // What an escape takes beyond the next byte is digits or a
+                // line end, never a parenthesis.
+                b'\\' => self.pos += 1,
+                _ => {}
+            }
+        }
+        match self.closed.get(&at) {
+            Some(&end) => Some(end < at + MAX_STRING_SOURCE),
+            None => self.open.binary_search(&at).is_ok().then_some(false),
         }
     }
 }
@@ -630,19 +803,10 @@ fn follows_a85_lines(before: &[u8]) -> bool {
     false
 }
 
-/// Length of the resource that a `%%BeginResource:` or `%%BeginProcSet:`
-/// comment opens, when it is one of [`KNOWN_PROCSETS`].
-fn known_procset_len(comment: &[u8], following: &[u8]) -> Option<usize> {
-    if !(comment.starts_with(b"%%BeginResource:") || comment.starts_with(b"%%BeginProcSet:")) {
-        return None;
-    }
-    let ends = [b"%%EndResource".as_slice(), b"%%EndProcSet"];
-    let length = ends
-        .iter()
-        .filter_map(|end| memmem::find(following, end))
-        .min()?;
+/// Whether `body` hashes to one of [`KNOWN_PROCSETS`].
+fn is_known_procset(body: &[u8]) -> bool {
+    let mut body = body;
     let mut hasher = Sha256::new();
-    let mut body = &following[..length];
     while !body.is_empty() {
         let (line, rest) = body.split_at(line_len(body));
         hasher.update(line);
@@ -657,7 +821,7 @@ fn known_procset_len(comment: &[u8], following: &[u8]) -> Option<usize> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    KNOWN_PROCSETS.contains(&digest.as_str()).then_some(length)
+    KNOWN_PROCSETS.contains(&digest.as_str())
 }
 
 fn name_len(data: &[u8]) -> usize {
@@ -889,10 +1053,69 @@ mod tests {
         let body = "%%BeginResource: procset Adobe_AGM_Utils 1.0 0\n\
                     {(AGMUTIL_imagefile)(w+)file}stopped pop\n%%EndResource";
         assert_eq!(codes(body), ["ps.file_access"]);
-        assert_eq!(
-            known_procset_len(b"%%BeginResource: procset x", b"a\r\nb\n%%EndResource"),
-            None
+        assert!(!is_known_procset(b"a\r\nb\n"));
+    }
+
+    #[test]
+    fn resources_and_strings_that_never_end_cost_what_the_file_does() {
+        // Every comment opens a resource that one keyword at the end closes,
+        // and every parenthesis a string that never does.
+        let resources = format!(
+            "{}%%EndResource\nfile",
+            "%%BeginResource: procset x\n".repeat(20_000)
         );
+        let started = std::time::Instant::now();
+        assert_eq!(codes(&resources), ["ps.file_access"]);
+        assert_eq!(codes(&"(".repeat(400_000)), NONE);
+        // Strings that start where the others read an escape are not known
+        // to them, and are read each on its own.
+        assert_eq!(codes(&"\\(".repeat(200_000)), ["limit.complexity"]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn strings_in_image_data_that_never_close_are_read_once() {
+        // ASCII85 holds parentheses that open more often than they close,
+        // with code after it that has to be seen.
+        let mut data = String::new();
+        for i in 0..3000 {
+            data.push_str(if i % 3 == 0 {
+                "s4(IA0!\"_al8(O`[\n"
+            } else {
+                "s4IA0)!\"_(al8O`[\n"
+            });
+        }
+        let body = format!("currentfile /ASCII85Decode filter\n{data}~>\n(/etc/passwd) (r) file");
+        assert_eq!(codes(&body), ["ps.file_access"]);
+        // Each closes or does not, as when it was read on its own.
+        let mut parens = Parens::default();
+        let program = b"(a (b) (c\\) d) ((e) (f";
+        parens.start(0);
+        for (at, _) in program.iter().enumerate().filter(|(_, b)| **b == b'(') {
+            let alone = literal_string(&program[at..]).is_some();
+            assert_eq!(parens.closes(program, at), Some(alone), "at {at}");
+        }
+    }
+
+    #[test]
+    fn ascii85_strings_count_against_the_decompression_limit() {
+        let limits = Limits {
+            max_decompressed: 1000,
+            ..Limits::default()
+        };
+        let scan = |program: &[u8]| {
+            let mut budget = Budget::new(&limits);
+            let mut findings = Vec::new();
+            analyze(program, &limits, &mut budget, &mut findings);
+            findings.iter().map(|f| f.code).collect::<Vec<_>>()
+        };
+        // Each `z` is four bytes: 1200 of them, in one string or in several.
+        let one = format!("%!PS\n<~{}~> pop\n", "z".repeat(300));
+        assert_eq!(scan(one.as_bytes()), ["limit.decompression"]);
+        let many = format!("%!PS\n{}", "<~zzzzzzzzzz~> pop\n".repeat(30));
+        assert_eq!(scan(many.as_bytes()), ["limit.decompression"]);
+        let few = format!("%!PS\n{}", "<~zzzzzzzzzz~> pop\n".repeat(20));
+        assert!(scan(few.as_bytes()).is_empty());
     }
 
     #[test]

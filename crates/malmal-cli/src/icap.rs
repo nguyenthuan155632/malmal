@@ -17,11 +17,16 @@
 //! response to put in its place, and the finding in `X-Infection-Found`.
 
 use std::io::{self, BufRead, Read, Write};
+use std::time::Duration;
 
 use malmal::{ScanHints, Verdict};
+use memchr::memmem;
 
-use crate::input::Incoming;
-use crate::serve::{Line, MAX_HEADER_LEN, Service, percent_decode, read_line, signature};
+use crate::input::{Incoming, is_refused};
+use crate::serve::{
+    Line, MAX_HEADER_LEN, NO_ROOM, Pace, Service, next_request, percent_decode, read_line,
+    signature,
+};
 
 /// Longest encapsulated HTTP header section.
 const MAX_ENCAPSULATED: usize = 64 << 10;
@@ -38,10 +43,10 @@ fn ascii_prefix<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
         .then(|| &text[prefix.len()..])
 }
 
+/// In time that follows the length of `haystack`, however long and however
+/// repetitive `needle` is: a boundary is the client's to choose.
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    memmem::find(haystack, needle)
 }
 
 /// Value of the parameter `name` in a header value such as
@@ -130,6 +135,8 @@ enum Chunks {
         read_to_end: bool,
     },
     Malformed,
+    /// The body found no room to be held in.
+    Refused,
 }
 
 /// Append chunks to `body` up to the terminating one. Past `limit` bytes
@@ -177,7 +184,10 @@ fn read_chunks(
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
         } else {
-            body.read_from(reader, size)?;
+            match body.read_from(reader, size) {
+                Err(error) if is_refused(&error) => return Ok(Chunks::Refused),
+                read => read?,
+            }
         }
         if !matches!(read_line(reader, MAX_CHUNK_LINE)?, Line::Text(line) if line.is_empty()) {
             return Ok(Chunks::Malformed);
@@ -239,13 +249,24 @@ enum Blocked {
 }
 
 /// Scan the files `body` carries. `Ok` when every one of them is clean.
+///
+/// The files of one form share the time one scan may take: once their scans
+/// have taken that long, the files left are not scanned and the form does
+/// not pass. A form of many files cannot then hold a worker for as many
+/// times that limit.
 fn judge(service: &Service, request: bool, headers: &str, body: &[u8]) -> Result<(), Blocked> {
-    let scan = |data: &[u8], filename: Option<&str>, content_type: Option<&str>| {
+    let mut spent = Duration::ZERO;
+    let mut scan = |data: &[u8], filename: Option<&str>, content_type: Option<&str>| {
+        if spent > service.max_duration() {
+            return Err(Blocked::NotScanned("the files took too long to scan"));
+        }
         let hints = ScanHints {
             filename,
             content_type,
         };
-        match service.scan(data, hints) {
+        let (report, took) = service.timed_scan(data, hints);
+        spent += took;
+        match report {
             Some(report) if report.verdict == Verdict::Clean => Ok(()),
             Some(report) => Err(Blocked::Threat(signature(&report))),
             None => Err(Blocked::NotScanned("internal error while scanning")),
@@ -376,14 +397,14 @@ fn block(writer: impl Write, reason: &Blocked) -> io::Result<()> {
 /// Serve `OPTIONS`, `REQMOD` and `RESPMOD` on one connection, which may
 /// carry any number of requests. The service path is not looked at.
 pub fn icap(
-    reader: &mut impl BufRead,
+    reader: &mut (impl BufRead + Pace),
     mut writer: impl Write,
     service: &Service,
 ) -> io::Result<()> {
     loop {
-        let Some(_turn) = service.turn(reader)? else {
+        if !next_request(reader)? {
             return Ok(());
-        };
+        }
         let refuse = |writer, status: &str| {
             service.metrics().reject();
             Reply::status(status).write(writer)
@@ -462,6 +483,12 @@ pub fn icap(
                     return Ok(());
                 }
                 Chunks::Malformed => return refuse(writer, "400 Bad Request"),
+                // A proxy may let a message through on an ICAP error; this
+                // one is blocked instead. The rest of it is not read.
+                Chunks::Refused => {
+                    service.metrics().reject();
+                    return block(&mut writer, &Blocked::NotScanned(NO_ROOM));
+                }
             }
         }
 
@@ -681,6 +708,50 @@ mod tests {
         }
         let reply = blocked(&upload(ALLOW, "multipart/form-data", &form(&[])));
         assert!(reply.contains("X-Block-Reason"));
+    }
+
+    #[test]
+    fn the_files_of_a_form_share_one_scan_time() {
+        let limits = malmal::Limits {
+            max_duration: Duration::ZERO,
+            ..malmal::Limits::default()
+        };
+        let hurried = Service::new(Scanner::builder().limits(limits).build());
+        let reply = run(&hurried, &upload(ALLOW, FORM, &form(&[("a.gif", GIF)])));
+        assert!(reply.starts_with("ICAP/1.0 204"), "{reply}");
+        let reply = run(
+            &hurried,
+            &upload(ALLOW, FORM, &form(&[("a.gif", GIF), ("b.gif", GIF)])),
+        );
+        assert!(
+            reply.contains("X-Block-Reason: the files took too long to scan"),
+            "{reply}"
+        );
+    }
+
+    #[test]
+    fn boundaries_cost_what_the_body_does() {
+        // A boundary that matches the body almost everywhere, for as long as
+        // it is.
+        let boundary = format!("{}b", "-".repeat(20_000));
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let body = vec![b'-'; 2 << 20];
+        let started = std::time::Instant::now();
+        let reply = run(&service(), &upload(ALLOW, &content_type, &body));
+        assert!(reply.contains("malformed multipart body"), "{reply}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn files_with_no_room_are_blocked() {
+        let reserve = crate::input::Reserve::new(8, Duration::from_millis(50));
+        let service = service().holding(reserve);
+        let reply = run(&service, &upload(ALLOW, "image/gif", GIF));
+        assert!(reply.contains("HTTP/1.1 403 Forbidden"), "{reply}");
+        assert!(
+            reply.contains("X-Block-Reason: no room for the file"),
+            "{reply}"
+        );
     }
 
     #[test]

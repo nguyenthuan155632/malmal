@@ -8,13 +8,19 @@
 //! end.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, BufWriter, Read, Seek, Write};
 use std::ops::Deref;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 /// Below this a copy costs less than a mapping.
-const MAP_FROM: u64 = 1 << 20;
+pub const MAP_FROM: u64 = 1 << 20;
+/// What a body takes of the [`Reserve`] at a time, as it arrives.
+const PIECE: u64 = 256 << 10;
+/// Writes to the spool are gathered up to this; a client that sends its
+/// file a byte at a time would otherwise cost a system call a byte.
+const SPOOL_BUFFER: usize = 64 << 10;
 
 pub enum Input {
     Mapped(memmap2::Mmap),
@@ -128,20 +134,193 @@ fn unnamed(dir: &Path, index: usize) -> io::Result<File> {
     Ok(file)
 }
 
+/// Bytes of request bodies that may be held at once, as they arrive and
+/// while they are scanned, in memory or in the spool. A body takes its share
+/// a piece at a time as it arrives, so a client holds no more than it has
+/// sent, however much it said it would.
+///
+/// A body that finds no room waits for it, for as long as a connection may
+/// stay idle. Bodies that are all still arriving and all waiting would wait
+/// for each other: then the one that started last gives up its share and
+/// is refused, and the others go on.
+#[derive(Debug)]
+pub struct Reserve {
+    state: Mutex<Shares>,
+    changed: Condvar,
+    total: u64,
+    patience: Duration,
+}
+
+#[derive(Debug, Default)]
+struct Shares {
+    free: u64,
+    next: u64,
+    /// Bodies that hold some of the reserve and are still arriving, and are
+    /// not waiting for more.
+    arriving: usize,
+    /// Bodies that have arrived and hold some of the reserve: it comes back
+    /// when their scan is over.
+    arrived: usize,
+    /// Bodies waiting for room, and whether they hold some already.
+    waiting: Vec<(u64, bool)>,
+}
+
+impl Reserve {
+    pub fn new(total: u64, patience: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(Shares {
+                free: total,
+                ..Shares::default()
+            }),
+            changed: Condvar::new(),
+            total,
+            patience,
+        })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Shares> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn share(self: &Arc<Self>) -> Share {
+        let mut state = self.lock();
+        state.next += 1;
+        Share {
+            reserve: Arc::clone(self),
+            id: state.next,
+            held: 0,
+            arrived: false,
+        }
+    }
+}
+
+/// What one body holds of a [`Reserve`]; dropping it gives that back.
+#[derive(Debug)]
+struct Share {
+    reserve: Arc<Reserve>,
+    id: u64,
+    held: u64,
+    arrived: bool,
+}
+
+/// The error a body that finds no room ends with; see [`is_refused`].
+fn no_room() -> io::Error {
+    io::Error::new(io::ErrorKind::OutOfMemory, "no room for the file")
+}
+
+/// Whether `error` says that a body could not be held, as opposed to the
+/// connection failing: the client is told so before the connection ends.
+pub fn is_refused(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::OutOfMemory
+}
+
+impl Share {
+    /// Take `count` more bytes of the reserve, waiting for them if need be.
+    fn grow(&mut self, count: u64) -> io::Result<()> {
+        let reserve = Arc::clone(&self.reserve);
+        if count > reserve.total {
+            return Err(no_room());
+        }
+        let deadline = Instant::now() + reserve.patience;
+        let mut state = reserve.lock();
+        let mut waiting = false;
+        let outcome = loop {
+            if state.free >= count {
+                break Ok(());
+            }
+            if !waiting {
+                waiting = true;
+                if self.held > 0 {
+                    state.arriving -= 1;
+                }
+                state.waiting.push((self.id, self.held > 0));
+                // Those already waiting look again: this may be a deadlock.
+                reserve.changed.notify_all();
+            }
+            // Nothing will come back to the reserve while every body that
+            // holds some of it waits for more: the latest of them gives up.
+            let stuck = state.arriving == 0 && state.arrived == 0;
+            let latest = state
+                .waiting
+                .iter()
+                .filter(|(_, holds)| *holds)
+                .map(|(id, _)| *id)
+                .max();
+            if stuck && latest == Some(self.id) {
+                break Err(no_room());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break Err(no_room());
+            }
+            state = reserve
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        };
+        if waiting {
+            state.waiting.retain(|(id, _)| *id != self.id);
+            if self.held > 0 {
+                state.arriving += 1;
+            }
+        }
+        if outcome.is_ok() {
+            state.free -= count;
+            if self.held == 0 {
+                state.arriving += 1;
+            }
+            self.held += count;
+        }
+        outcome
+    }
+
+    /// The body has arrived; what it holds comes back when it is dropped.
+    fn arrive(&mut self) {
+        if self.held > 0 && !self.arrived {
+            let mut state = self.reserve.lock();
+            state.arriving -= 1;
+            state.arrived += 1;
+            self.reserve.changed.notify_all();
+        }
+        self.arrived = true;
+    }
+}
+
+impl Drop for Share {
+    fn drop(&mut self) {
+        if self.held == 0 {
+            return;
+        }
+        let mut state = self.reserve.lock();
+        state.free += self.held;
+        if self.arrived {
+            state.arrived -= 1;
+        } else {
+            state.arriving -= 1;
+        }
+        self.reserve.changed.notify_all();
+    }
+}
+
 /// A request body as it arrives: in memory while it is small, and in a file
 /// of the spool from [`MAP_FROM`] bytes on, if there is a spool.
 #[derive(Debug)]
 pub struct Incoming<'s> {
     spool: Option<&'s Arc<Spool>>,
+    share: Option<Share>,
     memory: Vec<u8>,
     spooled: Option<Spooled>,
     length: u64,
 }
 
 impl<'s> Incoming<'s> {
-    pub fn new(spool: Option<&'s Arc<Spool>>) -> Self {
+    /// A body to keep in `spool` once it is large, holding its share of
+    /// `reserve` as it arrives.
+    pub fn new(spool: Option<&'s Arc<Spool>>, reserve: Option<&Arc<Reserve>>) -> Self {
         Self {
             spool,
+            share: reserve.map(Reserve::share),
             memory: Vec::new(),
             spooled: None,
             length: 0,
@@ -157,14 +336,36 @@ impl<'s> Incoming<'s> {
     }
 
     /// Append the next `count` bytes of `reader`, all of them or none: a
-    /// reader that ends before is an error.
+    /// reader that ends before is an error, and so is a body that finds no
+    /// room in the reserve.
     pub fn read_from(&mut self, reader: &mut impl Read, count: u64) -> io::Result<()> {
+        // A body in memory gets its size and no more, in memory that is not
+        // touched until it is read into.
+        let spooling = self.spooled.is_some()
+            || self.spool.is_some() && self.length.saturating_add(count) >= MAP_FROM;
+        if !spooling && let Ok(count) = usize::try_from(count) {
+            self.memory.reserve_exact(count);
+        }
+        let mut left = count;
+        while left > 0 {
+            let piece = left.min(PIECE);
+            if let Some(share) = &mut self.share {
+                share.grow(piece)?;
+            }
+            self.read_piece(reader, piece)?;
+            left -= piece;
+        }
+        Ok(())
+    }
+
+    fn read_piece(&mut self, reader: &mut impl Read, count: u64) -> io::Result<()> {
         let total = self.length.saturating_add(count);
         if self.spooled.is_none() && total >= MAP_FROM {
             // No file to be had means more requests at once than the spool
             // was opened for; the body stays in memory as it would have.
             let file = self.spool.and_then(|spool| Some((spool, spool.take()?)));
-            if let Some((spool, mut file)) = file {
+            if let Some((spool, file)) = file {
+                let mut file = BufWriter::with_capacity(SPOOL_BUFFER, file);
                 let moved = file.write_all(&self.memory);
                 self.spooled = Some(Spooled {
                     map: None,
@@ -186,16 +387,9 @@ impl<'s> Incoming<'s> {
                 }
             }
             None => {
-                let count = usize::try_from(count).map_err(|_| io::ErrorKind::OutOfMemory)?;
+                let count = usize::try_from(count).map_err(|_| no_room())?;
                 let start = self.memory.len();
-                if start == 0 {
-                    // A body that comes in one piece gets its size and no
-                    // more, in memory that is not touched until it is read
-                    // into.
-                    self.memory = vec![0; count];
-                } else {
-                    self.memory.resize(start + count, 0);
-                }
+                self.memory.resize(start + count, 0);
                 reader.read_exact(&mut self.memory[start..])?;
             }
         }
@@ -203,15 +397,24 @@ impl<'s> Incoming<'s> {
         Ok(())
     }
 
-    /// The whole body, to scan.
-    pub fn finish(self) -> io::Result<Body> {
+    /// The whole body, to scan. It keeps its share of the reserve until it
+    /// is dropped.
+    pub fn finish(mut self) -> io::Result<Body> {
+        if let Some(share) = &mut self.share {
+            share.arrive();
+        }
+        let held = Held {
+            kept: Kept::Memory(Vec::new()),
+            _share: self.share,
+        };
         let Some(mut spooled) = self.spooled else {
-            return Ok(Body::Memory(self.memory));
+            return Ok(held.with(Kept::Memory(self.memory)));
         };
-        let Some(file) = spooled.file.as_mut() else {
-            return Ok(Body::Memory(self.memory));
+        let Some(writer) = spooled.file.as_mut() else {
+            return Ok(held.with(Kept::Memory(self.memory)));
         };
-        file.flush()?;
+        writer.flush()?;
+        let file = writer.get_mut();
         // The file has no name and is this process's alone, which cuts it
         // short only once the mapping is gone.
         let mapped = usize::try_from(self.length)
@@ -220,14 +423,14 @@ impl<'s> Incoming<'s> {
         match mapped {
             Some(map) => {
                 spooled.map = Some(map);
-                Ok(Body::Spooled(spooled))
+                Ok(held.with(Kept::Spooled(spooled)))
             }
             // Where the file cannot be mapped it is read back.
             None => {
                 let mut memory = Vec::new();
                 file.rewind()?;
                 file.read_to_end(&mut memory)?;
-                Ok(Body::Memory(memory))
+                Ok(held.with(Kept::Memory(memory)))
             }
         }
     }
@@ -235,18 +438,41 @@ impl<'s> Incoming<'s> {
 
 /// A request body, whole.
 #[derive(Debug)]
-pub enum Body {
+pub struct Body(Held);
+
+#[derive(Debug)]
+struct Held {
+    kept: Kept,
+    _share: Option<Share>,
+}
+
+impl Held {
+    fn with(mut self, kept: Kept) -> Body {
+        self.kept = kept;
+        Body(self)
+    }
+}
+
+#[derive(Debug)]
+enum Kept {
     Memory(Vec<u8>),
     Spooled(Spooled),
+}
+
+impl Body {
+    /// Whether the body is in a file of the spool.
+    pub fn is_spooled(&self) -> bool {
+        matches!(self.0.kept, Kept::Spooled(_))
+    }
 }
 
 impl Deref for Body {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        match self {
-            Self::Memory(data) => data,
-            Self::Spooled(spooled) => spooled.map.as_deref().unwrap_or_default(),
+        match &self.0.kept {
+            Kept::Memory(data) => data,
+            Kept::Spooled(spooled) => spooled.map.as_deref().unwrap_or_default(),
         }
     }
 }
@@ -254,9 +480,9 @@ impl Deref for Body {
 /// A file of the spool with a body in it. Dropping it empties the file and
 /// gives it back: no body is on the disk for longer than its request.
 #[derive(Debug)]
-pub struct Spooled {
+struct Spooled {
     map: Option<memmap2::Mmap>,
-    file: Option<File>,
+    file: Option<BufWriter<File>>,
     spool: Arc<Spool>,
 }
 
@@ -264,7 +490,8 @@ impl Drop for Spooled {
     fn drop(&mut self) {
         // The mapping goes before the file is cut short under it.
         self.map = None;
-        if let Some(file) = self.file.take() {
+        // A file whose last writes cannot be made is closed, which empties it.
+        if let Some(Ok(file)) = self.file.take().map(BufWriter::into_inner) {
             self.spool.give(file);
         }
     }
@@ -284,17 +511,69 @@ mod tests {
     fn small_bodies_stay_in_memory() {
         let dir = scratch("small");
         let spool = Spool::open(&dir, 1).unwrap();
-        let mut incoming = Incoming::new(Some(&spool));
+        let mut incoming = Incoming::new(Some(&spool), None);
         incoming.read_from(&mut &b"abc"[..], 3).unwrap();
         incoming.read_from(&mut &b"defgh"[..], 2).unwrap();
         assert_eq!(incoming.len(), 5);
         let body = incoming.finish().unwrap();
-        assert!(matches!(body, Body::Memory(_)));
+        assert!(!body.is_spooled());
         assert_eq!(&*body, b"abcde");
         // A reader that ends early is an error, not a shorter body.
-        let mut short = Incoming::new(Some(&spool));
+        let mut short = Incoming::new(Some(&spool), None);
         assert!(short.read_from(&mut &b"abc"[..], 4).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bodies_wait_for_room_and_never_for_each_other() {
+        use std::thread;
+
+        let piece = PIECE as usize;
+        let data = vec![7; 2 * piece + 1];
+        let reserve = Reserve::new(2 * PIECE, Duration::from_secs(10));
+        let take = |reserve: &Arc<Reserve>, count: usize| {
+            let mut body = Incoming::new(None, Some(reserve));
+            body.read_from(&mut &data[..count], count as u64)
+                .map(|()| body)
+        };
+
+        // A body that fills the reserve keeps the next one waiting until
+        // its scan is over.
+        let first = take(&reserve, 2 * piece).unwrap().finish().unwrap();
+        let waiting = thread::scope(|scope| {
+            let next = scope.spawn(|| {
+                let started = Instant::now();
+                take(&reserve, piece).map(|_| started.elapsed())
+            });
+            thread::sleep(Duration::from_millis(200));
+            drop(first);
+            next.join().unwrap().unwrap()
+        });
+        assert!(waiting >= Duration::from_millis(150), "{waiting:?}");
+
+        // Two bodies still arriving that fill the reserve between them and
+        // each want more: the later one gives way at once.
+        let mut early = take(&reserve, piece).unwrap();
+        let mut late = take(&reserve, piece).unwrap();
+        thread::scope(|scope| {
+            let data = &data;
+            let early = scope.spawn(move || early.read_from(&mut &data[..piece], PIECE));
+            thread::sleep(Duration::from_millis(100));
+            let started = Instant::now();
+            let refused = late.read_from(&mut &data[..piece], PIECE).unwrap_err();
+            assert!(is_refused(&refused));
+            assert!(started.elapsed() < Duration::from_secs(5));
+            drop(late);
+            early.join().unwrap().unwrap();
+        });
+
+        // More than there is, or room that does not come back in time.
+        assert!(is_refused(&take(&reserve, 2 * piece + 1).unwrap_err()));
+        let patient = Reserve::new(PIECE, Duration::from_millis(100));
+        let kept = take(&patient, piece).unwrap().finish().unwrap();
+        assert!(is_refused(&take(&patient, 1).unwrap_err()));
+        drop(kept);
+        assert!(take(&patient, piece).is_ok());
     }
 
     #[test]
@@ -308,20 +587,20 @@ mod tests {
             .map(|i| (i % 251) as u8)
             .collect();
         for round in 0..3 {
-            let mut incoming = Incoming::new(Some(&spool));
+            let mut incoming = Incoming::new(Some(&spool), None);
             // In pieces, the first of them small.
             let mut reader = &data[..];
             for piece in [100, 70_000, data.len() as u64 - 70_100] {
                 incoming.read_from(&mut reader, piece).unwrap();
             }
             let body = incoming.finish().unwrap();
-            assert!(matches!(body, Body::Spooled(_)), "round {round}");
+            assert!(body.is_spooled(), "round {round}");
             assert_eq!(&*body, &data[..]);
 
             // The one file is taken: a second body stays in memory.
-            let mut second = Incoming::new(Some(&spool));
+            let mut second = Incoming::new(Some(&spool), None);
             second.read_from(&mut &data[..], data.len() as u64).unwrap();
-            assert!(matches!(second.finish().unwrap(), Body::Memory(_)));
+            assert!(!second.finish().unwrap().is_spooled());
 
             drop(body);
             let file = spool.take().unwrap();
@@ -330,11 +609,11 @@ mod tests {
         }
 
         // Without a spool everything is in memory.
-        let mut incoming = Incoming::new(None);
+        let mut incoming = Incoming::new(None, None);
         incoming
             .read_from(&mut &data[..], data.len() as u64)
             .unwrap();
-        assert!(matches!(incoming.finish().unwrap(), Body::Memory(_)));
+        assert!(!incoming.finish().unwrap().is_spooled());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

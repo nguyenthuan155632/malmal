@@ -16,20 +16,114 @@
 //! assert!(report.has("type.executable"));
 //! ```
 //!
+//! The type is told from the content; the file name and `Content-Type` in
+//! [`ScanHints`] are claims to check, never to trust. Reject every file
+//! whose verdict is not [`Verdict::Clean`]: a suspicious file is one the
+//! scanner could not clear, not one it found harmless.
+//!
+//! # What is checked
+//!
+//! | Content | [`FileType`] | Looked for |
+//! |---|---|---|
+//! | JPEG, PNG and APNG, GIF, WebP, BMP, TIFF and BigTIFF, ICO, JPEG XL | `Jpeg`, `Png`, `Gif`, `Webp`, `Bmp`, `Tiff`, `Ico`, `Jxl` | broken structure, more pixels than [`Limits::max_pixels`], code in metadata, data after the image, a second format in the same bytes |
+//! | PSD and PSB, HEIC, AVIF | `Psd`, `Heif`, `Avif` | the same, of the container: the pixel data is not decoded |
+//! | SVG | `Svg` | scripts, event handlers, `javascript:` and `data:` addresses, entities, embedded HTML, resources fetched from elsewhere |
+//! | PDF, and Illustrator files from version 9 on | `Pdf` | JavaScript, actions that run by themselves, launches, PostScript, XFA forms, attachments (each scanned in turn), encryption, obfuscated names, renderer bombs, broken structure |
+//! | PostScript, EPS, older Illustrator files | `PostScript` | file and device access, shell pipes, interpreter internals, code built at run time |
+//!
+//! Every file is also checked for executables, server-side code (PHP, ASP,
+//! JSP) and its SHA-256 against a [`HashList`]. Any other content is
+//! `type.unknown`: office documents, archives and video are out of scope.
+//!
+//! # Verdicts and policy
+//!
+//! Each [`Finding`] has a code, a [`Severity`] and a message. The
+//! [`Policy`] turns the worst severity into the verdict:
+//!
+//! | Policy | Info | Low, Medium | High, Critical |
+//! |---|---|---|---|
+//! | [`Policy::default`] | clean | suspicious | malicious |
+//! | [`Policy::strict`] | clean | suspicious (Low), malicious (Medium) | malicious |
+//!
+//! [`Policy::allow`] lets one code through, at Info, for files that carry a
+//! feature on purpose, such as attachments in e-invoices; the rest of the
+//! file is still checked. [`Policy::with_override`] sets the severity of a
+//! code, and [`Policy::with_allowed_types`] narrows the accepted types.
+//!
+//! ```
+//! use malmal::{FileType, Limits, Policy, ScanHints, Scanner};
+//!
+//! let policy = Policy::default()
+//!     .allow("pdf.embedded_file")?
+//!     .with_allowed_types([FileType::Jpeg, FileType::Png, FileType::Pdf]);
+//! let limits = Limits {
+//!     max_file_size: 16 << 20,
+//!     ..Limits::default()
+//! };
+//! let scanner = Scanner::builder()
+//!     .policy(policy)
+//!     .limits(limits)
+//!     .pdf_passwords(["statement password"])
+//!     .build();
+//! let report = scanner.scan_bytes(b"<svg/>", ScanHints::default());
+//! assert!(report.has("type.not_allowed"));
+//! # Ok::<(), malmal::AllowError>(())
+//! ```
+//!
+//! # Finding codes
+//!
+//! [`report::CODES`] lists every code. What each one means, its severity
+//! and what to do about it are in
+//! [`docs/findings.md`](https://github.com/nguyenthuan155632/malmal/blob/main/docs/findings.md).
+//! A code keeps its meaning, and new codes arrive in minor releases.
+//! Messages are for people and may be reworded at any time.
+//!
+//! # Limits
+//!
+//! [`Limits`] bound the file size, what compressed data may expand to, how
+//! deep embedded files are followed, the pixels an image may declare and
+//! the time a scan may take. What exceeds a limit is a `limit.*` finding,
+//! so a file that was not analyzed to the end is never clean; `limit.*`
+//! codes cannot be allowed. The work a scan does follows the size of the
+//! file: a structure that would cost more is cut off with
+//! `limit.complexity`.
+//!
+//! The time limit is checked between steps, and a step cannot be stopped
+//! from outside. Where a scan must never run on, scan in a process that can
+//! be ended, as the `malmald` daemon of
+//! [`malmal-cli`](https://crates.io/crates/malmal-cli) does.
+//!
+//! [`Scanner::scan_bytes`] takes the file whole. For a large file, map it
+//! rather than read it, so that its pages stay the kernel's to drop; what a
+//! scan holds beyond the file is then what the structure costs, not the
+//! size: a 1 GB PDF is scanned in less than 96 MB.
+//!
+//! # Threads
+//!
+//! A [`Scanner`] holds no per-scan state. Build one and share it between
+//! threads, or clone it, which is cheap. A scan is CPU work: in an async
+//! service, run it on a blocking thread.
+//!
 //! # Stability
 //!
-//! Finding codes are part of the API: a code keeps its meaning, and new
-//! codes arrive in minor releases. [`FileType`], [`Report`] and [`Finding`]
-//! may grow, so match on them with a wildcard. Messages are for people and
-//! may be reworded at any time.
+//! [`FileType`], [`Report`] and [`Finding`] may grow, so match on them with
+//! a wildcard.
 //!
 //! # Features
 //!
-//! - `yara`: match files against YARA rules with [`YaraRules`]. Off by
-//!   default; it adds a WebAssembly runtime to the build.
 //! - `cdr`: rebuild raster images from their pixels with
 //!   [`Scanner::sanitize`], so that nothing but the picture is kept. Off by
 //!   default; it adds the codecs of the `image` crate to the build.
+//! - `cdr-svg`: with `cdr`, also filter SVG files down to what draws a
+//!   picture.
+//! - `cdr-pdf`: with `cdr`, also render each page of a PDF and write a new
+//!   PDF of nothing but the pictures of its pages.
+//! - `yara`: match files against YARA rules with [`YaraRules`]. Off by
+//!   default; it adds a WebAssembly runtime to the build.
+//!
+//! The command-line scanner, the daemon (HTTP, a Unix socket, the ClamAV
+//! protocol and ICAP) and the C and Python bindings are in the
+//! [repository](https://github.com/nguyenthuan155632/malmal).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -38,7 +132,6 @@
 #[cfg(feature = "cdr")]
 #[cfg_attr(docsrs, doc(cfg(feature = "cdr")))]
 pub mod cdr;
-/// Telling a file's type from its content, and the claims made about it.
 pub mod detect;
 /// SHA-256 blocklists.
 pub mod hashlist;

@@ -72,16 +72,15 @@ const MEMORY_LIMIT: Option<u64> = if cfg!(feature = "yara") {
     Some(4 << 30)
 };
 
-/// The address space limit for a process that works on `at_once` files of
-/// up to `limits.max_file_size` bytes at a time. Each file is mapped or held
+/// The address space limit for a process that scans `at_once` files at a
+/// time and holds `files` bytes of them at once. Each file is mapped or held
 /// whole, and what is decoded from it comes to a few times
 /// `limits.max_decompressed`: a limit below what the options allow would
 /// end the process on the files they were raised for, or on as many honest
 /// requests as it was told to take at once. The limit is there to stop a
 /// decoder that has lost its way, not to do the work of the other limits.
-pub fn memory_limit(limits: &Limits, at_once: u64) -> Option<u64> {
+pub fn memory_limit(limits: &Limits, at_once: u64, files: u64) -> Option<u64> {
     let defaults = Limits::default();
-    let files = limits.max_file_size.saturating_mul(at_once);
     let decoded = limits
         .max_decompressed
         .saturating_mul(3)

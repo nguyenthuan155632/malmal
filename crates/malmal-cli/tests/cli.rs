@@ -325,8 +325,13 @@ fn daemon_scans_over_a_unix_socket() {
 
 /// Start the daemon on a system-chosen TCP port and return that address.
 fn daemon_on_tcp(option: &str) -> (Daemon, String) {
+    daemon_on_tcp_with(option, &["--timeout", "5"])
+}
+
+fn daemon_on_tcp_with(option: &str, args: &[&str]) -> (Daemon, String) {
     let mut child = Command::new(MALMALD)
-        .args([option, "127.0.0.1:0", "--timeout", "5"])
+        .args([option, "127.0.0.1:0"])
+        .args(args)
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -621,6 +626,48 @@ fn idle_connections_do_not_keep_others_waiting() {
     // Well inside the five seconds after which an idle connection is dropped.
     assert!(started.elapsed() < Duration::from_secs(3));
     drop(kept);
+}
+
+/// A client that sends its file a byte now and then once held a worker
+/// for as long as it went on, and its connection for longer.
+#[test]
+fn slow_clients_keep_no_one_waiting_and_are_let_go() {
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    let args = ["--workers", "1", "--timeout", "1", "--min-rate", "1000"];
+    let (_daemon, address) = daemon_on_tcp_with("--http", &args);
+    let mut slow = TcpStream::connect(&address).unwrap();
+    slow.write_all(b"POST /scan HTTP/1.1\r\nContent-Length: 100000\r\n\r\nGIF")
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+
+    let started = Instant::now();
+    let mut other = TcpStream::connect(&address).unwrap();
+    other
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let head = format!(
+        "POST /scan HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        ELF.len()
+    );
+    other.write_all(head.as_bytes()).unwrap();
+    other.write_all(ELF).unwrap();
+    let mut reply = String::new();
+    other.read_to_string(&mut reply).unwrap();
+    assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
+    assert!(started.elapsed() < Duration::from_secs(1));
+
+    // A byte every 300 ms is far below the pace asked for.
+    let started = Instant::now();
+    while slow.write_all(b"8").is_ok() && started.elapsed() < Duration::from_secs(20) {
+        thread::sleep(Duration::from_millis(300));
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 /// A PDF of `size` bytes or a little more, most of them one image, with a

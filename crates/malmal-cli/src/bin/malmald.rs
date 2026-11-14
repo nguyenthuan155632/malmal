@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::Cell;
 use std::fs;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -13,13 +14,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use malmal_cli::icap;
-use malmal_cli::input::Spool;
+use malmal_cli::input::{MAP_FROM, Reserve, Spool};
 use malmal_cli::options::{self, Common};
 use malmal_cli::sandbox;
-use malmal_cli::serve::{self, Service, Slots};
+use malmal_cli::serve::{self, Pace, Service, Slots};
 
 const USAGE: &str = "\
 Usage: malmald (--socket <PATH> | --http <ADDR> | --clamd <ADDR> | --icap <ADDR>)...
@@ -32,9 +33,16 @@ Options:
   --http <ADDR>        HTTP: POST /scan, GET /metrics, GET /healthz
   --clamd <ADDR>       ClamAV daemon protocol (PING, VERSION, INSTREAM)
   --icap <ADDR>        ICAP for proxies (OPTIONS, REQMOD, RESPMOD)
-  --workers <N>        Requests worked on at once [default: 4]
+  --workers <N>        Files scanned at once [default: 4]
   --connections <N>    Connections kept open at once [default: 256]
+  --file-budget <BYTES>
+                       Most that the files of requests held at once may come
+                       to, as they arrive and while they are scanned; a file
+                       waits for room [default: --workers times --max-size]
   --timeout <SECONDS>  Idle time before a connection is dropped [default: 30]
+  --min-rate <BYTES>   Once --timeout has passed, the bytes a second a request
+                       has to arrive at, and its answer leave at, or the
+                       connection is dropped; 0 for any rate [default: 1024]
   --spool-dir <DIR>    Keep files of 1 MiB and more in unnamed files in DIR
                        while they are scanned, and not in memory; DIR must
                        be on a disk [default: every file in memory]";
@@ -62,7 +70,9 @@ struct Args {
     endpoints: Vec<(Protocol, String)>,
     workers: usize,
     connections: usize,
+    file_budget: u64,
     timeout: Duration,
+    min_rate: u64,
     spool_dir: Option<PathBuf>,
     common: Common,
 }
@@ -79,6 +89,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut workers = 4;
     let mut connections = 256;
     let mut timeout = 30;
+    let mut file_budget = None;
+    let mut min_rate = 1024;
     let mut spool_dir = None;
     let mut common = Common::default();
     while let Some(arg) = args.next() {
@@ -109,6 +121,20 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     .filter(|&n| n > 0)
                     .ok_or("--timeout needs a positive number of seconds")?
             }
+            "--file-budget" => {
+                file_budget = Some(
+                    value("--file-budget")?
+                        .parse()
+                        .ok()
+                        .filter(|&n: &u64| n > 0)
+                        .ok_or("--file-budget needs a positive number of bytes")?,
+                )
+            }
+            "--min-rate" => {
+                min_rate = value("--min-rate")?
+                    .parse()
+                    .map_err(|_| "--min-rate needs a number of bytes")?
+            }
             "--spool-dir" => spool_dir = Some(PathBuf::from(value("--spool-dir")?)),
             other => {
                 if !common.parse(other, &mut args)? {
@@ -120,11 +146,19 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     if endpoints.is_empty() {
         return Err("one of --socket, --http, --clamd or --icap is required".into());
     }
+    let max_size = common.limits.max_file_size;
+    let file_budget = file_budget.unwrap_or(max_size.saturating_mul(workers as u64));
+    // Otherwise a file the size limit allows could never be held.
+    if file_budget < max_size {
+        return Err("--file-budget has to be at least --max-size".into());
+    }
     Ok(Args {
         endpoints,
         workers,
         connections,
+        file_budget,
         timeout: Duration::from_secs(timeout),
+        min_rate,
         spool_dir,
         common,
     })
@@ -210,18 +244,104 @@ impl Write for &Stream {
     }
 }
 
+/// How long a request may take to arrive and its answer to leave: `grace`,
+/// and past that as long as it takes at `min_rate` bytes a second. Only the
+/// time spent waiting on the client counts, not the time spent scanning, so
+/// a client that sends a byte now and then cannot keep its connection, and
+/// the file it is sending, for as long as it likes.
+struct Clock {
+    grace: Duration,
+    min_rate: u64,
+    running: Cell<bool>,
+    waited: Cell<Duration>,
+    moved: Cell<u64>,
+}
+
+impl Clock {
+    fn time(&self, io: impl FnOnce() -> io::Result<usize>) -> io::Result<usize> {
+        if !self.running.get() {
+            return io();
+        }
+        if self.min_rate > 0 {
+            let earned = Duration::from_secs_f64(self.moved.get() as f64 / self.min_rate as f64);
+            if self.waited.get() > self.grace.saturating_add(earned) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the client is too slow",
+                ));
+            }
+        }
+        let started = Instant::now();
+        let outcome = io();
+        self.waited.set(self.waited.get() + started.elapsed());
+        if let Ok(count) = &outcome {
+            self.moved.set(self.moved.get() + *count as u64);
+        }
+        outcome
+    }
+}
+
+/// A connection, read and written on the clock of its request.
+#[derive(Clone, Copy)]
+struct Paced<'a> {
+    stream: &'a Stream,
+    clock: &'a Clock,
+}
+
+impl Read for Paced<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut stream = self.stream;
+        self.clock.time(|| stream.read(buffer))
+    }
+}
+
+impl Write for Paced<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let mut stream = self.stream;
+        self.clock.time(|| stream.write(buffer))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let mut stream = self.stream;
+        stream.flush()
+    }
+}
+
+impl Pace for Paced<'_> {
+    fn idle(&mut self) {
+        self.clock.running.set(false);
+    }
+
+    fn start(&mut self) {
+        self.clock.running.set(true);
+        self.clock.waited.set(Duration::ZERO);
+        self.clock.moved.set(0);
+    }
+}
+
 /// Serve one connection to its end.
-fn serve(stream: &Stream, protocol: Protocol, service: &Service, timeout: Duration) {
+fn serve(stream: &Stream, protocol: Protocol, service: &Service, timeout: Duration, min_rate: u64) {
     if stream.set_timeout(timeout).is_err() {
         return;
     }
-    let mut reader = BufReader::new(stream);
+    let clock = Clock {
+        grace: timeout,
+        min_rate,
+        running: Cell::new(false),
+        waited: Cell::new(Duration::ZERO),
+        moved: Cell::new(0),
+    };
+    let paced = Paced {
+        stream,
+        clock: &clock,
+    };
+    let mut reader = BufReader::new(paced);
     // Errors here are the peer's: a timeout, a reset, a short body.
     let _ = match protocol {
-        Protocol::Json => serve::json(&mut reader, stream, service),
-        Protocol::Http => serve::http(&mut reader, stream, service),
-        Protocol::Clamd => serve::clamd(&mut reader, stream, service),
-        Protocol::Icap => icap::icap(&mut reader, stream, service),
+        Protocol::Json => serve::json(&mut reader, paced, service),
+        Protocol::Http => serve::http(&mut reader, paced, service),
+        Protocol::Clamd => serve::clamd(&mut reader, paced, service),
+        Protocol::Icap => icap::icap(&mut reader, paced, service),
     };
 }
 
@@ -235,6 +355,7 @@ fn accept(
     service: Arc<Service>,
     connections: Arc<Slots>,
     timeout: Duration,
+    min_rate: u64,
 ) {
     loop {
         let place = connections.take();
@@ -247,7 +368,7 @@ fn accept(
         // If no thread can be had, the connection is dropped with the closure.
         let _ = thread::Builder::new().spawn(move || {
             let _place = place;
-            serve(&stream, protocol, &service, timeout);
+            serve(&stream, protocol, &service, timeout, min_rate);
         });
     }
 }
@@ -283,10 +404,11 @@ fn main() -> ExitCode {
         }
     };
 
-    // One file for each request worked on at once, opened here and used
-    // over and over: the sandbox has no directory to allow.
+    // As many files as there can be bodies in them at once, opened here and
+    // used over and over: the sandbox has no directory to allow.
+    let spooled = (args.file_budget / MAP_FROM).clamp(1, args.connections as u64);
     let spool = match &args.spool_dir {
-        Some(dir) => match Spool::open(dir, args.workers) {
+        Some(dir) => match Spool::open(dir, spooled as usize) {
             Ok(spool) => Some(spool),
             Err(error) => {
                 eprintln!("malmald: {}: {error}", dir.display());
@@ -299,7 +421,7 @@ fn main() -> ExitCode {
     // The sockets are open; the file system is not needed again, and the
     // sandbox forbids opening any more of them. Every request worked on
     // has its file mapped or held whole.
-    let memory = options::memory_limit(scanner.limits(), args.workers as u64);
+    let memory = options::memory_limit(scanner.limits(), args.workers as u64, args.file_budget);
     match sandbox::enter(args.common.sandbox, &[], memory) {
         Ok(status) => {
             let endpoints: Vec<String> = listeners
@@ -325,14 +447,15 @@ fn main() -> ExitCode {
         Some(spool) => service.spooling_to(spool),
         None => service,
     };
-    let service = Arc::new(service.at_once(args.workers));
+    let reserve = Reserve::new(args.file_budget, args.timeout);
+    let service = Arc::new(service.at_once(args.workers).holding(reserve));
     let connections = Slots::new(args.connections);
     let mut handles = Vec::new();
     for (protocol, listener, _) in listeners {
         let (service, connections) = (Arc::clone(&service), Arc::clone(&connections));
-        let timeout = args.timeout;
+        let (timeout, min_rate) = (args.timeout, args.min_rate);
         handles.push(thread::spawn(move || {
-            accept(listener, protocol, service, connections, timeout)
+            accept(listener, protocol, service, connections, timeout, min_rate)
         }));
     }
     for handle in handles {

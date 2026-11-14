@@ -382,11 +382,22 @@ impl Analyzer<'_> {
             );
         }
         let mut external = css.contains("@import");
-        let mut rest = css.as_str();
-        while let Some(index) = rest.find("url(") {
-            rest = &rest[index + 4..];
-            let end = rest.find(')').unwrap_or(rest.len());
-            let url = rest[..end].trim().trim_matches(['"', '\'']).trim();
+        // Where the next `)` is, found once for all the `url(` before it:
+        // looking for it from each of them is the square of a text that has
+        // none. Only the start of an address is judged, so it is trimmed at
+        // its start alone.
+        let mut close = 0;
+        let mut from = 0;
+        while let Some(index) = css[from..].find("url(") {
+            let start = from + index + 4;
+            from = start;
+            if close < start {
+                close = css[start..].find(')').map_or(css.len(), |at| start + at);
+            }
+            let url = css[start..close.max(start)]
+                .trim_start()
+                .trim_start_matches(['"', '\''])
+                .trim_start();
             // Script URLs were reported above; data: URLs carry fonts and bitmaps.
             external |= url.starts_with("//")
                 || scheme_of(url).is_some_and(|scheme| {
@@ -487,9 +498,12 @@ impl Analyzer<'_> {
             out.push_str(&rest[..amp]);
             let after = &rest[amp + 1..];
             let Some((name, tail)) = after.split_once(';') else {
+                // No reference after this one ends either: each `&` left
+                // is dropped, as it is here. Looking for a `;` from each of
+                // them would be the square of the text.
                 self.malformed("unterminated entity reference", offset);
-                rest = after;
-                continue;
+                out.extend(after.chars().filter(|&c| c != '&'));
+                return out;
             };
             rest = tail;
             if let Some(character) = resolve_builtin(name) {
@@ -544,12 +558,15 @@ fn clean_url(value: &str) -> String {
 }
 
 /// Lowercased scheme of an absolute URL.
+/// Only the characters a scheme may have are read: callers pass the rest
+/// of a long text, which this must not go through for each of them.
 fn scheme_of(url: &str) -> Option<String> {
-    let (scheme, _) = url.split_once(':')?;
-    let valid = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    let length = url
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+        .unwrap_or(url.len());
+    let scheme = &url[..length];
+    let valid =
+        url[length..].starts_with(':') && scheme.starts_with(|c: char| c.is_ascii_alphabetic());
     valid.then(|| scheme.to_ascii_lowercase())
 }
 
@@ -1019,5 +1036,30 @@ mod tests {
             ),
             Err(GunzipError::Corrupt)
         ));
+    }
+
+    #[test]
+    fn unclosed_references_and_urls_cost_what_the_file_does() {
+        let started = std::time::Instant::now();
+        let ampersands = wrap(&format!(r#"<g id="{}"/>"#, "&".repeat(400_000)));
+        assert_eq!(codes(&ampersands), ["svg.malformed"]);
+        let urls = wrap(&format!(r#"<g style="{}"/>"#, "url(".repeat(100_000)));
+        assert_eq!(codes(&urls), [""; 0]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+        // What is read of them is what was read before.
+        let mut analyzer = Analyzer {
+            budget: &mut Budget::new(&Limits::default()),
+            findings: &mut Vec::new(),
+            entities: HashMap::new(),
+        };
+        assert_eq!(analyzer.unescape("a&lt;b&c&d", 0), "a<bcd");
+        let late = wrap(r#"<g style="url( url(url( ' javascript:x)"/>"#);
+        assert_eq!(codes(&late), ["svg.javascript_uri"]);
+        let external = wrap(r#"<g style="fill: url(url(https://example.com/x)"/>"#);
+        assert_eq!(codes(&external), ["svg.external_ref"]);
+        assert_eq!(scheme_of("Java-Script:x").as_deref(), Some("java-script"));
+        assert_eq!(scheme_of("1http:x"), None);
+        assert_eq!(scheme_of("a b:x"), None);
     }
 }

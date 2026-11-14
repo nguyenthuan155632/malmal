@@ -400,9 +400,11 @@ The Python and C interfaces use the default limits. Embedded files are scanned u
 
 | Option | Default | Effect |
 |---|---|---|
-| `--workers <N>` | 4 | Requests processed at once; bounds CPU and memory |
+| `--workers <N>` | 4 | Files scanned at once; bounds CPU and the memory scans take |
 | `--connections <N>` | 256 | Connections kept open at once |
+| `--file-budget <BYTES>` | workers × max size | Most that the files held at once may come to, as they arrive and while they are scanned |
 | `--timeout <S>` | 30 | Idle time before a connection is closed |
+| `--min-rate <BYTES>` | 1024 | Bytes per second a request must arrive at once `--timeout` has passed; 0 for any rate |
 | `--spool-dir <DIR>` | none | Keep files of 1 MiB or more in temporary files in `DIR` instead of memory |
 
 ### Severity and policy
@@ -588,11 +590,16 @@ file, not its size: a 1 GB PDF is scanned within a 96 MB memory limit. The daemo
 uploads in memory unless `--spool-dir` is set; with it, files of 1 MiB or more are kept in
 unnamed temporary files that are removed when the request ends.
 
-The worst case per request is set by `--max-decompressed` and `--max-pixels`, and the
-total by `--workers`. At the defaults, a single hostile file can use 250–550 MB; four
-workers handling such files at once peaked at about 2 GB. Lower these options, or the
-number of workers, to fit your memory budget. Details and measurements are in
-[docs/integration.md](docs/integration.md#memory).
+What the daemon holds is the files themselves, while they arrive and while they are
+scanned, and what the scans take beyond them. `--file-budget` bounds the first: a file takes
+its share as it arrives and waits for room when there is none, and a request that cannot get
+room within `--timeout` is refused (`503` over HTTP), never answered as clean. The default,
+`--workers` times `--max-size`, is what the files could take before the option existed. The
+second is set per scan by `--max-decompressed` and `--max-pixels`, and in total by
+`--workers`: at the defaults a single hostile file can take 250–550 MB, and four workers
+handling such files at once peaked at about 2 GB. The ceiling is then about
+`--file-budget` plus `--workers` times that; lower these options to fit your memory.
+Details and measurements are in [docs/integration.md](docs/integration.md#memory).
 
 ### Container
 
@@ -659,6 +666,12 @@ goes to the SHA-256 hash; `--no-hash` skips it when you do not need it.
   between steps; only the command-line tools enforce `--hard-timeout`. Use the daemon if
   you need that guarantee.
 - **The daemon has no authentication or TLS.**
+- **Slow clients are let go, not refused.** A request that arrives at `--min-rate` or
+  faster keeps its connection and the part of `--file-budget` it has sent, however long it
+  takes; enough such clients fill `--connections` or the budget, and the others wait. They
+  hold no worker, so the files that have arrived are still scanned.
+- **Scans do not wait for memory.** `--file-budget` counts the files, not what scanning them
+  takes; that is bounded per scan by the limits and in total by `--workers`.
 - **macOS** has no sandbox, and the test suite is not run there.
 
 ## Development

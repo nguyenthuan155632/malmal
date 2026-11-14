@@ -1671,7 +1671,7 @@ checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
 name = "malmal"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -1695,11 +1695,12 @@ dependencies = [
 
 [[package]]
 name = "malmal-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "landlock",
  "libc",
  "malmal",
+ "memchr",
  "memmap2",
  "seccompiler",
  "serde",
@@ -1708,7 +1709,7 @@ dependencies = [
 
 [[package]]
 name = "malmal-ffi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "malmal",
  "serde_json",

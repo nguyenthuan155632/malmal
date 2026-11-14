@@ -333,7 +333,9 @@ scanner knows and would be blocked as `type.unknown`.
 A clean message is answered `204`, or echoed when the proxy did not send `Allow: 204`.
 Anything else is replaced by a `403 Forbidden` response, with the reason in
 `X-Infection-Found: Type=0; Resolution=2; Threat=Malmal.Malicious.pdf.javascript;`, or in
-`X-Block-Reason` when the body was too large or could not be taken apart. Those are ICAP
+`X-Block-Reason` when the body was too large, could not be taken apart, found no room in
+`--file-budget`, or was a form whose files took longer than `--scan-timeout` between them
+to scan (see [Limits and timeouts](#limits-and-timeouts)). Those are ICAP
 headers: the proxy sees them and can log them, the client gets the `403` alone. Previews
 are supported.
 
@@ -344,34 +346,60 @@ limit, and some hundreds of requests at once. Other proxies have not been tried.
 ### Connections and workers
 
 Every connection has a thread of its own, up to `--connections` (256); beyond that they
-wait to be accepted. `--workers` (4) is the number of requests worked on at once, across
-all endpoints, and is what bounds memory and processors: see
-[Memory](#memory). A connection kept open between requests holds no worker, so clients
-that keep theirs, as proxies and HTTP clients do, do not keep others waiting.
+wait to be accepted. `--workers` (4) is the number of files scanned at once, across all
+endpoints, and is what bounds the processors and the memory that scans take: see
+[Memory](#memory). A request takes a worker once its file has arrived and gives it back
+before its answer is written. A connection kept open between requests, as proxies and HTTP
+clients keep theirs, a client that sends its file slowly and one that reads its answer
+slowly hold no worker, so they keep no one else waiting.
 
 ### Limits and timeouts
 
 `--max-size` and `--scan-timeout` set `Limits::max_file_size` and `Limits::max_duration` for
-every request; `--timeout` is how long an idle connection is kept. The time limit is checked
-between steps of the analysis, so it bounds a scan without cutting it off at an exact moment.
-A file over the size limit is refused outright by the daemon rather than scanned in part.
+every request. The time limit is checked between steps of the analysis, so it bounds a scan
+without cutting it off at an exact moment. A file over the size limit is refused outright
+by the daemon rather than scanned in part. The files of one multipart form over ICAP share
+the time limit: once their scans have taken that long, those left are not scanned and the
+form is blocked.
+
+`--timeout` (30 seconds) is how long a connection may wait on its client at a time, idle
+between requests or in the middle of one. Past it, a request has to keep up `--min-rate`
+(1024 bytes a second) on average, its answer included, or its connection is dropped; only
+the time spent waiting on the client counts, not the time spent scanning, and `0` turns
+the rate off. Without it, a client that sent a byte every few seconds kept its connection
+for as long as it liked; four of them, when a request still took its worker as it started
+to arrive, kept a daemon with four workers from answering anyone for over a minute.
 
 ### Memory
 
 `malmal scan` maps the file it is given, so its memory does not grow with the file. The
-daemon receives the file over a socket and, as shipped, holds it whole: `--workers` times
-`--max-size` of memory for the files alone.
+daemon receives the file over a socket and, as shipped, holds it whole, from the moment it
+starts to arrive until its scan is over. `--file-budget` is what the files held at once may
+come to, `--workers` times `--max-size` by default:
+
+- A file takes its share 256 KiB at a time as it arrives, so a client holds no more than
+  it has sent, whatever its `Content-Length` says.
+- A file that finds no room waits for it, for up to `--timeout`, and is then refused: `503`
+  over HTTP, `{"ok": false, "error": "no room for the file now; try again"}` over the socket,
+  `... ERROR` over the ClamAV protocol, a block with `X-Block-Reason` over ICAP. The rest of
+  its body is not read, so the connection ends. A refused file is never answered as clean.
+- Files that are all still arriving and all waiting for room would wait for each other:
+  the one that started last is refused at once, and the others go on.
+- The budget has to be at least `--max-size`. With 32 uploads of 16 MiB sent at once to
+  four workers and the default budget, all 32 were scanned in 0.8 seconds and the daemon
+  peaked at 316 MB.
 
 `--spool-dir <DIR>` changes that. Files of 1 MiB and more are written to a file in `DIR`
 as they arrive and mapped from there; smaller ones stay in memory, where they are
 faster. What to know about it:
 
-- The files have no names. They are opened when the daemon starts, one for each worker,
-  before the sandbox closes, and are emptied after each request and used again. Nothing
+- The files have no names. They are opened when the daemon starts, one for each MiB of
+  `--file-budget` up to `--connections`, before the sandbox closes, and are emptied after
+  each request and used again. Nothing
   is left in `DIR` when the daemon ends, however it ends, and the sandbox allows no more
   than it does without the option: `--require-sandbox` works as before.
 - `DIR` has to be on a disk. `/tmp` is memory on most systems; a file there is no
-  saving. It needs room for `--workers` times `--max-size`.
+  saving. It needs room for `--file-budget`.
 - Uploads are then written to that disk for as long as they are scanned. Without the
   option nothing a client sends is written anywhere.
 - A daemon with less memory than the file it is scanning reads the file back from the
@@ -397,9 +425,14 @@ as much as the defaults allow, one request takes this much, the file included:
 | `/sanitize`, a PNG of 8000 × 8000 pixels | 0.3 MB | 250 MiB |
 
 Four of the worst at once, which is what four workers allow, took the daemon to 1.7 GiB
-scanning and 2.1 GiB rebuilding. Nothing makes a request wait for memory: a container
-with less than `--workers` times some 550 MiB can be ended by its memory limit when
-such files arrive together, and the daemon with defaults in a container of 512 MiB is.
+scanning and 2.1 GiB rebuilding. A scan does not wait for memory: `--file-budget` counts
+the files and not what is decoded from them, which is only known as the scan goes. Making
+each scan wait for the most it could take, `--max-decompressed` and more, would let as
+many scans run as `--workers` already does, and handing out decoded bytes from one pool
+would make a file's verdict depend on what else was being scanned. So a container with
+less than `--file-budget` plus `--workers` times some 550 MiB can be ended by its memory
+limit when such files arrive together, and the daemon with defaults in a container of
+512 MiB is.
 Ordinary files are nowhere near: 3,000 scans of a 200 KB PDF leave the daemon at 4 MiB.
 
 To run in less, lower what a request may cost and how many are worked on:

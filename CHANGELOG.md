@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- `malmald --file-budget`: what the files of requests held at once may come to, as they
+  arrive and while they are scanned. A file takes its share as it arrives and waits for
+  room; one that finds none within `--timeout` is refused. The default, `--workers` times
+  `--max-size`, is what the files could take before.
+- `malmald --min-rate` (1024 bytes a second): once `--timeout` has passed, the pace a
+  request and its answer have to keep, counting only the time spent waiting on the client.
+
+### Changed
+
+- `malmal-cli` depends on `memchr`, which `malmal` already used.
+- The crate documentation says what is checked, how verdicts and the policy work, the
+  limits, threads, stability and the features, with an example of a configured scanner.
+- A daemon request takes its worker once its file has arrived, and gives it back before
+  its answer is written. `--workers` now counts scans, not requests.
+
+### Fixed
+
+- Files made of one structure repeated many times were read again for each repetition,
+  and some ran past the time limit, which none of them reached a check of. Measured
+  before and after on a file of 1 MB: trailers whose strings never close, more than
+  60 s and 0.02 s; objects that cannot be parsed, 9.1 s and 0.02 s; an object stream
+  whose entries all point at one value, more than 60 s for 40 KB and 0.04 s; forms
+  that draw a name listed in one large table, 7.1 s and 574 MiB, 0.04 s and 14 MiB;
+  `/Encrypt` in every object, 54 s for 16 MB and 0.43 s; in SVG, `&` without `;`,
+  34 s and 0.01 s, and `url(` without `)`, 18 s and 0.03 s; in PostScript,
+  `%%BeginResource` comments that one keyword closes, 19 s and 0.04 s, and `(` that
+  never closes, the 10 s of the time limit and 0.05 s: one pass tells which strings
+  close, so ASCII85 image data, which is full of parentheses, is read once; an icon
+  whose entries all name one image, 34 s for 1.3 MB and 0.01 s. Tags of server-side
+  code in a raster image took 6.5 s for 16 MB and take 0.17 s. Of these, the trailers
+  and the object stream now stop at `limit.complexity`, and so do PostScript strings
+  that start after a backslash and never close, which that pass cannot tell of; an icon
+  whose images lie over one another is `image.malformed`.
+- What a damaged PDF filter produced before it gave out was not counted against
+  `--max-decompressed`: 16 streams that inflate to 64 MiB each and end in a row the
+  predictor rejects, 2.4 MB in all, were clean after 3 s, and 38 MB of them ran to the
+  time limit. Both now stop at `limit.decompression` in 0.7 s. ASCII85 strings in
+  PostScript, whose `z` is four bytes, are counted too.
+- Four clients sending a byte every five seconds held the four workers of a daemon for as
+  long as they went on: another request went unanswered for over a minute, and the four
+  were never let go. The other request is now answered at once, and the four are let go
+  after `--timeout`.
+- A multipart boundary of 60,000 bytes took 7 s of a worker for a body of 4 MiB, outside
+  the time limit, and takes 0.02 s. The files of one form share the time limit of one
+  scan; each had its own.
+- Bodies sent to a `--spool-dir` a byte at a time cost a write each: 8 MiB took 14 s over
+  ICAP and 12 s over the ClamAV protocol, and take 2.7 s and 0.6 s, as without a spool.
+
+### Behaviour to check when upgrading
+
+- A PDF whose trailers take more than eight times the file to read, an object stream
+  whose entries do, and a PostScript program whose strings that start after a backslash
+  and never close take more than four times the program, are `limit.complexity`. An
+  icon whose images take more than twice the file is `image.malformed`. None of the files of `tests/corpus` comes near these,
+  and 3,359 files uploaded by customers (PDF, JPEG, PNG, PSD, EPS) get the same verdicts
+  as before.
+- A PDF whose damaged streams decode to more than `--max-decompressed` in all is
+  `limit.decompression`, and so is a PostScript program whose ASCII85 strings do.
+- `malmald` may hold more files at once than it has workers, up to `--file-budget`: with
+  the defaults and no spool, 32 uploads of 16 MiB at once took it to 316 MB where 185 MB
+  before. A request that finds no room within `--timeout` is refused (`503` over HTTP).
+  A client slower than `--min-rate` past `--timeout` loses its connection. The spool
+  opens a file for each MiB of the budget, up to `--connections`, where one per worker.
+
 ## 0.2.0
 
 ### Added

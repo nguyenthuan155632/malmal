@@ -1,5 +1,5 @@
-//! Content-based file type detection. Filenames and Content-Type headers are
-//! attacker-controlled, so they are only ever used as claims to check against.
+//! Telling a file's type from its content. File names and `Content-Type`
+//! headers are the uploader's to choose, so they are only claims to check.
 
 use serde::Serialize;
 

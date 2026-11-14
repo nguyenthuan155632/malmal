@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use malmal::{Report, ScanHints, Scanner, Severity, Verdict};
 use serde::Deserialize;
 
-use crate::input::{Body, Incoming, Spool};
+use crate::input::{Body, Incoming, Reserve, Spool, is_refused};
 use crate::watchdog::Watchdog;
 
 pub(crate) const MAX_HEADER_LEN: u64 = 16 << 10;
@@ -141,16 +141,53 @@ impl Drop for Slot {
     }
 }
 
+/// What a connection's reader is told of the requests on it, so that it can
+/// hold each one to a pace. The time a connection waits for its next request
+/// is not the request's.
+pub trait Pace {
+    /// The connection waits for its next request.
+    fn idle(&mut self) {}
+    /// A request has started to arrive.
+    fn start(&mut self) {}
+}
+
+impl<T> Pace for io::Cursor<T> {}
+
+impl<R: Pace> Pace for io::BufReader<R> {
+    fn idle(&mut self) {
+        self.get_mut().idle();
+    }
+
+    fn start(&mut self) {
+        self.get_mut().start();
+    }
+}
+
+/// Wait for the next request on a connection; `false` when the connection
+/// has ended. It holds nothing while it waits, so the clients that keep
+/// their connections open, as proxies do, cannot keep the others waiting.
+pub(crate) fn next_request(reader: &mut (impl BufRead + Pace)) -> io::Result<bool> {
+    reader.idle();
+    let more = !reader.fill_buf()?.is_empty();
+    reader.start();
+    Ok(more)
+}
+
+/// Why no reply can say anything of a file: it was never held.
+pub(crate) const NO_ROOM: &str = "no room for the file now; try again";
+
 /// The scanner and its counters, shared by every connection.
 #[derive(Debug)]
 pub struct Service {
     scanner: Scanner,
     metrics: Metrics,
     watchdog: Watchdog,
-    /// Places for requests being worked on; without them, any number.
+    /// Places for scans; without them, any number.
     turns: Option<Arc<Slots>>,
     /// Where large request bodies are kept; without it, in memory.
     spool: Option<Arc<Spool>>,
+    /// What the bodies held at once may come to; without it, any amount.
+    reserve: Option<Arc<Reserve>>,
 }
 
 impl Service {
@@ -161,7 +198,15 @@ impl Service {
             watchdog: Watchdog::default(),
             turns: None,
             spool: None,
+            reserve: None,
         }
+    }
+
+    /// Hold no more of request bodies at once than `reserve` has room for,
+    /// while they arrive and while they are scanned.
+    pub fn holding(mut self, reserve: Arc<Reserve>) -> Self {
+        self.reserve = Some(reserve);
+        self
     }
 
     /// Keep large request bodies in the files of `spool` and not in memory,
@@ -173,25 +218,17 @@ impl Service {
 
     /// A request body to read into.
     pub(crate) fn incoming(&self) -> Incoming<'_> {
-        Incoming::new(self.spool.as_ref())
+        Incoming::new(self.spool.as_ref(), self.reserve.as_ref())
     }
 
-    /// Work on at most `requests` at once, however many connections there
-    /// are. This is what bounds the memory and the processors in use.
-    pub fn at_once(mut self, requests: usize) -> Self {
-        self.turns = Some(Slots::new(requests));
+    /// Scan at most `scans` files at once, however many connections there
+    /// are. This is what bounds the processors in use, and the memory that
+    /// scans take beyond the files themselves. A request takes its place
+    /// once its file has arrived and gives it back before it is answered:
+    /// a client that sends or reads slowly keeps no one else waiting.
+    pub fn at_once(mut self, scans: usize) -> Self {
+        self.turns = Some(Slots::new(scans));
         self
-    }
-
-    /// Wait for the next request on a connection, then for a place to work
-    /// on it; `None` when the connection has ended. A connection kept open
-    /// between requests holds no place, so the clients that keep theirs,
-    /// as proxies do, cannot keep the others waiting.
-    pub(crate) fn turn(&self, reader: &mut impl BufRead) -> io::Result<Option<Option<Slot>>> {
-        if reader.fill_buf()?.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(self.turns.as_ref().map(Slots::take)))
     }
 
     /// End the process when a scan runs for as long as `watchdog` allows.
@@ -209,18 +246,35 @@ impl Service {
         self.scanner.limits().max_file_size
     }
 
+    /// Time one scan may take.
+    pub(crate) fn max_duration(&self) -> Duration {
+        self.scanner.limits().max_duration
+    }
+
     /// `None` when the scanner itself failed; the caller reports an error.
     pub(crate) fn scan(&self, body: &[u8], hints: ScanHints<'_>) -> Option<Report> {
+        self.timed_scan(body, hints).0
+    }
+
+    /// [`Service::scan`], and how long the scan took once it had its place.
+    pub(crate) fn timed_scan(
+        &self,
+        body: &[u8],
+        hints: ScanHints<'_>,
+    ) -> (Option<Report>, Duration) {
+        let _turn = self.turns.as_ref().map(Slots::take);
         let started = Instant::now();
         let _running = self.watchdog.watch();
-        match catch_unwind(AssertUnwindSafe(|| self.scanner.scan_bytes(body, hints))) {
+        let outcome = catch_unwind(AssertUnwindSafe(|| self.scanner.scan_bytes(body, hints)));
+        let elapsed = started.elapsed();
+        match outcome {
             Ok(report) => {
-                self.metrics.record(&report, started.elapsed());
-                Some(report)
+                self.metrics.record(&report, elapsed);
+                (Some(report), elapsed)
             }
             Err(_) => {
                 self.metrics.errors.fetch_add(1, Ordering::Relaxed);
-                None
+                (None, elapsed)
             }
         }
     }
@@ -236,6 +290,7 @@ impl Service {
     ) -> Option<Result<malmal::cdr::Sanitized, malmal::cdr::Error>> {
         use malmal::cdr::{Error, Options};
 
+        let _turn = self.turns.as_ref().map(Slots::take);
         let started = Instant::now();
         let _running = self.watchdog.watch();
         let options = Options::default();
@@ -304,7 +359,7 @@ struct Request {
 /// `{"ok": false, "error": "..."}`. A connection may carry any number of
 /// requests. Anything but `"ok": true` means the file was not scanned.
 pub fn json(
-    reader: &mut impl BufRead,
+    reader: &mut (impl BufRead + Pace),
     mut writer: impl Write,
     service: &Service,
 ) -> io::Result<()> {
@@ -315,9 +370,9 @@ pub fn json(
     };
     let error = |message: &str| serde_json::json!({ "ok": false, "error": message });
     loop {
-        let Some(_turn) = service.turn(reader)? else {
+        if !next_request(reader)? {
             return Ok(());
-        };
+        }
         let mut header = String::new();
         if reader
             .by_ref()
@@ -339,7 +394,13 @@ pub fn json(
             service.metrics.reject();
             return reply(error("file exceeds the size limit"));
         }
-        let body = read_body(reader, request.size, service)?;
+        let body = match read_body(reader, request.size, service) {
+            Err(problem) if is_refused(&problem) => {
+                service.metrics.reject();
+                return reply(error(NO_ROOM));
+            }
+            body => body?,
+        };
 
         let hints = ScanHints {
             filename: request.filename.as_deref(),
@@ -436,14 +497,14 @@ pub(crate) fn percent_decode(text: &str) -> String {
 /// connection. From `/sanitize`, anything but `200` means there is no file
 /// to keep.
 pub fn http(
-    reader: &mut impl BufRead,
+    reader: &mut (impl BufRead + Pace),
     mut writer: impl Write,
     service: &Service,
 ) -> io::Result<()> {
     loop {
-        let Some(_turn) = service.turn(reader)? else {
+        if !next_request(reader)? {
             return Ok(());
-        };
+        }
         let too_large = |writer| {
             service.metrics.reject();
             Response::error("431 Request Header Fields Too Large", "headers too large")
@@ -516,7 +577,13 @@ pub fn http(
                     writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
                     writer.flush()?;
                 }
-                let body = read_body(reader, size, service)?;
+                let body = match read_body(reader, size, service) {
+                    // The rest of the body is not read, so the connection ends.
+                    Err(error) if is_refused(&error) => {
+                        return refuse("503 Service Unavailable", NO_ROOM).write(writer, false);
+                    }
+                    body => body?,
+                };
 
                 let from_query = query
                     .split('&')
@@ -633,16 +700,16 @@ pub(crate) fn signature(report: &Report) -> String {
 /// like a malicious one: `stream: Malmal.Suspicious.pdf.encrypted FOUND`.
 /// It also carries no file name or type, so those are not checked.
 pub fn clamd(
-    reader: &mut impl BufRead,
+    reader: &mut (impl BufRead + Pace),
     mut writer: impl Write,
     service: &Service,
 ) -> io::Result<()> {
     let mut session = false;
     let mut id = 0u32;
     loop {
-        let Some(_turn) = service.turn(reader)? else {
+        if !next_request(reader)? {
             return Ok(());
-        };
+        }
         let Some(&first) = reader.fill_buf()?.first() else {
             return Ok(());
         };
@@ -688,7 +755,14 @@ pub fn clamd(
                         writer.write_all(b"INSTREAM size limit exceeded. ERROR")?;
                         return writer.write_all(&[delimiter]);
                     }
-                    body.read_from(reader, length)?;
+                    match body.read_from(reader, length) {
+                        Err(error) if is_refused(&error) => {
+                            service.metrics.reject();
+                            write!(writer, "{NO_ROOM}. ERROR")?;
+                            return writer.write_all(&[delimiter]);
+                        }
+                        read => read?,
+                    }
                 }
                 let body = body.finish()?;
                 match service.scan(&body, ScanHints::default()) {
@@ -897,6 +971,38 @@ mod tests {
                 "{line}\n{metrics}"
             );
         }
+    }
+
+    #[test]
+    fn files_with_no_room_are_refused_and_not_scanned() {
+        use crate::input::Reserve;
+
+        let service = service().holding(Reserve::new(8, Duration::from_millis(50)));
+        let mut input = format!("{{\"size\": {}}}\n", GIF.len()).into_bytes();
+        input.extend_from_slice(GIF);
+        let reply: serde_json::Value =
+            serde_json::from_slice(&run(Json, &service, &input)).unwrap();
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], NO_ROOM);
+
+        let head = format!(
+            "POST /scan HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            GIF.len()
+        );
+        let replies = responses(&run(Http, &service, &http_request(&head, GIF)));
+        assert_eq!(replies[0].0, "HTTP/1.1 503 Service Unavailable");
+
+        let reply = run(Clamd, &service, &instream(b"zINSTREAM\0", &[GIF]));
+        assert_eq!(reply, format!("{NO_ROOM}. ERROR\0").as_bytes());
+        // Small files still fit.
+        let reply = run(Clamd, &service, &instream(b"zINSTREAM\0", &[b"GIF89a"]));
+        assert!(reply.starts_with(b"stream: "), "{reply:?}");
+        assert!(
+            service
+                .metrics
+                .render()
+                .contains("malmal_rejected_requests_total 3")
+        );
     }
 
     fn instream(command: &[u8], chunks: &[&[u8]]) -> Vec<u8> {
