@@ -4,13 +4,50 @@
 
 const MAX_DEPTH: usize = 64;
 
+/// Bytes of a name that fit in the value itself. Nearly every name does,
+/// so a document of many small objects costs no allocation per name.
+const INLINE: usize = 21;
+/// Longest string whose contents are kept. The ones that are inspected
+/// (addresses, appearance strings, file names) are far shorter.
+const MAX_STRING: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq)]
+enum Text {
+    Inline(u8, [u8; INLINE]),
+    Heap(Box<[u8]>),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Name {
+    text: Text,
+    obfuscated: bool,
+}
+
+impl Name {
+    fn new(text: &[u8], obfuscated: bool) -> Self {
+        let text = if text.len() <= INLINE {
+            let mut bytes = [0; INLINE];
+            bytes[..text.len()].copy_from_slice(text);
+            Text::Inline(text.len() as u8, bytes)
+        } else {
+            Text::Heap(text.into())
+        };
+        Self { text, obfuscated }
+    }
+
     /// Bytes after `#xx` escapes are decoded.
-    pub text: Vec<u8>,
+    pub fn text(&self) -> &[u8] {
+        match &self.text {
+            Text::Inline(length, bytes) => &bytes[..usize::from(*length)],
+            Text::Heap(bytes) => bytes,
+        }
+    }
+
     /// A letter or digit was written as a `#xx` escape. No PDF writer does
     /// that; it is how keywords are hidden from naive scanners.
-    pub obfuscated: bool,
+    pub fn obfuscated(&self) -> bool {
+        self.obfuscated
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,10 +55,10 @@ pub(crate) enum Value {
     Null,
     Bool(bool),
     Number(f64),
-    /// String contents are never inspected, so they are not kept.
-    String,
+    /// The decoded bytes, or `None` for a string longer than is kept.
+    String(Option<Box<[u8]>>),
     Name(Name),
-    Array(Vec<Value>),
+    Array(Box<[Value]>),
     Dict(Dict),
     /// Indirect reference by object number.
     Ref(u32),
@@ -30,13 +67,21 @@ pub(crate) enum Value {
 /// Entries in file order. Duplicate keys are kept: which one a reader
 /// honours differs between readers, so all of them are inspected.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub(crate) struct Dict(pub Vec<(Name, Value)>);
+pub(crate) struct Dict(pub Box<[(Name, Value)]>);
 
 impl Dict {
     pub fn get(&self, key: &[u8]) -> Option<&Value> {
         self.0
             .iter()
-            .find(|(name, _)| name.text == key)
+            .find(|(name, _)| name.text() == key)
+            .map(|(_, value)| value)
+    }
+
+    /// Every value stored under `key`.
+    pub fn all<'d>(&'d self, key: &'d [u8]) -> impl Iterator<Item = &'d Value> {
+        self.0
+            .iter()
+            .filter(move |(name, _)| name.text() == key)
             .map(|(_, value)| value)
     }
 }
@@ -44,7 +89,30 @@ impl Dict {
 impl Value {
     pub fn as_name(&self) -> Option<&[u8]> {
         match self {
-            Self::Name(name) => Some(&name.text),
+            Self::Name(name) => Some(name.text()),
+            _ => None,
+        }
+    }
+
+    /// Contents of a string short enough to have been kept.
+    pub fn as_string(&self) -> Option<&[u8]> {
+        match self {
+            Self::String(Some(bytes)) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// Any number, as written.
+    pub fn as_number(&self) -> Option<f64> {
+        match *self {
+            Self::Number(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    pub fn as_array(&self) -> Option<&[Value]> {
+        match self {
+            Self::Array(items) => Some(items),
             _ => None,
         }
     }
@@ -143,10 +211,7 @@ impl<'a> Parser<'a> {
         self.skip_whitespace();
         match self.peek()? {
             b'<' if self.rest().starts_with(b"<<") => self.dict(depth),
-            b'<' => {
-                self.pos += memchr::memchr(b'>', self.rest())? + 1;
-                Some(Value::String)
-            }
+            b'<' => self.hex_string(),
             b'(' => self.literal_string(),
             b'[' => {
                 self.pos += 1;
@@ -155,7 +220,7 @@ impl<'a> Parser<'a> {
                     self.skip_whitespace();
                     if self.peek()? == b']' {
                         self.pos += 1;
-                        return Some(Value::Array(items));
+                        return Some(Value::Array(items.into()));
                     }
                     items.push(self.value(depth + 1)?);
                 }
@@ -176,7 +241,7 @@ impl<'a> Parser<'a> {
             self.skip_whitespace();
             if self.rest().starts_with(b">>") {
                 self.pos += 2;
-                return Some(Value::Dict(Dict(entries)));
+                return Some(Value::Dict(Dict(entries.into())));
             }
             if self.peek()? != b'/' {
                 return None;
@@ -190,44 +255,82 @@ impl<'a> Parser<'a> {
     /// A name token starting at the current `/`.
     pub fn name(&mut self) -> Option<Name> {
         self.pos += 1;
-        let mut text = Vec::new();
+        let start = self.pos;
+        let length = self.rest().iter().take_while(|&&b| is_regular(b)).count();
+        let raw = &self.data[start..start + length];
+        self.pos += length;
+        if !raw.contains(&b'#') {
+            return Some(Name::new(raw, false));
+        }
+        let mut text = Vec::with_capacity(length);
         let mut obfuscated = false;
-        while let Some(byte) = self.peek().filter(|&b| is_regular(b)) {
-            self.pos += 1;
+        let mut at = 0;
+        while let Some(&byte) = raw.get(at) {
+            at += 1;
             let escaped = (byte == b'#')
-                .then(|| self.data.get(self.pos..self.pos + 2))
+                .then(|| raw.get(at..at + 2))
                 .flatten()
                 .and_then(|hex| std::str::from_utf8(hex).ok())
                 .and_then(|hex| u8::from_str_radix(hex, 16).ok());
             match escaped {
                 Some(decoded) => {
-                    self.pos += 2;
+                    at += 2;
                     obfuscated |= decoded.is_ascii_alphanumeric();
                     text.push(decoded);
                 }
                 None => text.push(byte),
             }
         }
-        Some(Name { text, obfuscated })
+        Some(Name::new(&text, obfuscated))
+    }
+
+    fn hex_string(&mut self) -> Option<Value> {
+        let length = memchr::memchr(b'>', self.rest())?;
+        let digits = &self.rest()[1..length];
+        self.pos += length + 1;
+        if digits.len() > MAX_STRING * 2 {
+            return Some(Value::String(None));
+        }
+        let mut nibbles = digits
+            .iter()
+            .filter_map(|&b| char::from(b).to_digit(16))
+            .map(|digit| digit as u8);
+        let mut bytes = Vec::with_capacity(digits.len() / 2);
+        while let Some(high) = nibbles.next() {
+            // An odd digit at the end stands for itself followed by zero.
+            bytes.push(high << 4 | nibbles.next().unwrap_or(0));
+        }
+        Some(Value::String(Some(bytes.into())))
     }
 
     fn literal_string(&mut self) -> Option<Value> {
+        let start = self.pos + 1;
         let mut depth = 0usize;
+        let mut escapes = false;
         loop {
             let byte = self.peek()?;
             self.pos += 1;
             match byte {
-                b'\\' => self.pos += 1,
+                b'\\' => {
+                    escapes = true;
+                    self.pos += 1;
+                }
                 b'(' => depth += 1,
                 b')' => {
                     depth -= 1;
                     if depth == 0 {
-                        return Some(Value::String);
+                        break;
                     }
                 }
                 _ => {}
             }
         }
+        let raw = &self.data[start..self.pos - 1];
+        if raw.len() > MAX_STRING {
+            return Some(Value::String(None));
+        }
+        let bytes = if escapes { unescape(raw) } else { raw.to_vec() };
+        Some(Value::String(Some(bytes.into())))
     }
 
     fn number(&mut self) -> Option<f64> {
@@ -269,6 +372,46 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Undo the backslash escapes of a literal string.
+fn unescape(raw: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut at = 0;
+    while let Some(&byte) = raw.get(at) {
+        at += 1;
+        if byte != b'\\' {
+            bytes.push(byte);
+            continue;
+        }
+        let Some(&escaped) = raw.get(at) else { break };
+        at += 1;
+        match escaped {
+            b'n' => bytes.push(b'\n'),
+            b'r' => bytes.push(b'\r'),
+            b't' => bytes.push(b'\t'),
+            b'b' => bytes.push(8),
+            b'f' => bytes.push(12),
+            // A backslash before a line break continues the string.
+            b'\r' => at += usize::from(raw.get(at) == Some(&b'\n')),
+            b'\n' => {}
+            b'0'..=b'7' => {
+                let mut code = u32::from(escaped - b'0');
+                for _ in 0..2 {
+                    match raw.get(at) {
+                        Some(&digit @ b'0'..=b'7') => {
+                            code = code * 8 + u32::from(digit - b'0');
+                            at += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                bytes.push(code as u8);
+            }
+            other => bytes.push(other),
+        }
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,11 +420,12 @@ mod tests {
         Parser::new(text.as_bytes(), 0, 1000).parse_value()
     }
 
+    fn string(text: &str) -> Vec<u8> {
+        parse(text).unwrap().as_string().unwrap().to_vec()
+    }
+
     fn name(text: &str) -> Value {
-        Value::Name(Name {
-            text: text.as_bytes().to_vec(),
-            obfuscated: false,
-        })
+        Value::Name(Name::new(text.as_bytes(), false))
     }
 
     #[test]
@@ -290,8 +434,12 @@ mod tests {
         assert_eq!(parse(" true "), Some(Value::Bool(true)));
         assert_eq!(parse("-12.5"), Some(Value::Number(-12.5)));
         assert_eq!(parse("% comment\n42"), Some(Value::Number(42.0)));
-        assert_eq!(parse("(a (nested) \\) string)"), Some(Value::String));
-        assert_eq!(parse("<48656C6C6F>"), Some(Value::String));
+        assert_eq!(string("(a (nested) \\) string)"), b"a (nested) ) string");
+        assert_eq!(string("(\\101\\n\\\\\\\nb\\7)"), b"A\n\\b\x07");
+        assert_eq!(string("<48656C6C6F>"), b"Hello");
+        assert_eq!(string("<4 8 7>"), b"Hp");
+        let long = format!("({})", "x".repeat(MAX_STRING + 1));
+        assert_eq!(parse(&long), Some(Value::String(None)));
         assert_eq!(parse("/Type"), Some(name("Type")));
         assert_eq!(parse("nullx"), None);
         assert_eq!(parse("(unterminated"), None);
@@ -303,11 +451,9 @@ mod tests {
         assert_eq!(parse("12 0 Rx"), Some(Value::Number(12.0)));
         assert_eq!(
             parse("[1 2 3 0 R]"),
-            Some(Value::Array(vec![
-                Value::Number(1.0),
-                Value::Number(2.0),
-                Value::Ref(3),
-            ]))
+            Some(Value::Array(
+                vec![Value::Number(1.0), Value::Number(2.0), Value::Ref(3)].into()
+            ))
         );
     }
 
@@ -316,14 +462,18 @@ mod tests {
         let Some(Value::Name(plain)) = parse("/Arial#20Bold") else {
             panic!("not a name");
         };
-        assert_eq!(plain.text, b"Arial Bold");
-        assert!(!plain.obfuscated);
+        assert_eq!(plain.text(), b"Arial Bold");
+        assert!(!plain.obfuscated());
 
         let Some(Value::Name(hidden)) = parse("/J#61vaScr#69pt") else {
             panic!("not a name");
         };
-        assert_eq!(hidden.text, b"JavaScript");
-        assert!(hidden.obfuscated);
+        assert_eq!(hidden.text(), b"JavaScript");
+        assert!(hidden.obfuscated());
+
+        let long = "/".to_string() + &"n".repeat(300);
+        assert_eq!(parse(&long).unwrap().as_name().unwrap().len(), 300);
+        assert!(std::mem::size_of::<Value>() <= 32);
     }
 
     #[test]

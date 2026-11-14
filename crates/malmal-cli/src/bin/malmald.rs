@@ -277,7 +277,11 @@ fn main() -> ExitCode {
 
     // The sockets are open; the file system is not needed again, and the
     // sandbox forbids opening any more of them.
-    match sandbox::enter(args.common.sandbox, &[], options::MEMORY_LIMIT) {
+    match sandbox::enter(
+        args.common.sandbox,
+        &[],
+        options::memory_limit(scanner.limits().max_file_size),
+    ) {
         Ok(status) => {
             let endpoints: Vec<String> = listeners
                 .iter()

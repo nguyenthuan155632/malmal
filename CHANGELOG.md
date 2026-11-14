@@ -35,6 +35,33 @@
   clean (`cdr::Error::Unclean`). Found by fuzzing: pixels that spell a PDF, hidden by the
   compression of the upload, came out of the PNG encoder as they were, and the rebuilt
   file was an image and a PDF with a script at once.
+- Deeper PDF checks, for what a keyword does not show. New findings:
+  `pdf.dangerous_uri` (links that run a script, start a Windows protocol handler, or open
+  a local file or network share), `pdf.external_ref` (streams, forms and file
+  specifications whose content is outside the file), `pdf.xml_entity` and
+  `pdf.xml_external_ref` (DOCTYPE, entities and XInclude in metadata and XFA),
+  `pdf.pixel_bomb`, `pdf.page_size`, `pdf.draw_recursion` (forms that draw themselves),
+  `pdf.conflicting_objects` (one object defined twice in one revision), and at Info
+  `pdf.risky_codec`, `pdf.print_only` and `pdf.signature_modified`. `pdf.postscript` now
+  covers the `PS` operator in a form's appearance string and calculator functions that
+  hold more than a calculator's operators; `pdf.rich_media` covers `Movie`, `Sound` and
+  `Screen` annotations and `U3D` and `PRC` artwork; `pdf.polyglot` covers ZIP headers and
+  HTML or SVG markup outside every stream; `pdf.malformed` covers a second header,
+  decode parameters outside the format's ranges and names over 255 bytes.
+- `malmal scan` and `malmal sanitize` map the file instead of reading it: a scan of a
+  large file needs the memory the analysis keeps, not the size of the file, and a 1 GB
+  PDF is scanned in a container limited to 96 MB. Files of 4 MiB and more are hashed and
+  searched for payloads on threads of their own while the format is analyzed, and what is
+  looked for outside the streams of a PDF is no longer looked for inside them.
+- `--no-hash` and `ScannerBuilder::without_hash`: no SHA-256, which is most of the time
+  of a large file on a processor without SHA instructions. `Report::sha256` is then
+  empty. A blocklist brings the hash back. 1 GB: 8.0 s before, 4.4 s now, 0.42 s without
+  the hash.
+- The values parsed from a PDF take about half the memory they did, and the number kept
+  grows with the size of the file (one for every 8 bytes, 2 million at least), so that
+  a large document of many objects is less likely to stop at `limit.complexity`.
+- The `evaluate` example measures refusal and false-refusal rates on files whose nature
+  is known, with the findings that decided each.
 - `malmal_sanitize` in the C interface and `Scanner.sanitize` in the Python binding;
   `malmal_scanner_new_with_passwords` and `Scanner(pdf_passwords=...)` for encrypted PDFs.
 - `malmald --connections`. Every connection has its own thread, and `--workers` now counts
@@ -60,13 +87,18 @@
   `--clamd` or `--icap` is.
 - New dependencies: `md-5` and `aes`, for PDF decryption; `brotli-decompressor`, for JPEG XL
   metadata; `image`, `png`, `moxcms`, `zune-jpeg`, `zune-core` and `jxl-oxide`, only with
-  the `cdr` feature; `svg-hush` with `cdr-svg`; `hayro` with `cdr-pdf`.
+  the `cdr` feature; `svg-hush` with `cdr-svg`; `hayro` with `cdr-pdf`; `memmap2` in
+  `malmal-cli`.
 
 ### Behaviour to check when upgrading
 
 - `malmal` and `malmald` exit with status 3 when a scan runs for six times the scan
   timeout. Run the daemon under a supervisor that restarts it, or pass `--hard-timeout 0`.
 
+- PDFs that came back clean may now be suspicious or malicious for what the deeper
+  checks find. Run the `survey` or `evaluate` example on your own files before deploying,
+  and lower a finding with `Policy::with_override` if your users need what it reports.
+- The address-space limit of the sandbox grows with `--max-size` beyond its default.
 - Files that were `type.unknown` because they were HEIC, AVIF, JPEG XL or ICO are now
   analyzed and may be clean.
 - PDFs with data after `%%EOF` are now at least suspicious.

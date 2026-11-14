@@ -116,6 +116,46 @@ fn eicar_is_blocked_by_hashlist() {
 }
 
 #[test]
+fn hashing_can_be_left_out_and_a_blocklist_brings_it_back() {
+    let data = png(8, 8, b"");
+    let hashed = Scanner::builder()
+        .build()
+        .scan_bytes(&data, ScanHints::default());
+    assert_eq!(hashed.sha256.len(), 64);
+
+    let plain = Scanner::builder().without_hash().build();
+    let report = plain.scan_bytes(&data, ScanHints::default());
+    assert_eq!(report.sha256, "");
+    assert_eq!(report.verdict, Verdict::Clean);
+
+    let list = HashList::parse(&format!("{}\n", hashed.sha256)).unwrap();
+    let listed = Scanner::builder().without_hash().hashlist(list).build();
+    let report = listed.scan_bytes(&data, ScanHints::default());
+    assert_eq!(report.sha256, hashed.sha256);
+    assert_eq!(codes(&report), ["hash.blocklisted"]);
+}
+
+/// Large files are hashed and searched on threads of their own; what is
+/// found must be what is found in a small one, in the same order.
+#[test]
+fn large_files_give_the_same_report() {
+    let document = |filler: usize| {
+        let mut data = format!("%PDF-1.7\n1 0 obj\n<< /Length {filler} >>\nstream\n").into_bytes();
+        data.resize(data.len() + filler, 0x55);
+        data.extend_from_slice(b"\nendstream\nendobj\n% <?php system($_GET['c']); ?>\n");
+        data.extend_from_slice(b"2 0 obj\n<< /S /JavaScript /JS (x) >>\nendobj\n");
+        data.extend_from_slice(b"trailer\n<< /Root 1 0 R >>\n%%EOF\n");
+        scan(&data)
+    };
+    let (small, large) = (document(16), document(5 << 20));
+    assert_eq!(codes(&small), ["payload.php", "pdf.javascript"]);
+    assert_eq!(codes(&large), codes(&small));
+    assert_eq!(large.verdict, Verdict::Malicious);
+    assert_eq!(large.sha256.len(), 64);
+    assert_ne!(large.sha256, small.sha256);
+}
+
+#[test]
 fn executable_disguised_as_image() {
     let report = Scanner::builder()
         .build()

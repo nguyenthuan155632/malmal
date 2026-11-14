@@ -1700,6 +1700,7 @@ dependencies = [
  "landlock",
  "libc",
  "malmal",
+ "memmap2",
  "seccompiler",
  "serde",
  "serde_json",

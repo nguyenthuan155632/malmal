@@ -16,6 +16,8 @@ pub const HELP: &str = "  --policy <NAME>      default or strict [default: defau
                        [default: jpeg,png,gif,webp,bmp,tiff,psd,heif,avif,jxl,ico,
                        svg,pdf,postscript]
   --hashlist <FILE>    SHA-256 blocklist, one hex digest per line
+  --no-hash            Do not compute the SHA-256 of a file, unless a
+                       blocklist needs it; the slowest part on large files
   --pdf-passwords <FILE>
                        Passwords to try on encrypted PDFs, one per line
   --max-size <BYTES>   Largest file analyzed in full [default: 67108864]
@@ -31,6 +33,8 @@ pub const HELP: &str = "  --policy <NAME>      default or strict [default: defau
                        [default: jpeg,png,gif,webp,bmp,tiff,psd,heif,avif,jxl,ico,
                        svg,pdf,postscript]
   --hashlist <FILE>    SHA-256 blocklist, one hex digest per line
+  --no-hash            Do not compute the SHA-256 of a file, unless a
+                       blocklist needs it; the slowest part on large files
   --pdf-passwords <FILE>
                        Passwords to try on encrypted PDFs, one per line
   --max-size <BYTES>   Largest file analyzed in full [default: 67108864]
@@ -41,20 +45,29 @@ pub const HELP: &str = "  --policy <NAME>      default or strict [default: defau
   --no-sandbox         Do not restrict the process
   --require-sandbox    Exit with an error if the sandbox cannot be applied";
 
-/// Address space the scanning process may use once sandboxed. The YARA
-/// engine reserves far more address space than it touches, so no limit is
-/// set when it is compiled in.
-pub const MEMORY_LIMIT: Option<u64> = if cfg!(feature = "yara") {
+/// Address space the scanning process may use once sandboxed, besides the
+/// file it scans. The YARA engine reserves far more address space than it
+/// touches, so no limit is set when it is compiled in.
+const MEMORY_LIMIT: Option<u64> = if cfg!(feature = "yara") {
     None
 } else {
     Some(4 << 30)
 };
+
+/// The address space limit for a process that scans files of up to
+/// `max_file_size` bytes: the file is mapped or held whole, and a limit
+/// below its size would refuse the files `--max-size` was raised for.
+pub fn memory_limit(max_file_size: u64) -> Option<u64> {
+    let beyond_default = max_file_size.saturating_sub(malmal::Limits::default().max_file_size);
+    MEMORY_LIMIT.map(|limit| limit.saturating_add(beyond_default))
+}
 
 pub struct Common {
     pub policy: Policy,
     /// Replaces the policy's accepted types when given.
     pub types: Option<Vec<FileType>>,
     pub hashlist: HashList,
+    pub no_hash: bool,
     pub pdf_passwords: Vec<String>,
     pub limits: Limits,
     /// Seconds given with `--hard-timeout`; 0 is never.
@@ -70,6 +83,7 @@ impl Default for Common {
             policy: Policy::default(),
             types: None,
             hashlist: HashList::default(),
+            no_hash: false,
             pdf_passwords: Vec::new(),
             limits: Limits::default(),
             hard_timeout: None,
@@ -113,6 +127,7 @@ impl Common {
                 let text = fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
                 self.hashlist = HashList::parse(&text).map_err(|e| format!("{path}: {e}"))?;
             }
+            "--no-hash" => self.no_hash = true,
             "--pdf-passwords" => {
                 let path = rest.next().ok_or("--pdf-passwords needs a value")?;
                 let text = fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
@@ -178,6 +193,11 @@ impl Common {
             .policy(policy)
             .hashlist(self.hashlist.clone())
             .pdf_passwords(self.pdf_passwords.iter().map(String::as_str));
+        let builder = if self.no_hash {
+            builder.without_hash()
+        } else {
+            builder
+        };
         #[cfg(feature = "yara")]
         let builder = if self.yara_sources.is_empty() {
             builder

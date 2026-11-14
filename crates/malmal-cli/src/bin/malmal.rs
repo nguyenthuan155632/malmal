@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::Path;
 use std::process::ExitCode;
 
 use malmal::{Report, ScanHints, Verdict};
+use malmal_cli::input::Input;
 use malmal_cli::options::{self, Common};
 use malmal_cli::sandbox;
 
@@ -171,15 +172,8 @@ fn describe(path: &str, report: &Report) -> String {
 
 /// The file at `path`, or standard input for `-`, up to one byte past the
 /// size limit, which is how the scanner knows the file is too large.
-fn read(path: &str, scanner: &malmal::Scanner) -> io::Result<Vec<u8>> {
-    let limit = scanner.limits().max_file_size.saturating_add(1);
-    let mut data = Vec::new();
-    if path == "-" {
-        io::stdin().lock().take(limit).read_to_end(&mut data)?;
-    } else {
-        File::open(path)?.take(limit).read_to_end(&mut data)?;
-    }
-    Ok(data)
+fn read(path: &str, scanner: &malmal::Scanner) -> io::Result<Input> {
+    Input::open(path, scanner.limits().max_file_size.saturating_add(1))
 }
 
 /// `sanitize` into a file. The sandbox lets a process neither rename nor
@@ -276,7 +270,11 @@ fn sanitize(args: &Args, scanner: &malmal::Scanner) -> ExitCode {
     };
     let watchdog = args.common.watchdog("malmal");
     let readable: Vec<&Path> = vec![Path::new(input)];
-    if let Err(message) = sandbox::enter(args.common.sandbox, &readable, options::MEMORY_LIMIT) {
+    if let Err(message) = sandbox::enter(
+        args.common.sandbox,
+        &readable,
+        options::memory_limit(scanner.limits().max_file_size),
+    ) {
         return fail(message);
     }
 
@@ -373,7 +371,11 @@ fn main() -> ExitCode {
     let watchdog = args.common.watchdog("malmal");
     // From here on, nothing but the files to scan can be opened.
     let readable: Vec<&Path> = args.files.iter().map(Path::new).collect();
-    if let Err(message) = sandbox::enter(args.common.sandbox, &readable, options::MEMORY_LIMIT) {
+    if let Err(message) = sandbox::enter(
+        args.common.sandbox,
+        &readable,
+        options::memory_limit(scanner.limits().max_file_size),
+    ) {
         eprintln!("malmal: {message}");
         return ExitCode::from(EXIT_ERROR);
     }

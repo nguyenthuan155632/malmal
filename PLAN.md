@@ -364,6 +364,22 @@ Not done:
       running after it ends the process with status 3. The library's limit stays a
       cooperative one; `cdr::rebuild` now checks it between frames (`Error::TimedOut`).
 
+### M13 — Large files, deeper PDF checks, measurement
+
+Taken from a comparison with quelda (github.com/tranhuucanh/quelda), a PDF scanner.
+
+- [x] The commands map the file; the hash runs beside the analysis; parsed PDF values
+      take about half the memory. 1 GB in 4.4 s, 0.42 s with `--no-hash`, in a 96 MB
+      container.
+- [x] PDF checks that read strings, numbers and positions: `pdf/deep.rs`.
+- [x] `examples/evaluate.rs`, for sets of files with known labels.
+- [ ] Measure on CIC-Evasive-PDFMal2022 and PDF Insecurity, and tune severities on what
+      the clean halves show.
+- [ ] Not done: reading the file in blocks (every analyzer takes a slice), which is what
+      would bound the daemon's memory too; parsing objects on demand instead of keeping
+      the tree; recursion through patterns, soft masks and glyphs; page tree and
+      bookmark loops; embedded fonts and colour profiles; presets and locked rules.
+
 ## Order and dependencies
 
 ```

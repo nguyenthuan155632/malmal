@@ -355,6 +355,11 @@ every request; `--timeout` is how long an idle connection is kept. The time limi
 between steps of the analysis, so it bounds a scan without cutting it off at an exact moment.
 A file over the size limit is refused outright by the daemon rather than scanned in part.
 
+`malmal scan` maps the file it is given, so its memory does not grow with the file; the
+daemon receives the file over a socket and holds it whole. For files of hundreds of
+megabytes, run the command on the stored file, or keep `--workers` low enough that
+`--workers` times `--max-size` fits in memory.
+
 A step that never ends never reaches that check, and a thread cannot be stopped from
 outside. `--hard-timeout <S>` is the answer to that: when a scan or a rebuild has run for
 that many seconds, the daemon prints a line and exits with status 3. Every connection it

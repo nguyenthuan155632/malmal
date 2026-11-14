@@ -77,7 +77,8 @@ pub struct Report {
     pub declared_types: Vec<FileType>,
     /// Size of the input as given, before any truncation to the size limit.
     pub size: u64,
-    /// Lowercase hex SHA-256 of the input as given.
+    /// Lowercase hex SHA-256 of the input as given; empty when the scanner
+    /// was built without hashing.
     pub sha256: String,
     /// Everything that was noticed, in the order it was found.
     pub findings: Vec<Finding>,

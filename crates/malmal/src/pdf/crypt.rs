@@ -75,7 +75,7 @@ pub(crate) fn raw_entries(data: &[u8], pos: usize) -> Option<Vec<(Vec<u8>, Range
         if parser.rest().first() != Some(&b'/') {
             return None;
         }
-        let key = parser.name()?.text;
+        let key = parser.name()?.text().to_vec();
         parser.skip_whitespace();
         let start = parser.pos;
         parser.parse_value()?;
@@ -166,7 +166,7 @@ fn integer(raw: &[u8]) -> Option<i64> {
 
 fn name(raw: &[u8]) -> Option<Vec<u8>> {
     match Parser::new(raw, 0, 4).parse_value()? {
-        Value::Name(name) => Some(name.text),
+        Value::Name(name) => Some(name.text().to_vec()),
         _ => None,
     }
 }

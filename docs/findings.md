@@ -76,21 +76,32 @@ Also applies to Illustrator files saved since version 9, which are PDFs.
 |---|---|---|
 | `pdf.javascript` | High | JavaScript in an action, a name tree or the scripts of an XFA form. |
 | `pdf.launch` | High | An action that starts a program or opens a file. |
-| `pdf.postscript` | High | PostScript handed to an interpreter: a PostScript XObject, a form XObject with a PostScript alternative, or the `PS` operator in page content. |
+| `pdf.postscript` | High | PostScript handed to an interpreter: a PostScript XObject, a form XObject with a PostScript alternative, the `PS` operator in page content or in the default appearance string (`/DA`) of a form, or a calculator function (`/FunctionType 4`) that holds anything but the operators the format allows. |
 | `pdf.open_action` | Medium / High | An action runs when the document opens. High when it leads to JavaScript or a launch; a plain jump to a page is not reported. |
 | `pdf.additional_action` | Medium / High | An action runs on a page or document event. Same rule as `pdf.open_action`. |
 | `pdf.obfuscated_name` | High | A keyword such as `/JavaScript` written with `#xx` escapes, which no PDF writer does. |
 | `pdf.embedded_file` | Medium | The document carries attachments. Each one is scanned too, and what is found in it is reported with the prefix `embedded file:`. |
-| `pdf.rich_media` | Medium | Embedded Flash, video or 3D content. |
+| `pdf.rich_media` | Medium | Embedded Flash, video, sound or 3D content: `RichMedia`, `Movie`, `Sound` and `Screen` annotations, `3D`, `U3D` and `PRC` artwork. |
 | `pdf.xfa` | Medium | An XFA form. Its packets are searched for scripts, which are reported as `pdf.javascript`. |
 | `pdf.encrypted` | Info / Medium | The document is encrypted. Info when the empty password or one given with `pdf_passwords` opens it: the content was decrypted and inspected. Medium when no password at hand opens it, so its streams could not be inspected. |
-| `pdf.polyglot` | High | The file is also another format: the bytes after the last `%%EOF` are a recognizable file, or a ZIP end record closes the file. |
+| `pdf.polyglot` | High / Medium | The file is also another format: the bytes after the last `%%EOF` are a recognizable file, a ZIP end record closes the file, or a ZIP file header stands outside every stream. Medium for HTML or SVG markup (`<html`, `<script`, `<svg`) outside every stream. The same bytes in the data of a stream are data and are not reported. |
 | `pdf.trailing_data` | Low | Bytes other than padding follow the last `%%EOF`. |
 | `pdf.submit_form` | Low | A form action that sends or fetches data. |
 | `pdf.remote_goto` | Low | An action that opens another document. |
 | `pdf.uri` | Info | Links to external addresses. |
+| `pdf.dangerous_uri` | High / Medium | A link that is not to a web page. High when it runs a script (`javascript:`, `vbscript:`, `data:`) or starts a protocol handler with a history of exploits (`ms-msdt:` and the other `ms-*:`, `search-ms:`, `mhtml:`, `jar:`, `shell:`). Medium when it opens a file on the reader's machine or a network share (`file:`, `smb:`, `\\server\share`, `C:\...`), which hands the reader's Windows credentials to that server. The address is read as a browser reads it: in either case, in UTF-16, with tabs and line breaks dropped. Also reported for the base address of the document (`/URI << /Base >>`). |
+| `pdf.external_ref` | Medium | Content that is read from outside the file when it is rendered: a stream whose data is in another file (`/F`, `/FFilter`), a form that draws a page of another document (`/Ref`), a file specification that names a URL (`/FS /URL`), OPI comments. What is printed is then not what was scanned, and the renderer opens a path the file chose. |
+| `pdf.xml_entity` | High / Medium | XML in the document (XMP metadata, an XFA packet) with a document type declaration. High when it declares entities: XXE and entity expansion in the XML parsers of readers and server tools. UTF-16 and UTF-32 text is read too. |
+| `pdf.xml_external_ref` | Medium | XML in the document that makes its parser fetch something: XInclude, `<?xml-stylesheet?>`, an XFA web service connection. |
+| `pdf.pixel_bomb` | Medium | An image declares more pixels than `Limits::max_pixels`: a few bytes that make a renderer allocate gigabytes. |
+| `pdf.page_size` | Medium | A page box is longer than 28,800 points on a side (400 inches) after `/UserUnit`, twice what the format allows. Rasterizing it exhausts memory. |
+| `pdf.draw_recursion` | Medium | A form XObject that draws itself, directly or through other forms, by its own resources or those of the page. Renderers follow the calls until they crash or hang. Only what content draws counts, not what a resource dictionary lists. |
+| `pdf.conflicting_objects` | Medium | An object number is defined twice with different contents and no `%%EOF` between the two, so that no update explains it. Which one counts depends on the reader: the trick that shows a scanner one document and a reader another. Identical repeats and objects that stand in the data of a stream are not reported. |
+| `pdf.risky_codec` | Info | An image compressed with JBIG2 or JPEG 2000, whose decoders have a long history of exploits (FORCEDENTRY). Raise the severity with an override to refuse them. |
+| `pdf.print_only` | Info | An annotation or a layer that is printed and not shown on screen: what is approved on screen is not what comes out of the printer. Some real files carry such stamps. |
+| `pdf.signature_modified` | Info | A signature's `/ByteRange` does not cover the whole file: bytes were added after signing, or left out of what was signed. Filling in a form or signing a second time does this too. Only the ranges are checked, not the signature. |
 | `pdf.incremental_update` | Info | Several `%%EOF` markers: the file was saved incrementally or is linearized. |
-| `pdf.malformed` | Medium | A missing header or `%%EOF`, data before the header, an object that could not be parsed, or a stream that could not be decoded. |
+| `pdf.malformed` | Medium | A missing header or `%%EOF`, data before the header, a second header, an object that could not be parsed, a stream that could not be decoded, decode parameters outside what the format allows (decoders size their buffers from them), or a name longer than 255 bytes. |
 
 ## PostScript, EPS and older Illustrator files
 

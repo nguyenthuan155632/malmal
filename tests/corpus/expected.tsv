@@ -7,6 +7,7 @@ corpus/clean/decoder-panic.jxl	Clean
 corpus/clean/encrypted-empty-password.pdf	Clean	pdf.encrypted
 corpus/clean/encrypted-rc4.pdf	Clean	pdf.encrypted
 corpus/clean/icon.ico	Clean	
+corpus/clean/jbig2-image.pdf	Clean	pdf.risky_codec
 corpus/clean/layers.psd	Clean	
 corpus/clean/line.eps	Clean	
 corpus/clean/page.pdf	Clean	
@@ -20,15 +21,19 @@ corpus/clean/pixel.jpg	Clean
 corpus/clean/pixel.png	Clean	
 corpus/clean/pixel.psd	Clean	
 corpus/clean/pixels-spell-pdf.png	Clean	
+corpus/clean/print-only-stamp.pdf	Clean	pdf.print_only
 corpus/clean/square.svg	Clean	
+corpus/clean/web-link.pdf	Clean	pdf.uri
 corpus/clean/ycck-profile.jpg	Clean	
 corpus/malicious/elf-after-image.avif	Malicious	image.polyglot,image.trailing_data
 corpus/malicious/embedded-executable.pdf	Malicious	pdf.embedded_file,type.executable
 corpus/malicious/encrypted-javascript.pdf	Malicious	pdf.encrypted,pdf.javascript,pdf.open_action
+corpus/malicious/entity-in-metadata.pdf	Malicious	pdf.xml_entity
 corpus/malicious/executable.jpg	Malicious	type.executable,type.mismatch
 corpus/malicious/forceput.eps	Malicious	ps.ghostscript_internal
 corpus/malicious/hidden-file-read.eps	Malicious	ps.exec_dynamic,ps.file_access
 corpus/malicious/html-after-eof.pdf	Malicious	pdf.polyglot,pdf.trailing_data
+corpus/malicious/javascript-link.pdf	Malicious	pdf.dangerous_uri,pdf.uri
 corpus/malicious/javascript.pdf	Malicious	pdf.javascript
 corpus/malicious/launch-in-objstm.pdf	Malicious	pdf.launch
 corpus/malicious/obfuscated-href.svg	Malicious	svg.javascript_uri
@@ -41,9 +46,11 @@ corpus/malicious/php-after-image.jxl	Malicious	payload.php
 corpus/malicious/php-in-compressed-metadata.jxl	Malicious	image.metadata.payload
 corpus/malicious/php-tail.psd	Malicious	image.trailing_data,payload.php
 corpus/malicious/pipe.eps	Malicious	ps.file_access,ps.pipe
+corpus/malicious/protocol-handler-link.pdf	Malicious	pdf.dangerous_uri,pdf.uri
 corpus/malicious/ps-driver-key.eps	Malicious	ps.device_access
 corpus/malicious/ps-file-status.eps	Malicious	ps.file_access
 corpus/malicious/ps-form-xobject.pdf	Malicious	pdf.postscript
+corpus/malicious/ps-in-appearance-string.pdf	Malicious	pdf.postscript
 corpus/malicious/ps-operator.pdf	Malicious	pdf.postscript
 corpus/malicious/ps-outputdevice-key.eps	Malicious	ps.device_access
 corpus/malicious/ps-outputfile-cvn.eps	Malicious	ps.file_access
@@ -60,6 +67,7 @@ corpus/malicious/webshell-in-comment.jpg	Malicious	payload.php
 corpus/malicious/webshell-in-ztxt.png	Malicious	image.metadata.payload
 corpus/malicious/xxe.svg	Malicious	svg.entity
 corpus/malicious/zip-after-image.ico	Malicious	image.polyglot,image.trailing_data
+corpus/malicious/zip-header-inside.pdf	Malicious	pdf.polyglot
 corpus/malicious/zip-polyglot.png	Malicious	image.polyglot,image.trailing_data
 prototypes/files/bmp-php-trailing.bmp	Malicious	image.trailing_data,payload.php
 prototypes/files/bmp-pixel-bomb.bmp	Suspicious	image.malformed
@@ -169,7 +177,7 @@ prototypes/files/pdf-js-hex-string.pdf	Malicious	pdf.javascript,pdf.open_action
 prototypes/files/pdf-js-no-action-type.pdf	Malicious	pdf.javascript,pdf.open_action,pdf.uri
 prototypes/files/pdf-js-obfuscated-name.pdf	Malicious	pdf.javascript,pdf.obfuscated_name,pdf.open_action
 prototypes/files/pdf-js-stream.pdf	Malicious	pdf.javascript,pdf.open_action
-prototypes/files/pdf-junk-prefix.pdf	Suspicious	pdf.malformed
+prototypes/files/pdf-junk-prefix.pdf	Suspicious	pdf.malformed,pdf.polyglot
 prototypes/files/pdf-launch-objstm.pdf	Malicious	pdf.launch,pdf.open_action
 prototypes/files/pdf-launch-win.pdf	Malicious	pdf.launch,pdf.open_action
 prototypes/files/pdf-launch.pdf	Malicious	pdf.launch,pdf.open_action
@@ -253,7 +261,7 @@ prototypes/files/struct-jpeg-bad-seg-len.jpg	Suspicious	image.malformed
 prototypes/files/struct-pdf-bad-startxref.pdf	Clean	
 prototypes/files/struct-pdf-deep-objstm.pdf	Malicious	pdf.launch,pdf.open_action
 prototypes/files/struct-pdf-selfref.pdf	Clean	
-prototypes/files/struct-pdf-two-eof.pdf	Malicious	pdf.incremental_update,pdf.javascript,pdf.open_action
+prototypes/files/struct-pdf-two-eof.pdf	Malicious	pdf.incremental_update,pdf.javascript,pdf.malformed,pdf.open_action
 prototypes/files/struct-png-huge-chunk-len.png	Suspicious	image.malformed
 prototypes/files/struct-png-neg-dims.png	Suspicious	image.malformed
 prototypes/files/struct-png-zero-idat.png	Clean	

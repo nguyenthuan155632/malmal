@@ -466,6 +466,29 @@ From Rust, `Limits` holds these and the caps on decompressed data (256 MB), nest
 (4) and pixel count (2^28). The hard timeout exists in the commands only; see
 [Known limits](#known-limits).
 
+**Large files.** `malmal scan` maps the file rather than reading it, so the memory a scan
+needs is what the analysis keeps, not the size of the file: a 1 GB PDF is scanned in a
+container limited to 96 MB. Raise `--max-size` to the largest file you take; the default
+is sized for uploads to a web application.
+
+| File | Size | Time | With `--no-hash` | Memory besides the mapped file |
+|---|---:|---:|---:|---:|
+| PDF, mostly images | 60 MB | 0.3 s | 0.03 s | 12 MB |
+| PDF, mostly images | 1 GB | 4.4 s | 0.42 s | 12 MB |
+| PDF, 100,000 small objects | 10 MB | 0.2 s | 0.2 s | 87 MB |
+| PDF, one page stream of 200 MB once inflated | 7 MB | 0.6 s | 0.6 s | 244 MB |
+
+Measured on a six-core desktop of 2018, with the file in the page cache. The time of a
+large file is the time of its SHA-256: that processor has no instructions for it and
+hashes 230 MB a second, and nothing else in a scan is that slow. The hash runs beside
+the analysis, and `--no-hash` (`ScannerBuilder::without_hash`) leaves it out where
+nothing records it; a blocklist brings it back. On a processor with SHA instructions,
+which is every current server, hashing is several times faster. What a scan keeps grows
+with the number of objects in a PDF (about 40 bytes for each value in them) and with the
+size of the stream being inflated, which `Limits::max_decompressed` bounds. The daemon
+receives a file over a socket and holds it whole: there, `--workers` times `--max-size`
+is the bound.
+
 **The daemon.** `--workers` (4) is the number of requests worked on at once and is what
 bounds memory and processors; `--connections` (256) is the number of connections kept
 open, and an idle one holds no worker. Because a scan past the hard timeout ends the
@@ -507,6 +530,10 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
 - `cargo run --release --example survey -- --expect-clean DIR...` scans a directory of
   known-good files and lists those that did not come back clean: the false-positive rate on
   your own uploads. Run it before you deploy.
+- `cargo run --release --example evaluate -- --clean DIR --malicious DIR` measures both
+  at once on files whose nature is known: how many malicious ones are refused, how many
+  clean ones with them, and which findings decided. `--tsv FILE` records every verdict, to
+  diff between two versions. The example names two public sets of real PDF files.
 - `fuzz/` has one target per format (`cargo fuzz list`).
 - `cargo run --release --example throughput -- FILE...` measures throughput.
 
@@ -540,9 +567,16 @@ cd fuzz && cargo +nightly fuzz run pdf corpus/pdf seeds/pdf
 - **PDFs that need a password are decrypted only when it is supplied**; otherwise they
   yield `pdf.encrypted` at Medium. Only the standard security handler is supported, not
   certificate encryption.
-- **Strings in a PDF are not inspected**, encrypted or not: JavaScript is reported because
-  it is there, not for what it does.
-- **XFA forms are searched for scripts and nothing else.**
+- **JavaScript in a PDF is reported because it is there**, not for what it does. Of the
+  strings, the addresses of links and the appearance strings of forms are read; in an
+  encrypted document, the ones that are written in the object itself.
+- **XFA forms are searched for scripts and for XML that reaches outside**, and nothing
+  else.
+- **What a PDF check does not follow.** Recursion is found between form XObjects, not
+  through tiling patterns, soft masks or Type 3 glyphs. Loops in the page tree and in
+  chains of bookmarks or actions are not looked for, nor are embedded fonts and colour
+  profiles parsed. The cross-reference table is ignored rather than checked against the
+  file: every object in the file is inspected, whether the table lists it or not.
 - **The ClamAV protocol carries no file name**, so `type.mismatch` and
   `name.dangerous_extension` cannot be reported over it.
 - **Over ICAP a request body is judged as a file** unless it is a form. The endpoint is

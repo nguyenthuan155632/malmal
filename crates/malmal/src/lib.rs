@@ -88,6 +88,7 @@ pub struct Scanner {
     limits: Limits,
     policy: Policy,
     hashlist: HashList,
+    without_hash: bool,
     pdf_passwords: Passwords,
     #[cfg(feature = "yara")]
     yara: Option<YaraRules>,
@@ -120,6 +121,15 @@ impl ScannerBuilder {
     /// a verdict.
     pub fn policy(mut self, policy: Policy) -> Self {
         self.scanner.policy = policy;
+        self
+    }
+
+    /// Do not hash the files. [`Report::sha256`] is then empty. Hashing is
+    /// the slowest pass over a large file wherever the processor has no
+    /// instructions for it, and a service that does not record the hash
+    /// can leave it out. A blocklist needs the hash, and brings it back.
+    pub fn without_hash(mut self) -> Self {
+        self.scanner.without_hash = true;
         self
     }
 
@@ -157,6 +167,10 @@ impl ScannerBuilder {
         self.scanner
     }
 }
+
+/// Files at least this large are hashed, and searched for payloads, on
+/// threads of their own while the format is analyzed.
+const APART: usize = 4 << 20;
 
 impl Scanner {
     /// Start from the defaults: every supported type accepted, the default
@@ -215,17 +229,61 @@ impl Scanner {
     pub fn scan_bytes(&self, data: &[u8], hints: ScanHints<'_>) -> Report {
         let mut findings = Vec::new();
         let size = data.len() as u64;
-        let digest: [u8; 32] = Sha256::digest(data).into();
 
-        if self.hashlist.contains(&digest) {
-            findings.push(Finding::new(
-                "hash.blocklisted",
-                Severity::Critical,
-                "SHA-256 is on the blocklist",
-            ));
+        // Hashing is the slowest pass over a large file and needs nothing
+        // from the others, so it runs beside them.
+        let hash = || -> [u8; 32] { Sha256::digest(data).into() };
+        let wanted = !self.without_hash || !self.hashlist.is_empty();
+        let (digest, (detected, declared_types)) = if !wanted {
+            (None, self.analyze(data, hints, &mut findings))
+        } else if data.len() < APART {
+            (Some(hash()), self.analyze(data, hints, &mut findings))
+        } else {
+            std::thread::scope(|scope| {
+                let hashing = std::thread::Builder::new().spawn_scoped(scope, hash);
+                let analysis = self.analyze(data, hints, &mut findings);
+                // Where no thread can be had, the file is hashed here.
+                let digest = hashing
+                    .ok()
+                    .and_then(|thread| thread.join().ok())
+                    .unwrap_or_else(hash);
+                (Some(digest), analysis)
+            })
+        };
+        if digest.is_some_and(|digest| self.hashlist.contains(&digest)) {
+            findings.insert(
+                0,
+                Finding::new(
+                    "hash.blocklisted",
+                    Severity::Critical,
+                    "SHA-256 is on the blocklist",
+                ),
+            );
         }
 
-        let data = if size > self.limits.max_file_size {
+        let verdict = self.policy.apply(&mut findings);
+        Report {
+            verdict,
+            detected_type: detected,
+            declared_types,
+            size,
+            sha256: digest
+                .as_ref()
+                .map(|digest| to_hex(digest))
+                .unwrap_or_default(),
+            findings,
+        }
+    }
+
+    /// Everything a scan does but hash the file; returns the detected type
+    /// and the declared ones.
+    fn analyze(
+        &self,
+        data: &[u8],
+        hints: ScanHints<'_>,
+        findings: &mut Vec<Finding>,
+    ) -> (FileType, Vec<FileType>) {
+        let data = if data.len() as u64 > self.limits.max_file_size {
             findings.push(Finding::new(
                 "limit.size",
                 Severity::Medium,
@@ -257,30 +315,21 @@ impl Scanner {
         }
         let data = inflated.as_deref().unwrap_or(data);
 
-        let declared_types = self.check_claims(detected, hints, &mut findings);
-        self.check_type(detected, &mut findings);
-        self.analyze_content(data, detected, &mut budget, &mut findings);
+        let declared_types = self.check_claims(detected, hints, findings);
+        self.check_type(detected, findings);
+        self.analyze_content(data, detected, &mut budget, findings);
         // Interpreters run PostScript whether or not it starts with `%!`, so
         // a file that claims to be PostScript is analyzed as such even when
         // the content is not recognizable.
         if detected == FileType::Unknown && declared_types.contains(&FileType::PostScript) {
-            ps::analyze(data, &self.limits, &mut budget, &mut findings);
+            ps::analyze(data, &self.limits, &mut budget, findings);
         }
 
         #[cfg(feature = "yara")]
         if let Some(rules) = &self.yara {
-            rules.scan(data, self.limits.max_duration, &mut findings);
+            rules.scan(data, self.limits.max_duration, findings);
         }
-
-        let verdict = self.policy.apply(&mut findings);
-        Report {
-            verdict,
-            detected_type: detected,
-            declared_types,
-            size,
-            sha256: to_hex(&digest),
-            findings,
-        }
+        (detected, declared_types)
     }
 
     /// Checks that depend only on the bytes, shared by top-level and
@@ -292,7 +341,36 @@ impl Scanner {
         budget: &mut Budget,
         findings: &mut Vec<Finding>,
     ) {
-        check_payloads(data, detected, findings);
+        if data.len() < APART {
+            check_payloads(data, detected, findings);
+            return self.analyze_format(data, detected, budget, findings);
+        }
+        // The search for payloads reads every byte and nothing else, so on
+        // a large file it runs beside the analysis of the format.
+        let search = || {
+            let mut found = Vec::new();
+            check_payloads(data, detected, &mut found);
+            found
+        };
+        std::thread::scope(|scope| {
+            let searching = std::thread::Builder::new().spawn_scoped(scope, search);
+            let before = findings.len();
+            self.analyze_format(data, detected, budget, findings);
+            let found = searching
+                .ok()
+                .and_then(|thread| thread.join().ok())
+                .unwrap_or_else(search);
+            findings.splice(before..before, found);
+        });
+    }
+
+    fn analyze_format(
+        &self,
+        data: &[u8],
+        detected: FileType,
+        budget: &mut Budget,
+        findings: &mut Vec<Finding>,
+    ) {
         match detected {
             FileType::Svg => svg::analyze(data, budget, findings),
             FileType::Pdf => {
@@ -300,7 +378,14 @@ impl Scanner {
                     |inner: &[u8], budget: &mut Budget, findings: &mut Vec<Finding>| {
                         self.scan_embedded(inner, budget, findings)
                     };
-                pdf::analyze(data, budget, findings, &self.pdf_passwords.0, &mut nested);
+                pdf::analyze(
+                    data,
+                    budget,
+                    findings,
+                    &self.pdf_passwords.0,
+                    self.limits.max_pixels,
+                    &mut nested,
+                );
             }
             FileType::PostScript => ps::analyze(data, &self.limits, budget, findings),
             _ => image::analyze(data, detected, &self.limits, budget, findings),

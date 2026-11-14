@@ -20,6 +20,7 @@ path = "src/bin/malmald.rs"
 
 [dependencies]
 malmal = { path = "../malmal", version = "0.2.0" }
+memmap2 = "0.9"
 serde.workspace = true
 serde_json.workspace = true
 

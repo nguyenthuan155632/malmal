@@ -4,6 +4,7 @@
 //! dictionary found either way is inspected for active content.
 
 pub(crate) mod crypt;
+mod deep;
 pub(crate) mod filters;
 pub(crate) mod parser;
 
@@ -22,8 +23,14 @@ use parser::{Dict, Name, Parser, Value, is_regular, is_whitespace};
 /// Callback that scans a file extracted from the PDF.
 pub(crate) type NestedScan<'a> = dyn FnMut(&[u8], &mut Budget, &mut Vec<Finding>) + 'a;
 
-/// Parsed values kept in memory for one document.
-const MAX_NODES: usize = 2_000_000;
+/// Parsed values kept in memory for one document: this many for any file,
+/// and one for every `BYTES_PER_NODE` bytes of a larger one. Documents of
+/// hundreds of thousands of objects are real, and they are large; ten bytes
+/// to a value is what their objects come to. A value costs some forty bytes
+/// of memory, so the tree is bounded by a few times the size of the file.
+const MIN_NODES: usize = 2_000_000;
+const MAX_NODES: usize = 32_000_000;
+const BYTES_PER_NODE: usize = 8;
 const MAX_FILTERS: usize = 8;
 /// How far past an unparsable object's start to look for names.
 const FALLBACK_WINDOW: usize = 64 << 10;
@@ -31,6 +38,8 @@ const FALLBACK_WINDOW: usize = 64 << 10;
 const MAX_ENCRYPT_SOURCES: usize = 8;
 /// Passwords tried on one document, the empty one included.
 const MAX_PASSWORDS: usize = 33;
+/// Names one content stream is remembered to draw.
+const MAX_DRAWN: usize = 4096;
 
 /// Names whose `#xx`-escaped spelling is reported as obfuscation.
 const SENSITIVE_NAMES: &[&[u8]] = &[
@@ -75,6 +84,8 @@ struct Object {
     value: Value,
     /// First byte of stream data, for stream objects.
     stream_start: Option<usize>,
+    /// The object was stored in an object stream.
+    packed: bool,
 }
 
 struct Document<'a> {
@@ -137,7 +148,7 @@ impl<'a> Document<'a> {
         let raw = self.stream_data(object).ok_or(DecodeError::Corrupt)?;
         let filters: Vec<&[u8]> = match self.resolve(dict.get(b"Filter")) {
             Value::Null => Vec::new(),
-            Value::Name(name) => vec![name.text.as_slice()],
+            Value::Name(name) => vec![name.text()],
             Value::Array(items) => items
                 .iter()
                 .map(|item| {
@@ -246,6 +257,7 @@ pub(crate) fn analyze(
     budget: &mut Budget,
     findings: &mut Vec<Finding>,
     passwords: &[Vec<u8>],
+    max_pixels: u64,
     nested: &mut NestedScan<'_>,
 ) {
     let mut out = Output {
@@ -261,10 +273,11 @@ pub(crate) fn analyze(
         by_number: HashMap::new(),
         crypt: None,
     };
-    let mut nodes_left = MAX_NODES;
+    let mut nodes_left = (data.len() / BYTES_PER_NODE).clamp(MIN_NODES, MAX_NODES);
 
     check_header(data, &mut out);
     discover_objects(&mut doc, &mut nodes_left, budget, &mut out);
+
     for at in memmem::find_iter(data, b"trailer") {
         let mut parser = Parser::new(data, at + b"trailer".len(), nodes_left);
         if let Some(trailer) = parser.parse_value() {
@@ -318,6 +331,9 @@ pub(crate) fn analyze(
         scan_xfa(&doc, budget, &mut out);
     }
 
+    let readable = encrypted.is_none() || doc.crypt.is_some();
+    deep::inspect(&doc, readable, max_pixels, budget, &mut out);
+
     if doc.objects.is_empty() {
         out.malformed("PDF contains no objects", 0);
     }
@@ -338,11 +354,11 @@ fn check_header(data: &[u8], out: &mut Output<'_>) {
 }
 
 fn check_end(data: &[u8], out: &mut Output<'_>) {
-    let mut markers = memmem::find_iter(data, b"%%EOF");
-    let Some(first) = markers.next() else {
+    let Some(first) = memmem::find(data, b"%%EOF") else {
         return out.malformed("PDF has no %%EOF marker", data.len());
     };
-    let last = markers.last();
+    // From the end: in a large file the last marker is the nearest thing.
+    let last = memmem::rfind(data, b"%%EOF").filter(|&last| last != first);
     if last.is_some() {
         out.report(
             "pdf.incremental_update",
@@ -482,6 +498,7 @@ fn discover_objects(
             offset,
             value,
             stream_start,
+            packed: false,
         });
     }
 }
@@ -568,6 +585,7 @@ fn expand_object_streams(
                     offset,
                     value,
                     stream_start: None,
+                    packed: true,
                 }),
                 _ => {
                     out.malformed("object inside an object stream could not be parsed", offset);
@@ -603,7 +621,7 @@ fn walk(doc: &Document<'_>, value: &Value, offset: usize, out: &mut Output<'_>) 
 }
 
 fn check_name(name: &Name, offset: usize, out: &mut Output<'_>) {
-    if name.obfuscated && SENSITIVE_NAMES.contains(&name.text.as_slice()) {
+    if name.obfuscated() && SENSITIVE_NAMES.contains(&name.text()) {
         out.report(
             "pdf.obfuscated_name",
             Severity::High,
@@ -614,7 +632,7 @@ fn check_name(name: &Name, offset: usize, out: &mut Output<'_>) {
 }
 
 fn check_entry(doc: &Document<'_>, key: &Name, value: &Value, offset: usize, out: &mut Output<'_>) {
-    match key.text.as_slice() {
+    match key.text() {
         b"JS" | b"JavaScript" => javascript(offset, out),
         b"OpenAction" => match classify_action(doc, value) {
             Action::Harmless => {}
@@ -712,7 +730,9 @@ fn check_entry(doc: &Document<'_>, key: &Name, value: &Value, offset: usize, out
         },
         b"Type" if doc.name_is(Some(value), b"EmbeddedFile") => embedded_file(offset, out),
         b"Subtype" => {
-            if let Some(b"RichMedia" | b"3D") = doc.resolve(Some(value)).as_name() {
+            if let Some(b"RichMedia" | b"3D" | b"Movie" | b"Sound" | b"Screen" | b"U3D" | b"PRC") =
+                doc.resolve(Some(value)).as_name()
+            {
                 rich_media(offset, out);
             }
         }
@@ -811,7 +831,7 @@ enum Action {
 fn classify_action(doc: &Document<'_>, value: &Value) -> Action {
     match doc.resolve(Some(value)) {
         // Explicit and named destinations.
-        Value::Array(_) | Value::Name(_) | Value::String => Action::Harmless,
+        Value::Array(_) | Value::Name(_) | Value::String(_) => Action::Harmless,
         Value::Dict(action) => match doc.resolve(action.get(b"S")).as_name() {
             Some(b"JavaScript" | b"Launch") => Action::Code,
             Some(b"GoTo") => Action::Harmless,
@@ -839,7 +859,7 @@ fn fallback_names(region: &[u8], offset: usize, out: &mut Output<'_>) {
             break;
         };
         check_name(&name, offset, out);
-        match name.text.as_slice() {
+        match name.text() {
             b"JS" | b"JavaScript" => javascript(offset, out),
             b"Launch" => launch(offset, out),
             b"OpenAction" => out.report(
@@ -937,23 +957,142 @@ fn scan_content_streams(doc: &Document<'_>, budget: &mut Budget, out: &mut Outpu
     targets.sort_unstable();
     targets.dedup();
 
+    // What each form draws by name, for the forms that draw anything.
+    let mut draws: HashMap<usize, Vec<Vec<u8>>> = HashMap::new();
     for index in targets {
         let object = &doc.objects[index];
         if object.stream_start.is_none() {
             continue;
         }
         match doc.decode(object, budget) {
-            Ok(content) if uses_operator(&content, b"PS") => {
-                return postscript(
-                    "content stream uses the PostScript operator",
-                    object.offset,
-                    out,
-                );
+            Ok(content) => {
+                let mut drawn = Vec::new();
+                let found = for_each_operator(&content, |token, name| {
+                    if token == b"Do"
+                        && let Some(name) = name
+                        && drawn.len() < MAX_DRAWN
+                    {
+                        drawn.push(name.to_vec());
+                    }
+                    token == b"PS"
+                });
+                if found {
+                    return postscript(
+                        "content stream uses the PostScript operator",
+                        object.offset,
+                        out,
+                    );
+                }
+                if !drawn.is_empty() {
+                    draws.insert(index, drawn);
+                }
             }
             Err(DecodeError::Limit) => return out.limit(LimitExceeded::Decompression),
             // A stream no reader can decode draws nothing.
-            _ => {}
+            Err(_) => {}
         }
+    }
+    draw_recursion(doc, &draws, out);
+}
+
+/// A form that draws itself, directly or through other forms. A renderer
+/// follows the calls until it runs out of stack or of time.
+fn draw_recursion(doc: &Document<'_>, draws: &HashMap<usize, Vec<Vec<u8>>>, out: &mut Output<'_>) {
+    // Forms without resources of their own draw with those of whatever
+    // draws them: any dictionary of XObjects in the document may apply.
+    let mut anywhere: Option<Vec<&Dict>> = None;
+    let mut calls: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (&index, names) in draws {
+        let Some(dict) = doc.objects[index].value.as_dict() else {
+            continue;
+        };
+        let own = doc
+            .resolve(dict.get(b"Resources"))
+            .as_dict()
+            .and_then(|resources| doc.resolve(resources.get(b"XObject")).as_dict());
+        let tables: Vec<&Dict> = match own {
+            Some(table) => vec![table],
+            None => anywhere
+                .get_or_insert_with(|| {
+                    let mut tables = Vec::new();
+                    for object in &doc.objects {
+                        xobject_tables(doc, &object.value, &mut tables);
+                    }
+                    tables
+                })
+                .clone(),
+        };
+        let targets = calls.entry(index).or_default();
+        for name in names {
+            let named = tables.iter().flat_map(|table| table.all(name));
+            targets.extend(
+                named
+                    .filter_map(as_ref)
+                    .filter_map(|number| doc.by_number.get(&number).copied())
+                    .filter(|target| draws.contains_key(target)),
+            );
+        }
+    }
+
+    // Depth-first over the calls, with the forms on the current path marked.
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        OnPath,
+        Done,
+    }
+    let mut states: HashMap<usize, State> = HashMap::new();
+    for &start in calls.keys() {
+        if states.contains_key(&start) {
+            continue;
+        }
+        states.insert(start, State::OnPath);
+        let mut path = vec![(start, 0usize)];
+        while let Some((form, next)) = path.last_mut() {
+            let form = *form;
+            let Some(&target) = calls[&form].get(*next) else {
+                states.insert(form, State::Done);
+                path.pop();
+                continue;
+            };
+            *next += 1;
+            match states.get(&target) {
+                Some(State::OnPath) => {
+                    return out.report(
+                        "pdf.draw_recursion",
+                        Severity::Medium,
+                        "form draws itself; rendering it never ends",
+                        doc.objects[target].offset,
+                    );
+                }
+                Some(State::Done) => {}
+                None => {
+                    states.insert(target, State::OnPath);
+                    path.push((target, 0));
+                }
+            }
+        }
+    }
+}
+
+/// Collect every dictionary stored under `/XObject` in `value`.
+fn xobject_tables<'v>(doc: &'v Document<'_>, value: &'v Value, tables: &mut Vec<&'v Dict>) {
+    match value {
+        Value::Dict(dict) => {
+            for (key, item) in &dict.0 {
+                if key.text() == b"XObject"
+                    && let Some(table) = doc.resolve(Some(item)).as_dict()
+                {
+                    tables.push(table);
+                }
+                xobject_tables(doc, item, tables);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                xobject_tables(doc, item, tables);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -974,15 +1113,17 @@ fn scan_xfa(doc: &Document<'_>, budget: &mut Budget, out: &mut Output<'_>) {
             continue;
         }
         match doc.decode(object, budget) {
-            Ok(packet) if has_script_element(&packet) => {
-                return out.report(
-                    "pdf.javascript",
-                    Severity::High,
-                    "XFA form contains scripts",
-                    object.offset,
-                );
+            Ok(packet) => {
+                deep::xml(&packet, object.offset, out);
+                if has_script_element(&packet) {
+                    return out.report(
+                        "pdf.javascript",
+                        Severity::High,
+                        "XFA form contains scripts",
+                        object.offset,
+                    );
+                }
             }
-            Ok(_) => {}
             Err(DecodeError::Limit) => return out.limit(LimitExceeded::Decompression),
             // An unread packet may hold the script.
             Err(_) => out.malformed("XFA packet cannot be decoded", object.offset),
@@ -1019,10 +1160,13 @@ fn has_script_element(packet: &[u8]) -> bool {
     })
 }
 
-/// Whether a content stream has `operator` as a token of its own, outside
-/// strings, names and comments.
-fn uses_operator(content: &[u8], operator: &[u8]) -> bool {
+/// Call `visit` with every token of a content stream that stands outside
+/// strings, names and comments, and with the name that came before it, if
+/// one did: its operand, for the operators that take a name. Stops and
+/// returns true once `visit` does.
+fn for_each_operator(content: &[u8], mut visit: impl FnMut(&[u8], Option<&[u8]>) -> bool) -> bool {
     let mut unclosed_string = false;
+    let mut last_name: Option<Vec<u8>> = None;
     let mut pos = 0;
     while let Some(&byte) = content.get(pos) {
         match byte {
@@ -1059,7 +1203,7 @@ fn uses_operator(content: &[u8], operator: &[u8]) -> bool {
                     .take_while(|&&b| is_regular(b))
                     .count();
                 let token = &content[pos..pos + length];
-                if token == operator {
+                if visit(token, last_name.take().as_deref()) {
                     return true;
                 }
                 pos += length;
@@ -1074,11 +1218,9 @@ fn uses_operator(content: &[u8], operator: &[u8]) -> bool {
                 }
             }
             b'/' => {
-                pos += 1;
-                pos += content[pos..]
-                    .iter()
-                    .take_while(|&&b| is_regular(b))
-                    .count();
+                let mut parser = Parser::new(content, pos, usize::MAX);
+                last_name = parser.name().map(|name| name.text().to_vec());
+                pos = parser.pos;
             }
             _ => pos += 1,
         }
@@ -1124,7 +1266,14 @@ mod tests {
                 findings.push(Finding::new("type.executable", Severity::Critical, "elf"));
             }
         };
-        analyze(data, &mut budget, &mut findings, passwords, &mut nested);
+        analyze(
+            data,
+            &mut budget,
+            &mut findings,
+            passwords,
+            Limits::default().max_pixels,
+            &mut nested,
+        );
         findings.iter().map(|f| (f.code, f.severity)).collect()
     }
 
@@ -1577,8 +1726,354 @@ mod tests {
             &mut budget,
             &mut findings,
             &[],
+            limits.max_pixels,
             &mut |_, _, _| {},
         );
         assert_eq!(findings[0].code, "limit.decompression");
+    }
+
+    const PLAIN_CATALOG: &[u8] = b"<< /Type /Catalog /Pages 2 0 R >>";
+
+    fn link(address: &str) -> Vec<u8> {
+        format!("<< /Subtype /Link /Rect [0 0 9 9] /A << /S /URI /URI {address} >> >>").into_bytes()
+    }
+
+    #[test]
+    fn links_are_judged_by_where_they_lead() {
+        let with = |address: &str| run(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, &link(address)]));
+        assert_eq!(
+            with("(https://example.com/)"),
+            [("pdf.uri", Severity::Info)]
+        );
+        for script in [
+            "(javascript:alert\\(1\\))",
+            "( Java\\tScript:x)",
+            // The same in hexadecimal, and in UTF-16.
+            "<6A6176617363726970743A78>",
+            "<FEFF006A006100760061007300630072006900700074003A>",
+            "(ms-msdt:/id x)",
+        ] {
+            assert!(
+                with(script).contains(&("pdf.dangerous_uri", Severity::High)),
+                "{script}"
+            );
+        }
+        for local in [
+            "(file:///etc/passwd)",
+            "(\\\\\\\\host\\\\share\\\\x)",
+            "(C:\\\\x.exe)",
+        ] {
+            assert!(
+                with(local).contains(&("pdf.dangerous_uri", Severity::Medium)),
+                "{local}"
+            );
+        }
+        // The base that relative links are resolved against.
+        let based = b"<< /Type /Catalog /Pages 2 0 R /URI << /Base (javascript:) >> >>";
+        assert_eq!(
+            run(&pdf(&[based, PAGES, PAGE])),
+            [
+                ("pdf.uri", Severity::Info),
+                ("pdf.dangerous_uri", Severity::High)
+            ]
+        );
+    }
+
+    #[test]
+    fn links_in_encrypted_documents_are_read() {
+        for scheme in [Scheme::Rc4Long, Scheme::Aes128, Scheme::Aes256] {
+            let sealed = Encrypted::new(scheme, b"");
+            let address = sealed.seal(4, b"javascript:alert(1)");
+            let hex: String = address.iter().map(|byte| format!("{byte:02X}")).collect();
+            let link = link(&format!("<{hex}>"));
+            let mut document = b"%PDF-1.7\n".to_vec();
+            let objects = [PLAIN_CATALOG, PAGES, PAGE, &link, sealed.dict.as_bytes()];
+            for (index, body) in objects.iter().enumerate() {
+                document.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+                document.extend_from_slice(body);
+                document.extend_from_slice(b"\nendobj\n");
+            }
+            let id: String = ID.iter().map(|byte| format!("{byte:02x}")).collect();
+            document.extend_from_slice(
+                format!("trailer\n<< /Root 1 0 R /Encrypt 5 0 R /ID [<{id}> <{id}>] >>\n%%EOF\n")
+                    .as_bytes(),
+            );
+            assert_eq!(
+                codes(&document),
+                ["pdf.uri", "pdf.encrypted", "pdf.dangerous_uri"]
+            );
+        }
+    }
+
+    #[test]
+    fn content_outside_the_file() {
+        let external = stream(
+            "/Subtype /Image /Width 1 /Height 1 /F (//host/share/x.jpg) /FFilter /DCTDecode",
+            b"",
+        );
+        assert_eq!(
+            codes(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, &external])),
+            ["pdf.external_ref"]
+        );
+        // An annotation's /F is its flags, a file specification's its name.
+        let annotation = b"<< /Subtype /Text /Rect [0 0 9 9] /F 4 >>";
+        assert_eq!(
+            codes(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, annotation])),
+            [""; 0]
+        );
+
+        for dictionary in [
+            &b"<< /FS /URL /F (https://example.com/x.pdf) >>"[..],
+            b"<< /Type /OPI /Version 1.3 >>",
+        ] {
+            assert_eq!(
+                codes(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, dictionary])),
+                ["pdf.external_ref"]
+            );
+        }
+        let reference = stream(
+            "/Subtype /Form /BBox [0 0 9 9] /Ref << /F (x.pdf) /Page 0 >>",
+            b"",
+        );
+        assert_eq!(
+            codes(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, &reference])),
+            ["pdf.external_ref"]
+        );
+    }
+
+    #[test]
+    fn postscript_in_appearance_strings_and_functions() {
+        let form = b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /DA ((quit) PS) >> >>";
+        assert_eq!(codes(&pdf(&[form, PAGES, PAGE])), ["pdf.postscript"]);
+        let ordinary = b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /DA (/Helv 0 Tf 0 g) >> >>";
+        assert_eq!(codes(&pdf(&[ordinary, PAGES, PAGE])), [""; 0]);
+
+        let function = |program: &[u8]| {
+            let function = stream("/FunctionType 4 /Domain [0 1] /Range [0 1]", program);
+            codes(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, &function]))
+        };
+        assert_eq!(function(b"{ 1 exch sub }"), [""; 0]);
+        assert_eq!(function(b"{ (%pipe%id) (r) file }"), ["pdf.postscript"]);
+    }
+
+    #[test]
+    fn multimedia_annotations() {
+        for subtype in ["Movie", "Sound", "Screen", "RichMedia", "3D"] {
+            let annotation = format!("<< /Subtype /{subtype} /Rect [0 0 9 9] >>");
+            assert_eq!(
+                codes(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, annotation.as_bytes()])),
+                ["pdf.rich_media"],
+                "{subtype}"
+            );
+        }
+    }
+
+    #[test]
+    fn xml_that_reaches_outside() {
+        let metadata = |text: &[u8]| {
+            let metadata = stream("/Type /Metadata /Subtype /XML", text);
+            run(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, &metadata]))
+        };
+        assert_eq!(metadata(b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"/>"), []);
+        assert_eq!(
+            metadata(b"<!DOCTYPE x [<!ENTITY e SYSTEM \"file:///etc/passwd\">]><x>&e;</x>"),
+            [("pdf.xml_entity", Severity::High)]
+        );
+        assert_eq!(
+            metadata(b"<!DOCTYPE x><x/>"),
+            [("pdf.xml_entity", Severity::Medium)]
+        );
+        let utf16: Vec<u8> = "<!ENTITY e 'x'>"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect();
+        assert_eq!(metadata(&utf16), [("pdf.xml_entity", Severity::High)]);
+        assert_eq!(
+            metadata(b"<x xmlns:xi=\"http://www.w3.org/2001/XInclude\"><xi:include href=\"/etc/passwd\"/></x>"),
+            [("pdf.xml_external_ref", Severity::Medium)]
+        );
+    }
+
+    #[test]
+    fn sizes_that_exhaust_a_renderer() {
+        let image = |width: u64, height: u64| {
+            let image = stream(
+                &format!("/Subtype /Image /Width {width} /Height {height} /BitsPerComponent 8"),
+                b"\0",
+            );
+            codes(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, &image]))
+        };
+        assert_eq!(image(4000, 3000), [""; 0]);
+        assert_eq!(image(1_000_000, 1_000_000), ["pdf.pixel_bomb"]);
+
+        let page = |entries: &str| {
+            let page = format!("<< /Type /Page /Parent 2 0 R {entries} >>");
+            codes(&pdf(&[PLAIN_CATALOG, PAGES, page.as_bytes()]))
+        };
+        // A0, and the largest page the format allows.
+        assert_eq!(page("/MediaBox [0 0 2384 3370]"), [""; 0]);
+        assert_eq!(page("/MediaBox [0 0 14400 14400]"), [""; 0]);
+        assert_eq!(page("/MediaBox [0 0 14400000 100]"), ["pdf.page_size"]);
+        assert_eq!(
+            page("/MediaBox [0 0 612 792] /CropBox [-99999 0 99999 9]"),
+            ["pdf.page_size"]
+        );
+        assert_eq!(
+            page("/MediaBox [0 0 10000 10000] /UserUnit 10"),
+            ["pdf.page_size"]
+        );
+    }
+
+    #[test]
+    fn forms_that_draw_themselves() {
+        let form = |resources: &str, content: &[u8]| {
+            stream(
+                &format!("/Subtype /Form /BBox [0 0 9 9] {resources}"),
+                content,
+            )
+        };
+        let page = b"<< /Type /Page /Parent 2 0 R /Resources << /XObject << /A 4 0 R >> >> >>";
+        let document = |forms: &[&[u8]]| {
+            let mut objects = vec![PLAIN_CATALOG, PAGES, &page[..]];
+            objects.extend_from_slice(forms);
+            codes(&pdf(&objects))
+        };
+
+        let itself = form("/Resources << /XObject << /A 4 0 R >> >>", b"q /A Do Q");
+        assert_eq!(document(&[&itself]), ["pdf.draw_recursion"]);
+        // Through the resources of the page that draws it.
+        let inherited = form("", b"/A Do");
+        assert_eq!(document(&[&inherited]), ["pdf.draw_recursion"]);
+        // Through another form.
+        let first = form("/Resources << /XObject << /B 5 0 R >> >>", b"/B Do");
+        let second = form("/Resources << /XObject << /A 4 0 R >> >>", b"/A Do");
+        assert_eq!(document(&[&first, &second]), ["pdf.draw_recursion"]);
+
+        // Listing a form is not drawing it, and neither is naming it in a string.
+        let listed = form("/Resources << /XObject << /A 4 0 R >> >>", b"(/A Do) Tj");
+        assert_eq!(document(&[&listed]), [""; 0]);
+        let chain = form("/Resources << /XObject << /B 5 0 R >> >>", b"/B Do /B Do");
+        let leaf = form("", b"0 0 9 9 re f");
+        assert_eq!(document(&[&chain, &leaf]), [""; 0]);
+    }
+
+    #[test]
+    fn one_object_defined_twice() {
+        let twice = |second: &[u8], between: &[u8]| {
+            let mut data = pdf(&[PLAIN_CATALOG, PAGES, PAGE]);
+            data.extend_from_slice(between);
+            data.extend_from_slice(b"3 0 obj\n");
+            data.extend_from_slice(second);
+            data.extend_from_slice(b"\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n");
+            codes(&data)
+        };
+        let other = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 9 9] >>";
+        // A later revision replaces the object: that is what updates are.
+        assert_eq!(twice(other, b""), ["pdf.incremental_update"]);
+        assert_eq!(twice(PAGE, b""), ["pdf.incremental_update"]);
+
+        let mut conflicting = pdf(&[PLAIN_CATALOG, PAGES, PAGE]);
+        let trailer = memmem::find(&conflicting, b"trailer").unwrap();
+        let mut second = b"3 0 obj\n".to_vec();
+        second.extend_from_slice(other);
+        second.extend_from_slice(b"\nendobj\n");
+        conflicting.splice(trailer..trailer, second.clone());
+        assert_eq!(codes(&conflicting), ["pdf.conflicting_objects"]);
+
+        // The same bytes twice are a careless writer's, and say one thing.
+        let mut repeated = pdf(&[PLAIN_CATALOG, PAGES, PAGE]);
+        let mut same = b"3 0 obj\n".to_vec();
+        same.extend_from_slice(PAGE);
+        same.extend_from_slice(b"\nendobj\n");
+        repeated.splice(trailer..trailer, same);
+        assert_eq!(codes(&repeated), [""; 0]);
+
+        // An object that stands in the data of a stream belongs to the stream.
+        let mut carried = b"3 0 obj\n".to_vec();
+        carried.extend_from_slice(other);
+        carried.extend_from_slice(b"\nendobj");
+        let carrier = stream("", &carried);
+        assert_eq!(
+            codes(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, &carrier])),
+            [""; 0]
+        );
+    }
+
+    #[test]
+    fn other_formats_inside_the_document() {
+        let with = |insert: &[u8]| {
+            let mut data = pdf(&[PLAIN_CATALOG, PAGES, PAGE]);
+            let trailer = memmem::find(&data, b"trailer").unwrap();
+            data.splice(trailer..trailer, insert.iter().copied());
+            run(&data)
+        };
+        assert_eq!(with(b"% a comment\n"), []);
+        assert_eq!(
+            with(b"% PK\x03\x04\x14\0\0\0\n"),
+            [("pdf.polyglot", Severity::High)]
+        );
+        assert_eq!(
+            with(b"% <HTML><body>x</body></html>\n"),
+            [("pdf.polyglot", Severity::Medium)]
+        );
+        assert_eq!(with(b"%PDF-1.4\n"), [("pdf.malformed", Severity::Medium)]);
+
+        // In the data of a stream they are data.
+        let archive = stream("", b"PK\x03\x04 <html> \n%PDF-1.4\n");
+        assert_eq!(run(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, &archive])), []);
+    }
+
+    #[test]
+    fn what_is_reported_and_does_not_decide() {
+        let image = stream(
+            "/Subtype /Image /Width 1 /Height 1 /Filter /JBIG2Decode",
+            b"\0",
+        );
+        assert_eq!(
+            run(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, &image])),
+            [("pdf.risky_codec", Severity::Info)]
+        );
+        let stamp = b"<< /Subtype /Stamp /Rect [0 0 9 9] /F 36 >>";
+        assert_eq!(
+            run(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, stamp])),
+            [("pdf.print_only", Severity::Info)]
+        );
+        let layer = b"<< /Type /OCG /Usage << /Print << /PrintState /ON >> /View << /ViewState /OFF >> >> >>";
+        assert_eq!(
+            run(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, layer])),
+            [("pdf.print_only", Severity::Info)]
+        );
+        let signature = b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>";
+        assert_eq!(
+            run(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, signature])),
+            [("pdf.signature_modified", Severity::Info)]
+        );
+    }
+
+    #[test]
+    fn numbers_a_decoder_trusts() {
+        let with = |parameters: &str| {
+            let data = stream(
+                &format!("/Filter /FlateDecode /DecodeParms {parameters}"),
+                b"x",
+            );
+            codes(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, &data]))
+        };
+        assert_eq!(with("<< /Predictor 12 /Columns 5 /Colors 3 >>"), [""; 0]);
+        assert_eq!(with("[null << /Predictor 2 >>]"), [""; 0]);
+        for wrong in [
+            "<< /Predictor 99 >>",
+            "<< /Colors 0 >>",
+            "<< /BitsPerComponent 7 >>",
+            "<< /Columns 4294967296 >>",
+            "<< /Columns -1 >>",
+        ] {
+            assert_eq!(with(wrong), ["pdf.malformed"], "{wrong}");
+        }
+        let name = format!("<< /{} 1 >>", "N".repeat(300));
+        assert_eq!(
+            codes(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, name.as_bytes()])),
+            ["pdf.malformed"]
+        );
     }
 }
