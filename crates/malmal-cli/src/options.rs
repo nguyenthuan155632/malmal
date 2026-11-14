@@ -3,7 +3,7 @@
 use std::fs;
 use std::time::Duration;
 
-use malmal::{FileType, HashList, Limits, Policy, Scanner};
+use malmal::{FileType, HashList, Limits, MemoryLimit, Policy, Scanner};
 
 use crate::sandbox::Mode;
 use crate::watchdog::Watchdog;
@@ -30,6 +30,8 @@ pub const HELP: &str = "  --policy <NAME>      default or strict [default: defau
                        what a request costs in memory follows from it
                        [default: 268435456]
   --max-pixels <N>     Most pixels an image may declare [default: 268435456]
+  --max-memory <BYTES> Most memory one scan may hold, beyond the file;
+                       0 for no limit [default: 536870912]
   --scan-timeout <S>   Seconds one scan may take [default: 10]
   --hard-timeout <S>   Seconds after which a scan still running ends the
                        process; 0 for never [default: six times --scan-timeout]
@@ -56,6 +58,8 @@ pub const HELP: &str = "  --policy <NAME>      default or strict [default: defau
                        what a request costs in memory follows from it
                        [default: 268435456]
   --max-pixels <N>     Most pixels an image may declare [default: 268435456]
+  --max-memory <BYTES> Most memory one scan may hold, beyond the file;
+                       0 for no limit [default: 536870912]
   --scan-timeout <S>   Seconds one scan may take [default: 10]
   --hard-timeout <S>   Seconds after which a scan still running ends the
                        process; 0 for never [default: six times --scan-timeout]
@@ -91,6 +95,10 @@ pub fn memory_limit(limits: &Limits, at_once: u64, files: u64) -> Option<u64> {
     MEMORY_LIMIT.map(|limit| limit.saturating_add(beyond_default))
 }
 
+/// What one scan may hold in memory by default: twice what the decoders
+/// may produce, whose output is most of what a scan holds.
+pub const DEFAULT_MAX_MEMORY: u64 = 512 << 20;
+
 pub struct Common {
     pub policy: Policy,
     /// Replaces the policy's accepted types when given.
@@ -101,6 +109,8 @@ pub struct Common {
     pub no_hash: bool,
     pub pdf_passwords: Vec<String>,
     pub limits: Limits,
+    /// What one scan may hold in memory; 0 is no limit.
+    pub max_memory: u64,
     /// Seconds given with `--hard-timeout`; 0 is never.
     pub hard_timeout: Option<u64>,
     pub sandbox: Mode,
@@ -118,6 +128,7 @@ impl Default for Common {
             no_hash: false,
             pdf_passwords: Vec::new(),
             limits: Limits::default(),
+            max_memory: DEFAULT_MAX_MEMORY,
             hard_timeout: None,
             sandbox: Mode::BestEffort,
             #[cfg(feature = "yara")]
@@ -202,6 +213,12 @@ impl Common {
                     .filter(|&pixels: &u64| pixels > 0)
                     .ok_or("--max-pixels needs a positive number of pixels")?;
             }
+            "--max-memory" => {
+                self.max_memory = rest
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .ok_or("--max-memory needs a number of bytes")?;
+            }
             "--scan-timeout" => {
                 let seconds = rest
                     .next()
@@ -258,6 +275,13 @@ impl Common {
             builder.without_hash()
         } else {
             builder
+        };
+        let builder = match self.max_memory {
+            0 => builder,
+            max => builder.memory_limit(MemoryLimit {
+                max,
+                measure: crate::memory::held,
+            }),
         };
         #[cfg(feature = "yara")]
         let builder = if self.yara_sources.is_empty() {

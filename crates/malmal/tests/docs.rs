@@ -18,7 +18,7 @@ fn codes(text: &str, quote: char) -> BTreeSet<String> {
                 && GROUPS.contains(&group)
                 && candidate
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || c == '.' || c == '_')
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_')
                 && candidate.ends_with(|c: char| c.is_ascii_lowercase())
         })
         .map(str::to_string)

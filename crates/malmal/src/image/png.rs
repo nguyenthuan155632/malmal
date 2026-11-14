@@ -1,7 +1,5 @@
-use miniz_oxide::inflate::{TINFLStatus, decompress_to_vec_zlib_with_limit};
-
 use super::{Ctx, Layout, Malformed, be32};
-use crate::limits::LimitExceeded;
+use crate::limits::Unpacked;
 use crate::payload::{self, Scope};
 use crate::report::{Finding, Severity};
 
@@ -83,10 +81,8 @@ fn compressed_part<'a>(kind: &[u8], body: &'a [u8]) -> Option<&'a [u8]> {
 /// Inflate a chunk under the scan budget and look for code in the result;
 /// uncompressed chunks are already covered by the whole-file payload scan.
 fn scan_compressed(compressed: &[u8], chunk: usize, ctx: &mut Ctx<'_>) -> Result<(), Malformed> {
-    let limit = ctx.budget.remaining().min(MAX_INFLATED_CHUNK);
-    match decompress_to_vec_zlib_with_limit(compressed, limit as usize) {
+    match crate::limits::inflate(compressed, true, MAX_INFLATED_CHUNK, ctx.budget) {
         Ok(inflated) => {
-            let _ = ctx.budget.consume(inflated.len() as u64);
             if !payload::scan(&inflated, Scope::Binary).is_empty() {
                 ctx.findings.push(
                     Finding::new(
@@ -99,12 +95,11 @@ fn scan_compressed(compressed: &[u8], chunk: usize, ctx: &mut Ctx<'_>) -> Result
             }
             Ok(())
         }
-        Err(error) if error.status == TINFLStatus::HasMoreOutput => {
-            let _ = ctx.budget.consume(limit);
-            ctx.limit_exceeded(LimitExceeded::Decompression);
+        Err(Unpacked::Limit) => {
+            ctx.limit_exceeded(ctx.budget.decode_limit());
             Ok(())
         }
-        Err(_) => Err(Malformed::new(chunk, "corrupt compressed PNG chunk")),
+        Err(Unpacked::Corrupt) => Err(Malformed::new(chunk, "corrupt compressed PNG chunk")),
     }
 }
 

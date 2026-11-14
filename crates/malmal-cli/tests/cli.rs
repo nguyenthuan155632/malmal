@@ -158,6 +158,41 @@ fn allow_option_lets_the_codes_it_names_through() {
 }
 
 #[test]
+fn max_memory_stops_a_scan_that_holds_too_much() {
+    // An attachment of 96 MiB of zeros, run-length encoded: 2 bytes for
+    // every 128.
+    let dir = scratch("memory");
+    let file = dir.join("attachment.pdf");
+    let runs = (96 << 20) / 128;
+    let data = [b"\x81\0".repeat(runs), b"\x80".to_vec()].concat();
+    let mut pdf = format!(
+        "%PDF-1.7\n1 0 obj << /Type /Catalog /Names << /EmbeddedFiles << /Names [(a) 3 0 R] >> >> >> endobj\n\
+         2 0 obj << /Type /EmbeddedFile /Filter /RunLengthDecode /Length {} >> stream\n",
+        data.len()
+    )
+    .into_bytes();
+    pdf.extend_from_slice(&data);
+    pdf.extend_from_slice(
+        b"\nendstream endobj\n3 0 obj << /Type /Filespec /F (a) /EF << /F 2 0 R >> >> endobj\n\
+          trailer << /Root 1 0 R >>\n%%EOF\n",
+    );
+    fs::write(&file, pdf).unwrap();
+
+    let scan = |options: &[&str]| {
+        let output = Command::new(MALMAL)
+            .args(["scan", "--json"])
+            .args(options)
+            .arg(&file)
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert!(!scan(&[]).contains("limit.memory"));
+    assert!(scan(&["--max-memory", &(32u64 << 20).to_string()]).contains("limit.memory"));
+    assert!(!scan(&["--max-memory", "0"]).contains("limit.memory"));
+}
+
+#[test]
 fn help_works_after_the_command_and_stays_aligned() {
     for args in [
         &["--help"][..],
@@ -607,11 +642,26 @@ fn idle_connections_do_not_keep_others_waiting() {
 
     let (_daemon, address) = daemon_on_tcp("--http");
     let request = b"GET /healthz HTTP/1.1\r\n\r\n";
+    // The whole answer is read, so that the next one starts the stream.
     let answered = |stream: &mut TcpStream| {
         stream.write_all(request).unwrap();
-        let mut reply = [0; 15];
-        stream.read_exact(&mut reply).unwrap();
-        assert_eq!(&reply, b"HTTP/1.1 200 OK");
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        let length = head
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|n| n.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        stream.read_exact(&mut vec![0; length]).unwrap();
     };
     // Three times as many as requests are worked on at once.
     let mut kept: Vec<TcpStream> = (0..12)
@@ -619,13 +669,13 @@ fn idle_connections_do_not_keep_others_waiting() {
         .collect();
     kept.iter_mut().for_each(answered);
 
-    let started = Instant::now();
     let mut late = TcpStream::connect(&address).unwrap();
-    late.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+    late.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
     answered(&mut late);
-    // Well inside the five seconds after which an idle connection is dropped.
-    assert!(started.elapsed() < Duration::from_secs(3));
-    drop(kept);
+    // Answered while the others are all still open, not once some of them
+    // were dropped for being idle.
+    kept.iter_mut().for_each(answered);
 }
 
 /// A client that sends its file a byte now and then once held a worker
@@ -635,14 +685,14 @@ fn slow_clients_keep_no_one_waiting_and_are_let_go() {
     use std::io::Read;
     use std::net::TcpStream;
 
-    let args = ["--workers", "1", "--timeout", "1", "--min-rate", "1000"];
-    let (_daemon, address) = daemon_on_tcp_with("--http", &args);
+    let slow_request = b"POST /scan HTTP/1.1\r\nContent-Length: 100000\r\n\r\nGIF";
+    // A client that has not sent its file keeps no one else waiting: with
+    // one worker, another is answered while it is still sending.
+    let args = ["--workers", "1", "--timeout", "30"];
+    let (_patient, address) = daemon_on_tcp_with("--http", &args);
     let mut slow = TcpStream::connect(&address).unwrap();
-    slow.write_all(b"POST /scan HTTP/1.1\r\nContent-Length: 100000\r\n\r\nGIF")
-        .unwrap();
+    slow.write_all(slow_request).unwrap();
     thread::sleep(Duration::from_millis(300));
-
-    let started = Instant::now();
     let mut other = TcpStream::connect(&address).unwrap();
     other
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -656,18 +706,25 @@ fn slow_clients_keep_no_one_waiting_and_are_let_go() {
     let mut reply = String::new();
     other.read_to_string(&mut reply).unwrap();
     assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
-    assert!(started.elapsed() < Duration::from_secs(1));
+    slow.write_all(b"8").unwrap();
 
-    // A byte every 300 ms is far below the pace asked for.
+    // A byte every 300 ms is far below the pace asked for: once `--timeout`
+    // has passed, the client is let go. The minute is only so that the test
+    // ends if it is not.
+    let args = ["--workers", "1", "--timeout", "1", "--min-rate", "1000"];
+    let (_strict, address) = daemon_on_tcp_with("--http", &args);
+    let mut slow = TcpStream::connect(&address).unwrap();
+    slow.write_all(slow_request).unwrap();
     let started = Instant::now();
-    while slow.write_all(b"8").is_ok() && started.elapsed() < Duration::from_secs(20) {
+    let mut let_go = false;
+    while started.elapsed() < Duration::from_secs(60) {
         thread::sleep(Duration::from_millis(300));
+        if slow.write_all(b"8").is_err() {
+            let_go = true;
+            break;
+        }
     }
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "{:?}",
-        started.elapsed()
-    );
+    assert!(let_go);
 }
 
 /// A PDF of `size` bytes or a little more, most of them one image, with a

@@ -146,6 +146,7 @@ mod ps;
 /// The result of a scan.
 pub mod report;
 mod svg;
+mod work;
 #[cfg(feature = "yara")]
 mod yara;
 
@@ -155,8 +156,8 @@ use sha2::{Digest, Sha256};
 
 pub use detect::FileType;
 pub use hashlist::{HashList, HashListError};
-pub use limits::Limits;
-use limits::{Budget, LimitExceeded};
+use limits::Budget;
+pub use limits::{Limits, MemoryLimit};
 pub use policy::{AllowError, Policy};
 pub use report::{Finding, Report, Severity, Verdict};
 #[cfg(feature = "yara")]
@@ -183,6 +184,7 @@ pub struct Scanner {
     hashlist: HashList,
     without_hash: bool,
     pdf_passwords: Passwords,
+    memory: Option<MemoryLimit>,
     #[cfg(feature = "yara")]
     yara: Option<YaraRules>,
 }
@@ -248,6 +250,13 @@ impl ScannerBuilder {
         self
     }
 
+    /// Stop a scan that holds more memory than `limit` allows, with
+    /// `limit.memory`. See [`MemoryLimit`] for how it is measured.
+    pub fn memory_limit(mut self, limit: MemoryLimit) -> Self {
+        self.scanner.memory = Some(limit);
+        self
+    }
+
     /// Match every scanned file against these YARA rules.
     #[cfg(feature = "yara")]
     pub fn yara(mut self, rules: YaraRules) -> Self {
@@ -275,6 +284,12 @@ impl Scanner {
     /// The limits this scanner was built with.
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// Replace the memory limit of a scanner already built, `None` for none:
+    /// see [`ScannerBuilder::memory_limit`].
+    pub fn set_memory_limit(&mut self, limit: Option<MemoryLimit>) {
+        self.memory = limit;
     }
 
     /// Scan a file and, if it is clean and of a type that can be, write it
@@ -390,7 +405,7 @@ impl Scanner {
             data
         };
 
-        let mut budget = Budget::new(&self.limits);
+        let mut budget = Budget::new(&self.limits).with_memory(self.memory);
         let mut detected = detect::detect(data);
         // SVGZ: a gzip member is only acceptable as a wrapper around an SVG.
         let mut inflated = None;
@@ -401,9 +416,7 @@ impl Scanner {
                     inflated = Some(inner);
                 }
                 Ok(_) | Err(svg::GunzipError::Corrupt) => {}
-                Err(svg::GunzipError::Limit) => {
-                    findings.push(LimitExceeded::Decompression.finding())
-                }
+                Err(svg::GunzipError::Limit) => findings.push(budget.decode_limit().finding()),
             }
         }
         let data = inflated.as_deref().unwrap_or(data);

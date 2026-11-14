@@ -18,6 +18,8 @@ Anything but `report.clean`, including a `malmal.ScanError`, means the file is n
 against a file; they are still reported, at `"info"`. A code that does not exist raises
 `ValueError`. Which codes honest files carry, and what letting each through takes on, is
 in the [main README](https://github.com/nguyenthuan155632/malmal#allowing-finding-codes).
+`Scanner(max_memory=...)` is what one scan may hold, in bytes (512 MiB unless given;
+`None` or `0` for no limit); a scan that holds more is stopped with `limit.memory`.
 
 `sanitize` scans and then writes a clean image anew from its pixels, so that nothing but the
 picture is kept:

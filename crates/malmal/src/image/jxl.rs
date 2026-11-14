@@ -4,11 +4,9 @@
 //! decoding it. Metadata boxes stored Brotli-compressed are decompressed and
 //! searched like the rest of the file.
 
-use std::io::Read;
-
 use super::isobmff::{self, BoxAt};
 use super::{Ctx, Layout, Malformed, be32};
-use crate::limits::LimitExceeded;
+use crate::limits::Unpacked;
 use crate::payload::{self, Scope};
 use crate::report::{Finding, Severity};
 
@@ -66,20 +64,15 @@ fn scan_compressed(
 ) -> Result<(), Malformed> {
     let corrupt = || Malformed::new(body, "corrupt compressed metadata box");
     let stream = data[..end].get(body + 4..).ok_or_else(corrupt)?;
-    let limit = ctx.budget.remaining().min(MAX_METADATA);
-    let mut plain = Vec::new();
-    let read = brotli_decompressor::Decompressor::new(stream, 4096)
-        .take(limit + 1)
-        .read_to_end(&mut plain);
-    if read.is_err() {
-        return Err(corrupt());
-    }
-    if plain.len() as u64 > limit {
-        let _ = ctx.budget.consume(limit);
-        ctx.limit_exceeded(LimitExceeded::Decompression);
-        return Ok(());
-    }
-    let _ = ctx.budget.consume(plain.len() as u64);
+    let read = brotli_decompressor::Decompressor::new(stream, 4096);
+    let plain = match crate::limits::read_all(read, MAX_METADATA, ctx.budget) {
+        Ok(plain) => plain,
+        Err(Unpacked::Corrupt) => return Err(corrupt()),
+        Err(Unpacked::Limit) => {
+            ctx.limit_exceeded(ctx.budget.decode_limit());
+            return Ok(());
+        }
+    };
     if !payload::scan(&plain, Scope::Binary).is_empty() {
         ctx.findings.push(
             Finding::new(

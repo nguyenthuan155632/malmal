@@ -429,10 +429,26 @@ scanning and 2.1 GiB rebuilding. A scan does not wait for memory: `--file-budget
 the files and not what is decoded from them, which is only known as the scan goes. Making
 each scan wait for the most it could take, `--max-decompressed` and more, would let as
 many scans run as `--workers` already does, and handing out decoded bytes from one pool
-would make a file's verdict depend on what else was being scanned. So a container with
-less than `--file-budget` plus `--workers` times some 550 MiB can be ended by its memory
-limit when such files arrive together, and the daemon with defaults in a container of
-512 MiB is.
+would make a file's verdict depend on what else was being scanned.
+
+What one scan may hold is set instead by `--max-memory` (512 MiB; `0` for no limit). The
+tools count what each thread allocates and frees, and a scan whose thread holds more than
+that beyond what it held when the scan began is stopped with `limit.memory`, which is
+never clean. It is checked as each block of a PDF stream, a PNG chunk, an SVGZ file or
+a JPEG XL box is inflated, before a PostScript ASCII85 string is decoded, and between the
+steps of a scan. It bounds scans and the scan of a rebuilt file, not the rebuilding
+itself. With `--max-memory 67108864` (64 MiB), the attachment and the
+object stream that each inflate to 200 MiB were stopped at 55 MiB, against 205 MiB
+without; eight of them sent at once to four workers took the daemon to 201 MiB, against
+807 MiB. At 16 MiB, no file of CIC-Evasive-PDFMal2022 or of the test corpus reached the
+limit; at 1 MiB, 56 did. In Rust, `ScannerBuilder::memory_limit` takes the limit and the
+function that measures what the thread holds; the C library counts for itself, and takes
+the limit with `malmal_scanner_set_max_memory` (512 MiB unless set, `0` for none), and so
+does Python, as `Scanner(max_memory=…)`.
+
+So a container with less than `--file-budget` plus `--workers` times `--max-memory` can be
+ended by its memory limit when such files arrive together, and the daemon with defaults in
+a container of 512 MiB can be.
 Ordinary files are nowhere near: 3,000 scans of a 200 KB PDF leave the daemon at 4 MiB.
 
 To run in less, lower what a request may cost and how many are worked on:

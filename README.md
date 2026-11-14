@@ -379,6 +379,7 @@ Status codes, metrics and protocol details are in
 | `--max-size <BYTES>` | 64 MiB | `Limits::max_file_size` | | |
 | `--max-decompressed <BYTES>` | 256 MiB | `Limits::max_decompressed` | | |
 | `--max-pixels <N>` | 2^28 | `Limits::max_pixels` | | |
+| `--max-memory <BYTES>` | 512 MiB | `ScannerBuilder::memory_limit` | `max_memory=` | `malmal_scanner_set_max_memory` |
 | `--scan-timeout <S>` | 10 | `Limits::max_duration` | | |
 | `--hard-timeout <S>` | 6 × scan timeout | | | |
 | `--yara <PATH>` | none | `ScannerBuilder::yara` | | |
@@ -395,6 +396,7 @@ The Python and C interfaces use the default limits. Embedded files are scanned u
 | `--jpeg-quality <N>` | 90 | Quality of rebuilt JPEG files, 1–100 |
 | `--pdf-dpi <N>` | 150 | Resolution of rebuilt PDF pages, 36–600 |
 | `--pdf-jpeg` | off | Store a PDF page as JPEG when that is smaller |
+| `--pdf-no-text` | off | Leave out the invisible text layer of a rebuilt PDF |
 
 `malmald` also takes:
 
@@ -441,14 +443,15 @@ Codes that legitimate files often carry:
 | Code | Severity | Common in | Risk if allowed |
 |---|---|---|---|
 | `pdf.xfa` | Medium | Tax and government forms | Forms render differently between readers |
-| `pdf.embedded_file` | Medium | Source documents, e-invoices (ZUGFeRD, Factur-X) | Attached files the reader can open; each is still scanned |
+| `pdf.embedded_file` | Medium | Source documents, e-invoices (ZUGFeRD, Factur-X); not C2PA manifests, which are `pdf.c2pa_manifest` at Info | Attached files the reader can open; each is still scanned |
 | `pdf.javascript` | High | Forms that calculate or validate fields | Scripts run by the reader; the most common PDF attack |
 | `pdf.open_action`, `pdf.additional_action` | Medium/High | Documents that open at a page or react to events | Actions that run without a click |
 | `pdf.rich_media` | Medium | Brochures with video, sound or 3D | Media decoders with a history of exploits |
 | `pdf.external_ref` | Medium | Prepress files, documents that include other files | Rendered content that was not scanned |
 | `pdf.encrypted` | Medium | Documents locked with a password you do not have | Content that was not scanned at all |
 | `pdf.submit_form`, `pdf.remote_goto` | Low | Forms that submit data, links to other documents | Requests to addresses the file chooses |
-| `pdf.trailing_data`, `image.trailing_data` | Low | Files saved by some editors and cameras | Unread bytes after the end of the file |
+| `pdf.trailing_data`, `image.trailing_data` | Low | Files saved by some editors and cameras; the trailers of Samsung and OPPO cameras and motion photos are `image.vendor_trailer` at Info | Unread bytes after the end of the file |
+| `pdf.link_lure` | Low | Flyers and covers that are one large picture linking to a site | A click anywhere on the page opens a site the file chooses |
 | `pdf.launch` | High | Old documents that open a local file | Starts a program on the reader's machine |
 | `svg.foreign_object` | Medium | Diagrams from tools such as draw.io | HTML rendered inside the image |
 | `svg.external_ref` | Medium | Images that load web fonts or pictures | Requests to other sites when displayed |
@@ -550,8 +553,10 @@ In C, use `malmal_sanitize`. In every interface, if rebuilding fails, store noth
   ([svg-hush](https://github.com/cloudflare/svg-hush)) that keeps only what draws.
   The result is scanned again and refused if it is not clean.
 - **PDF** pages are rendered ([hayro](https://github.com/LaurenzV/hayro)) and the new PDF
-  contains only the page images. Text can no longer be selected or searched, links and
-  forms are removed, and text documents become about ten times larger. This needs the
+  contains the page images and, under each, the page's characters where they stood, in
+  a font of glyphs that draw nothing: text can still be selected, searched and copied
+  (`--pdf-no-text` or `Options::pdf_text = false` leaves it out). Fonts, links and forms
+  are removed, and text documents become about ten times larger. This needs the
   `cdr-pdf` feature, which is not included in the released binaries, container or wheels:
 
   ```bash
@@ -596,9 +601,12 @@ its share as it arrives and waits for room when there is none, and a request tha
 room within `--timeout` is refused (`503` over HTTP), never answered as clean. The default,
 `--workers` times `--max-size`, is what the files could take before the option existed. The
 second is set per scan by `--max-decompressed` and `--max-pixels`, and in total by
-`--workers`: at the defaults a single hostile file can take 250–550 MB, and four workers
-handling such files at once peaked at about 2 GB. The ceiling is then about
-`--file-budget` plus `--workers` times that; lower these options to fit your memory.
+`--workers`, and `--max-memory` (512 MiB, `0` for none) stops a scan that holds more than
+that beyond what its thread held when it began, with `limit.memory`. Two files that each
+inflate to 200 MB peaked at 205 MB without it and 55 MB with a limit of 64 MiB; eight
+of them sent to a daemon with four workers, at 807 MB and 201 MB. The ceiling is then
+about `--file-budget` plus `--workers` times `--max-memory`; lower these options to fit
+your memory.
 Details and measurements are in [docs/integration.md](docs/integration.md#memory).
 
 ### Container
@@ -618,14 +626,16 @@ Results on [CIC-Evasive-PDFMal2022](https://www.unb.ca/cic/datasets/pdfmal-2022.
 
 | Configuration | Malicious rejected | Clean accepted |
 |---|---:|---:|
-| Default policy | 98.19% | 87.32% |
-| `--allow 'pdf.xfa\|pdf.embedded_file'` | 98.18% | 92.38% |
-| `--allow 'pdf.xfa\|pdf.embedded_file\|pdf.javascript'` | 76.19% | 97.11% |
+| Default policy | 99.07% | 87.32% |
+| `--allow 'pdf.xfa\|pdf.embedded_file'` | 99.06% | 92.38% |
+| `--allow 'pdf.xfa\|pdf.embedded_file\|pdf.javascript'` | 80.15% | 97.11% |
 
 Every clean file that is rejected carries active content or an attachment: JavaScript
 (660), XFA forms (260), attachments (207), launch actions (12), media (9) and a few others.
-Of the 396 malicious files accepted, 379 contain only a picture and a link to an ordinary
-web address; judging those requires a URL reputation service.
+Of the 203 malicious files accepted, 187 contain a link to an ordinary web address and
+nothing else: one smaller than a fifth of the page (or `pdf.link_lure` would refuse it),
+that goes through no shortener and to no numeric, punycode or made-up name (or
+`pdf.disguised_link` would). Judging such an address requires a URL reputation service.
 
 To measure false positives on your own files before you deploy:
 
@@ -652,8 +662,9 @@ goes to the SHA-256 hash; `--no-hash` skips it when you do not need it.
   built at run time is reported as `ps.exec_dynamic`, not analyzed. Always run Ghostscript
   with `-dSAFER` and in a sandbox.
 - **PDF JavaScript** is reported because it is present, not because of what it does.
-- **Links in PDFs** are not judged: a document that only links to a malicious site is
-  clean.
+- **Links in PDFs** are not judged by where they go: a document whose only link is to a
+  malicious site is clean, unless the link covers a fifth of a page (`pdf.link_lure`) or
+  hides where it leads (`pdf.disguised_link`).
 - **Pixel data is not decoded during a scan.** For HEIC and AVIF the container is checked,
   not the HEVC or AV1 stream.
 - **Encrypted PDFs** support the standard security handler only, not certificate
@@ -671,7 +682,10 @@ goes to the SHA-256 hash; `--no-hash` skips it when you do not need it.
   takes; enough such clients fill `--connections` or the budget, and the others wait. They
   hold no worker, so the files that have arrived are still scanned.
 - **Scans do not wait for memory.** `--file-budget` counts the files, not what scanning them
-  takes; that is bounded per scan by the limits and in total by `--workers`.
+  takes; that is bounded per scan by `--max-memory` and in total by `--workers`. The memory
+  limit is checked as PDF streams, PNG, SVGZ and JPEG XL data are inflated and between
+  steps, so a step that allocates at once (a decoder of the `image` crate, say) can pass
+  it before it is caught.
 - **macOS** has no sandbox, and the test suite is not run there.
 
 ## Development

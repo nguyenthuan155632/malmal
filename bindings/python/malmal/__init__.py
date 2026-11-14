@@ -133,6 +133,8 @@ def _load(path):
         ctypes.c_char_p,
         ctypes.POINTER(ctypes.c_void_p),
     ]
+    library.malmal_scanner_set_max_memory.restype = None
+    library.malmal_scanner_set_max_memory.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
     library.malmal_scanner_free.restype = None
     library.malmal_scanner_free.argtypes = [ctypes.c_void_p]
     library.malmal_scan.restype = ctypes.c_int
@@ -183,11 +185,19 @@ class Scanner:
     ``["pdf.xfa", "pdf.embedded_file"]`` or ``"pdf.xfa|pdf.embedded_file"``;
     they are still reported, at ``"info"``. A code the scanner does not
     report, or a ``limit.*`` code, raises :class:`ValueError`, as does a hash
-    list that does not parse.
+    list that does not parse. ``max_memory`` is the most a scan may hold, in
+    bytes, beyond what its thread held when it began; past it the scan stops
+    with ``limit.memory``. ``None`` or ``0`` is no limit.
     """
 
     def __init__(
-        self, strict=False, hashlist=None, library=None, pdf_passwords=(), allow=()
+        self,
+        strict=False,
+        hashlist=None,
+        library=None,
+        pdf_passwords=(),
+        allow=(),
+        max_memory=512 << 20,
     ):
         # Before anything is loaded: `close` runs even when this raises.
         self._handle = None
@@ -220,6 +230,9 @@ class Scanner:
                 message = ctypes.string_at(error.value).decode(errors="replace")
                 self._library.malmal_string_free(error)
             raise ValueError(message)
+        if max_memory is not None and max_memory < 0:
+            raise ValueError("max_memory cannot be negative")
+        self._library.malmal_scanner_set_max_memory(self._handle, max_memory or 0)
 
     def scan(self, data, filename=None, content_type=None):
         """Scan ``data`` (bytes). ``filename`` and ``content_type`` are what

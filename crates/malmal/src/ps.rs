@@ -254,6 +254,7 @@ impl ResourceEnds {
     /// The first end at or after `from`.
     fn after(&mut self, data: &[u8], from: usize) -> Option<usize> {
         let ends = self.0.get_or_insert_with(|| {
+            crate::work::done(2 * data.len());
             let mut ends: Vec<usize> = memmem::find_iter(data, b"%%EndResource")
                 .chain(memmem::find_iter(data, b"%%EndProcSet"))
                 .collect();
@@ -398,8 +399,12 @@ impl Scanner<'_> {
                             let encoded = &data[pos + 2..pos + end];
                             // `z` stands for four bytes, so what comes out
                             // can be more than what went in.
-                            let left =
-                                usize::try_from(self.budget.remaining()).unwrap_or(usize::MAX);
+                            // Decoded at once: no more than the scan may
+                            // still hold.
+                            let headroom = self.budget.memory_watch().headroom();
+                            let remaining = self.budget.remaining();
+                            let left = headroom.map_or(remaining, |room| room.min(remaining));
+                            let left = usize::try_from(left).unwrap_or(usize::MAX);
                             let decoded =
                                 filters::apply(b"ASCII85Decode", encoded, &Params::default(), left);
                             pos += end + 2;
@@ -409,8 +414,11 @@ impl Scanner<'_> {
                                     decoded
                                 }
                                 Err(DecodeError::Limit) => {
+                                    if headroom.is_some_and(|room| room < remaining) {
+                                        self.budget.memory_spent();
+                                    }
                                     let _ = self.budget.consume(u64::MAX);
-                                    self.limit_exceeded(LimitExceeded::Decompression);
+                                    self.limit_exceeded(self.budget.decode_limit());
                                     Vec::new()
                                 }
                                 Err(_) => Vec::new(),
@@ -626,6 +634,7 @@ impl Scanner<'_> {
         }
         let length = ends.after(data, start)? - start;
         self.hash_work = self.hash_work.checked_sub(length as u64)?;
+        crate::work::done(length);
         is_known_procset(&data[start..start + length]).then_some(length)
     }
 
@@ -652,6 +661,7 @@ impl Scanner<'_> {
             return None;
         }
         let found = literal_string(source);
+        crate::work::done(found.as_ref().map_or(reach as usize, |(_, length)| *length));
         if found.is_none() {
             self.string_work = self.string_work.saturating_sub(reach);
             parens.start(at);
@@ -1062,17 +1072,22 @@ mod tests {
         // and every parenthesis a string that never does.
         let resources = format!(
             "{}%%EndResource\nfile",
-            "%%BeginResource: procset x\n".repeat(20_000)
+            "%%BeginResource: procset x\n".repeat(2_000)
         );
-        let started = std::time::Instant::now();
-        assert_eq!(codes(&resources), ["ps.file_access"]);
-        assert_eq!(codes(&"(".repeat(400_000)), NONE);
+        // Each byte is read a few times, not once for each comment or
+        // parenthesis before it.
+        let cost = |program: &str, expected: &[&str]| {
+            let (found, work) = crate::work::counted(|| codes(program));
+            assert_eq!(found, expected);
+            let allowed = 2 * work_allowed(program.len());
+            assert!(work < allowed, "{work} for {}", program.len());
+        };
+        cost(&resources, &["ps.file_access"]);
+        cost(&"(".repeat(40_000), &NONE);
         // Strings that start where the others read an escape are not known
-        // to them, and are read each on its own.
-        assert_eq!(codes(&"\\(".repeat(200_000)), ["limit.complexity"]);
-        // Some 0.6 s in a debug build; the resources alone took 19 s of an
-        // optimized build when each comment was read to the end.
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // to them, and are read each on its own, until the work allowed for
+        // them runs out.
+        cost(&"\\(".repeat(20_000), &["limit.complexity"]);
     }
 
     #[test]

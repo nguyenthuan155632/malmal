@@ -184,6 +184,17 @@ pub(crate) struct Parser<'a> {
     /// small: see [`SHARED`].
     items: Vec<Value>,
     entries: Vec<(Name, Value)>,
+    /// Where it started, for what the tests count of its reading.
+    #[cfg(test)]
+    start: usize,
+}
+
+/// What a parser has read is counted for the tests: see [`crate::work`].
+#[cfg(test)]
+impl Drop for Parser<'_> {
+    fn drop(&mut self) {
+        crate::work::done(self.pos.saturating_sub(self.start));
+    }
 }
 
 impl<'a> Parser<'a> {
@@ -195,6 +206,8 @@ impl<'a> Parser<'a> {
             skipping: false,
             items: Vec::new(),
             entries: Vec::new(),
+            #[cfg(test)]
+            start: pos,
         }
     }
 
@@ -363,7 +376,9 @@ impl<'a> Parser<'a> {
     }
 
     fn hex_string(&mut self) -> Option<Value> {
-        let length = memchr::memchr(b'>', self.rest())?;
+        let length = memchr::memchr(b'>', self.rest());
+        crate::work::searched(self.rest().len(), length, 1);
+        let length = length?;
         let digits = &self.rest()[1..length];
         self.pos += length + 1;
         if digits.len() > MAX_STRING * 2 || self.skipping {

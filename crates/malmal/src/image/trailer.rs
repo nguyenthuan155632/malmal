@@ -10,6 +10,8 @@ pub(super) fn recognize(trailing: &[u8]) -> Option<&'static str> {
         Some("Samsung camera metadata")
     } else if is_iso_media(trailing) {
         Some("a motion photo video")
+    } else if is_oppo_trailer(trailing) {
+        Some("OPPO camera metadata")
     } else {
         None
     }
@@ -88,6 +90,83 @@ fn is_iso_media(trailing: &[u8]) -> bool {
     true
 }
 
+/// OPPO's camera writes data blocks, then a JSON list that names each
+/// block by its distance back from the list and its length, then a zero
+/// byte, a tag of four letters and the length from the list to the end
+/// (little-endian). The blocks must tile everything before the list.
+fn is_oppo_trailer(trailing: &[u8]) -> bool {
+    let Some(tail_at) = trailing.len().checked_sub(9) else {
+        return false;
+    };
+    let (zero, tag) = (trailing[tail_at], &trailing[tail_at + 1..tail_at + 5]);
+    let length = le32(trailing, tail_at + 5).unwrap_or(0) as usize;
+    let Some(list_at) = trailing.len().checked_sub(length) else {
+        return false;
+    };
+    if zero != 0 || !tag.iter().all(u8::is_ascii_lowercase) || list_at >= tail_at {
+        return false;
+    }
+    let Some(blocks) = oppo_blocks(&trailing[list_at..tail_at]) else {
+        return false;
+    };
+    let Some(mut blocks) = blocks
+        .into_iter()
+        .map(|(back, size)| Some((list_at.checked_sub(back)?, size)))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    blocks.sort_unstable();
+    let mut expected = 0;
+    for (start, size) in blocks {
+        if start != expected {
+            return false;
+        }
+        expected += size;
+    }
+    expected == list_at
+}
+
+/// The blocks of the list, as distance back and length: objects of
+/// `"length"`, `"name"`, `"offset"` and `"version"`, with numbers and plain
+/// names, and nothing else.
+fn oppo_blocks(list: &[u8]) -> Option<Vec<(usize, usize)>> {
+    let inner = list.strip_prefix(b"[{")?.strip_suffix(b"}]")?;
+    let mut blocks = Vec::new();
+    for entry in inner.split(|&byte| byte == b'}').map(|entry| {
+        // Every object but the first starts with `,{`.
+        entry.strip_prefix(b",{").unwrap_or(entry)
+    }) {
+        let (mut back, mut size, mut named) = (None, None, false);
+        for field in entry.split(|&byte| byte == b',') {
+            let (key, value) = field.split_at(field.iter().position(|&byte| byte == b':')?);
+            let value = &value[1..];
+            let number = || -> Option<usize> {
+                if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                    return None;
+                }
+                std::str::from_utf8(value).ok()?.parse().ok()
+            };
+            match key {
+                b"\"length\"" => size = Some(number()?),
+                b"\"offset\"" => back = Some(number()?),
+                b"\"version\"" => _ = number()?,
+                b"\"name\"" => {
+                    let name = value.strip_prefix(b"\"")?.strip_suffix(b"\"")?;
+                    let plain = |byte: &u8| byte.is_ascii_alphanumeric() || b"._-".contains(byte);
+                    named = !name.is_empty() && name.iter().all(plain);
+                }
+                _ => return None,
+            }
+        }
+        if !named {
+            return None;
+        }
+        blocks.push((back?, size?));
+    }
+    Some(blocks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +201,52 @@ mod tests {
         assert_eq!(recognize(&suffixed), None);
         assert_eq!(recognize(b"SEFT"), None);
         assert_eq!(recognize(b"\0\0\0\0SEFT"), None);
+    }
+
+    /// Two blocks and the list that names them, as OPPO's camera writes it.
+    fn oppo_trailer(tag: &[u8; 4]) -> Vec<u8> {
+        let mut data = b"\0OPPO A5 5G\0\0\0\0\0".to_vec();
+        let list = br#"[{"length":4,"name":"private.emptyspace","offset":16,"version":1},{"length":12,"name":"watermark.device","offset":12,"version":1}]"#;
+        data.extend_from_slice(list);
+        data.push(0);
+        data.extend_from_slice(tag);
+        data.extend_from_slice(&((list.len() + 9) as u32).to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn recognizes_a_complete_oppo_trailer() {
+        assert_eq!(
+            recognize(&oppo_trailer(b"wtmk")),
+            Some("OPPO camera metadata")
+        );
+        assert_eq!(
+            recognize(&oppo_trailer(b"jxrs")),
+            Some("OPPO camera metadata")
+        );
+        assert_eq!(recognize(&oppo_trailer(b"WTMK")), None);
+        // Bytes the list does not account for, before or after.
+        let mut prefixed = b"PK\x03\x04".to_vec();
+        prefixed.extend_from_slice(&oppo_trailer(b"wtmk"));
+        assert_eq!(recognize(&prefixed), None);
+        let mut suffixed = oppo_trailer(b"wtmk");
+        suffixed.push(0);
+        assert_eq!(recognize(&suffixed), None);
+        // Blocks that overlap, or a list that is not only blocks. Both
+        // replacements keep the length.
+        let replaced = |from: &[u8], to: &[u8]| {
+            let data = oppo_trailer(b"wtmk");
+            let at = data
+                .windows(from.len())
+                .position(|window| window == from)
+                .unwrap();
+            [&data[..at], to, &data[at + from.len()..]].concat()
+        };
+        let overlapping = replaced(br#""offset":12"#, br#""offset":13"#);
+        assert_eq!(recognize(&overlapping), None);
+        let scripted = replaced(br#""watermark.device""#, br#""<script>xxxxxxx""#);
+        assert_eq!(recognize(&scripted), None);
+        assert_eq!(recognize(b"\0wtmk\x09\0\0\0"), None);
     }
 
     #[test]
