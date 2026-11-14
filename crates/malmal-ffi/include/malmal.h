@@ -59,6 +59,15 @@ malmal_scanner *malmal_scanner_new_with_allow(
     const char *pdf_passwords, size_t pdf_passwords_len, const char *allow,
     char **error);
 
+/*
+ * Stop a scan that holds more than `max` bytes beyond what its thread held
+ * when it began, with the finding limit.memory; 0 for no limit. What is
+ * counted is what this library allocates, on the thread that calls it. A
+ * new scanner has a limit of 512 MiB, as the commands' --max-memory.
+ * Not to be called while another thread uses the scanner.
+ */
+void malmal_scanner_set_max_memory(malmal_scanner *scanner, uint64_t max);
+
 void malmal_scanner_free(malmal_scanner *scanner);
 
 /*

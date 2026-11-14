@@ -22,6 +22,7 @@ use memchr::memmem;
 use crate::detect::{self, FileType};
 use crate::limits::{Budget, LimitExceeded};
 use crate::report::{Finding, Severity};
+use crate::work;
 use content::{Drawn, Operators};
 use crypt::{Decryptor, StreamKind};
 use filters::{DecodeError, Params, Step};
@@ -332,7 +333,21 @@ impl<'a> Document<'a> {
             }
         });
         let steps: Vec<Step<'_>> = steps.collect();
-        let (used, outcome) = filters::run(&steps, &data, budget.remaining(), sink);
+        // What the sink holds counts against the scan's memory; past it,
+        // nothing more is handed over, and the stream ends at the limit.
+        let watch = budget.memory_watch();
+        let mut over = false;
+        let mut watched = |block: &[u8]| {
+            over = over || watch.is_over();
+            if !over {
+                sink(block);
+            }
+        };
+        let (used, outcome) = filters::run(&steps, &data, budget.remaining(), &mut watched);
+        if over {
+            budget.memory_spent();
+            return Err(DecodeError::Limit);
+        }
         budget.consume(used).map_err(|_| DecodeError::Limit)?;
         outcome
     }
@@ -363,6 +378,24 @@ struct Output<'a> {
     xfa: Vec<u32>,
     /// Where the objects stand whose type is that of an embedded file.
     file_streams: Vec<usize>,
+    /// Where file specifications with embedded files and trees of
+    /// attachments were seen, and the object numbers of the files they name.
+    /// They are reported once it is known what the files are.
+    attachments: Vec<usize>,
+    attached: Vec<u32>,
+    /// A file specification with embedded files that is not that of a C2PA
+    /// manifest was seen.
+    foreign_attachment: bool,
+    /// Links from an object to those it names as the next in a tree or a
+    /// chain: see [`reference_loops`].
+    links: Vec<(u32, u32)>,
+    /// The largest link to a web page, by area, and where it is; and the
+    /// largest page: see [`link_lure`].
+    web_link: Option<(f64, usize)>,
+    page_area: f64,
+    /// A dictionary that gives a key that decides what is shown two values:
+    /// what, and where. See [`ambiguities`].
+    twice: Option<(&'static str, usize)>,
     /// Where `/Encrypt` was seen: the trailer or object that names it.
     encrypt_sources: Vec<usize>,
 }
@@ -395,10 +428,17 @@ impl Output<'_> {
         }
     }
 
+    fn attachment(&mut self, offset: usize) {
+        if self.attachments.last() != Some(&offset) {
+            self.attachments.push(offset);
+        }
+    }
+
     /// Only the first [`MAX_ENCRYPT_SOURCES`] are ever tried, so no more are
     /// kept: a file that names `/Encrypt` in every object would otherwise
     /// make this the square of its objects.
     fn encrypted(&mut self, offset: usize) {
+        work::done(self.encrypt_sources.len());
         if self.encrypt_sources.len() < MAX_ENCRYPT_SOURCES
             && !self.encrypt_sources.contains(&offset)
         {
@@ -421,6 +461,13 @@ pub(crate) fn analyze(
         contents: Vec::new(),
         xfa: Vec::new(),
         file_streams: Vec::new(),
+        attachments: Vec::new(),
+        attached: Vec::new(),
+        foreign_attachment: false,
+        links: Vec::new(),
+        web_link: None,
+        page_area: 0.0,
+        twice: None,
         encrypt_sources: Vec::new(),
     };
     let mut doc = Document {
@@ -527,20 +574,24 @@ pub(crate) fn analyze(
             let value = walk_object(&doc, object, &mut out);
             early.visit(&doc, index, &value, max_pixels);
         }
-        report_file_streams(&doc, &mut out);
+        report_attachments(&doc, Some(budget), &mut out);
         scan_embedded_files(&doc, budget, &mut out, nested);
         scan_content_streams(&doc, budget, &mut out);
         scan_xfa(&doc, budget, &mut out);
     } else {
-        report_file_streams(&doc, &mut out);
+        report_attachments(&doc, None, &mut out);
     }
 
+    reference_loops(&doc, &mut out);
+    link_lure(&mut out);
     let pass = deep::Pass {
         doc: &doc,
         readable,
         max_pixels,
     };
     deep::inspect(&pass, early, seen_from, budget, &mut out);
+    signatures(&doc, &mut out);
+    ambiguities(&doc, &mut out);
 
     if doc.objects.is_empty() {
         out.malformed("PDF contains no objects", 0);
@@ -550,6 +601,187 @@ pub(crate) fn analyze(
         out.limit(LimitExceeded::Complexity);
     }
     check_end(data, &mut out);
+}
+
+/// What each signature signs, as far as the file shows it: the certificate
+/// and the digest are not checked. A signature signs the bytes its
+/// `/ByteRange` names, which are the whole file as it was signed but its own
+/// value, a hexadecimal string. The attacks on signed documents (USF, SWA
+/// and ISA in pdf-insecurity.org's terms) make readers that check part of
+/// that show a document as signed when what it shows was not: a range that
+/// names bytes the file does not have, or no value; a gap between ranges
+/// that leaves other content out; a signature copied into an update that
+/// it does not itself sign; page content written after the last signature.
+fn signatures(doc: &Document<'_>, out: &mut Output<'_>) {
+    let data = doc.data;
+    let mut found = memmem::find_iter(data, b"/ByteRange").peekable();
+    if found.peek().is_none() {
+        return;
+    }
+    // The objects of the file by where they start, to tell which one each
+    // range is in.
+    let mut starts: Vec<(usize, u32)> = (doc.objects.iter().enumerate())
+        .filter(|(_, object)| !object.packed())
+        .map(|(index, object)| (object.offset, index as u32))
+        .collect();
+    starts.sort_unstable();
+    let invalid = |why: &str, offset: usize, out: &mut Output<'_>| {
+        out.report(
+            "pdf.signature_invalid",
+            Severity::Medium,
+            &format!("signature {why}: a reader that checks only part of it shows it as valid"),
+            offset,
+        );
+    };
+    let mut signed_end: Option<usize> = None;
+    let mut checked = None;
+    // Signatures that lie after what they sign, with their ranges, and the
+    // ranges of those inside: a reader that saves a document again writes
+    // the dictionary of a signature anew, as it was.
+    let mut outside: Vec<(Vec<usize>, usize)> = Vec::new();
+    let mut inside: Vec<Vec<usize>> = Vec::new();
+    for at in found {
+        let Some(&(offset, index)) = starts.get(
+            starts
+                .partition_point(|&(start, _)| start <= at)
+                .wrapping_sub(1),
+        ) else {
+            continue;
+        };
+        if checked.replace(index) == Some(index) {
+            continue;
+        }
+        // Usage rights and document permissions sign as signatures do,
+        // from inside the catalogue.
+        let mut signatures = Vec::new();
+        signature_dicts(doc.kept(index), 0, &mut signatures);
+        for dict in signatures {
+            // The usage rights that Adobe's programs give a document to let
+            // Reader save it are not shown as a signature, and are broken
+            // by any other program that saves it.
+            if usage_rights(doc, dict) {
+                continue;
+            }
+            match signed_range(doc, dict) {
+                Ok(numbers) => {
+                    let end = numbers[numbers.len() - 2] + numbers[numbers.len() - 1];
+                    if offset >= end {
+                        outside.push((numbers, offset));
+                    } else {
+                        signed_end = signed_end.max(Some(end));
+                        inside.push(numbers);
+                    }
+                }
+                Err(why) => invalid(why, offset, out),
+            }
+        }
+    }
+    if let Some((_, offset)) = outside
+        .iter()
+        .find(|(numbers, _)| !inside.contains(numbers))
+    {
+        invalid("is not inside what it signs", *offset, out);
+    }
+    let Some(end) = signed_end else {
+        return;
+    };
+    if end < data.trim_ascii_end().len() {
+        out.report(
+            "pdf.signature_modified",
+            Severity::Info,
+            "signature does not cover the whole file: bytes were added after signing, \
+             or left out of what was signed",
+            end,
+        );
+    }
+    // Page content defined where no signature reaches.
+    let unsigned = out.contents.iter().find_map(|number| {
+        let object = &doc.objects[*doc.by_number.get(number)? as usize];
+        (object.offset >= end).then_some(object.offset)
+    });
+    if let Some(offset) = unsigned {
+        out.report(
+            "pdf.unsigned_content",
+            Severity::Medium,
+            "page content was written after the document was signed, and is not signed",
+            offset,
+        );
+    }
+}
+
+/// The dictionaries with a `/ByteRange` in `value`, which is that of one
+/// object, through the dictionaries and arrays written in it.
+fn signature_dicts<'v>(value: &'v Value, depth: usize, found: &mut Vec<&'v Dict>) {
+    match value {
+        Value::Dict(dict) if dict.get(b"ByteRange").is_some() => found.push(dict),
+        Value::Dict(dict) if depth < 4 => dict
+            .0
+            .iter()
+            .for_each(|(_, value)| signature_dicts(value, depth + 1, found)),
+        Value::Array(items) if depth < 4 => items
+            .iter()
+            .for_each(|value| signature_dicts(value, depth + 1, found)),
+        _ => {}
+    }
+}
+
+/// Whether the signature in `dict` grants usage rights (`/TransformMethod
+/// /UR3`, or `/UR` of old) rather than signing the document.
+fn usage_rights(doc: &Document<'_>, dict: &Dict) -> bool {
+    let references = doc.resolve(dict.get(b"Reference")).as_array();
+    references.unwrap_or_default().iter().any(|reference| {
+        doc.resolve(Some(reference))
+            .as_dict()
+            .is_some_and(|reference| {
+                let method = doc.resolve(reference.get(b"TransformMethod")).as_name();
+                matches!(method, Some(b"UR3" | b"UR"))
+            })
+    })
+}
+
+/// See [`signatures`]: the ranges the signature in `dict` signs, or what is
+/// wrong with them.
+fn signed_range(doc: &Document<'_>, dict: &Dict) -> Result<Vec<usize>, &'static str> {
+    let data = doc.data;
+    let ranges = doc
+        .resolve(dict.get(b"ByteRange"))
+        .as_array()
+        .unwrap_or_default();
+    let numbers: Option<Vec<usize>> = ranges
+        .iter()
+        .map(|item| doc.resolve(Some(item)).as_usize())
+        .collect();
+    let numbers = numbers
+        .filter(|numbers| numbers.len() >= 4 && numbers.len() % 2 == 0)
+        .ok_or("has no byte range that can be checked")?;
+    // From the start of the file, in order, each inside it, with the
+    // signature value and nothing else between two of them.
+    let mut end = 0;
+    for (index, &[start, length]) in numbers.as_chunks::<2>().0.iter().enumerate() {
+        let after = start
+            .checked_add(length)
+            .filter(|&after| after <= data.len() && (index > 0 || start == 0) && start >= end)
+            .ok_or("names bytes the file does not have, or not in order")?;
+        if index > 0 {
+            let gap = &data[end..start];
+            let value = gap
+                .strip_prefix(b"<")
+                .and_then(|gap| gap.strip_suffix(b">"))
+                .is_some_and(|digits| {
+                    digits
+                        .iter()
+                        .all(|&b| b.is_ascii_hexdigit() || is_whitespace(b))
+                });
+            if !value {
+                return Err("leaves out of what it signs more than its own value");
+            }
+        }
+        end = after;
+    }
+    if !matches!(dict.get(b"Contents"), Some(Value::String(_))) {
+        return Err("has no value of its own");
+    }
+    Ok(numbers)
 }
 
 fn check_header(data: &[u8], out: &mut Output<'_>) {
@@ -762,7 +994,7 @@ fn expand_object_streams(doc: &mut Document<'_>, budget: &mut Budget, out: &mut 
         let decoded = match doc.decode(object, dict, budget) {
             Ok(decoded) => decoded,
             Err(DecodeError::Limit) => {
-                out.limit(LimitExceeded::Decompression);
+                out.limit(budget.decode_limit());
                 continue;
             }
             // Whatever is inside stays unseen, so the file cannot be cleared.
@@ -787,6 +1019,7 @@ fn expand_object_streams(doc: &mut Document<'_>, budget: &mut Budget, out: &mut 
             };
             entries.push((number, first.saturating_add(relative)));
         }
+        drop(index);
         // Entries may all point at one large value; reading it for each of
         // them is bounded as reading the objects of the file is.
         let work_limit = decoded.len() as u64 * 8 + (1 << 20);
@@ -841,7 +1074,135 @@ fn walk_object(doc: &Document<'_>, object: &Object, out: &mut Output<'_>) -> Val
     let value = doc.value(object);
     object.hints.set(hints(&value));
     walk(doc, &value, object.offset, out);
+    if let Value::Dict(dict) = &value {
+        for key in TREE_LINKS {
+            let named = match dict.get(key) {
+                Some(Value::Ref(number)) => std::slice::from_ref(number),
+                Some(Value::Array(items)) => {
+                    let numbers = items.iter().filter_map(as_ref);
+                    out.links
+                        .extend(numbers.map(|number| (object.number, number)));
+                    &[]
+                }
+                _ => &[],
+            };
+            out.links
+                .extend(named.iter().map(|&number| (object.number, number)));
+        }
+    }
     value
+}
+
+/// The area of a rectangle given as `[x0 y0 x1 y1]`.
+fn area(doc: &Document<'_>, value: Option<&Value>) -> Option<f64> {
+    let Value::Array(corners) = doc.resolve(value) else {
+        return None;
+    };
+    let [x0, y0, x1, y1] = &corners[..] else {
+        return None;
+    };
+    let number = |value| doc.resolve(Some(value)).as_number();
+    let width = number(x1)? - number(x0)?;
+    let height = number(y1)? - number(y0)?;
+    Some((width * height).abs()).filter(|area| area.is_finite())
+}
+
+/// Keep the largest page, and the largest link that opens a web page.
+fn measure_links(doc: &Document<'_>, dict: &Dict, offset: usize, out: &mut Output<'_>) {
+    if let Some(page) = area(doc, dict.get(b"MediaBox")) {
+        out.page_area = out.page_area.max(page);
+    }
+    if !doc.name_is(dict.get(b"Subtype"), b"Link") {
+        return;
+    }
+    let opens_page = match doc.resolve(dict.get(b"A")) {
+        Value::Dict(action) => doc.name_is(action.get(b"S"), b"URI"),
+        _ => false,
+    };
+    if let Some(link) = area(doc, dict.get(b"Rect")).filter(|_| opens_page)
+        && out.web_link.is_none_or(|(largest, _)| link > largest)
+    {
+        out.web_link = Some((link, offset));
+    }
+}
+
+/// A link to a web page this large a share of the page or more. Text links
+/// are a line high; a link this size lies over a picture or most of the
+/// page, so that a click anywhere opens it. Many of the phishing documents
+/// that carry nothing but that are such: a picture of a document, or of a
+/// button, with the link over it. On CIC-Evasive-PDFMal2022, a fifth of the
+/// page took 102 of the 396 malicious files that were clean and none of the
+/// clean ones; a tenth took 171, and 15 clean files, whose logos link to
+/// their publisher.
+const LURE_SHARE: f64 = 0.2;
+
+/// See [`LURE_SHARE`].
+fn link_lure(out: &mut Output<'_>) {
+    if let Some((link, offset)) = out.web_link
+        && out.page_area > 0.0
+        && link / out.page_area >= LURE_SHARE
+    {
+        let share = (link / out.page_area * 100.0).min(100.0);
+        out.report(
+            "pdf.link_lure",
+            Severity::Low,
+            &format!("a link to a web page covers {share:.0}% of a page"),
+            offset,
+        );
+    }
+}
+
+/// The keys that lead down a tree or along a chain: the kids of the page
+/// tree, of name and number trees and of form fields; the first child and
+/// the next sibling of an outline item, and the next of a chain of actions;
+/// the object stream another extends.
+const TREE_LINKS: [&[u8]; 4] = [b"Kids", b"First", b"Next", b"Extends"];
+
+/// Trees and chains that lead back to where they started. A reader that
+/// follows one goes round it for as long as it is let; none of them loops in
+/// a document a program wrote.
+fn reference_loops(doc: &Document<'_>, out: &mut Output<'_>) {
+    let mut next: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(from, to) in &out.links {
+        next.entry(from).or_default().push(to);
+    }
+    // Depth first, with the objects on the current path and those done.
+    // From the lowest object number, so that the loop reported is the same
+    // from one scan to the next.
+    let mut starts: Vec<u32> = next.keys().copied().collect();
+    starts.sort_unstable();
+    let (mut on_path, mut done) = (HashSet::new(), HashSet::new());
+    for start in starts {
+        if done.contains(&start) {
+            continue;
+        }
+        let mut stack = vec![(start, 0)];
+        on_path.insert(start);
+        while let Some((node, child)) = stack.pop() {
+            let Some(&to) = next.get(&node).and_then(|children| children.get(child)) else {
+                on_path.remove(&node);
+                done.insert(node);
+                continue;
+            };
+            stack.push((node, child + 1));
+            if on_path.contains(&to) {
+                let offset = doc
+                    .by_number
+                    .get(&to)
+                    .map_or(0, |&index| doc.objects[index as usize].offset);
+                return out.report(
+                    "pdf.reference_loop",
+                    Severity::Medium,
+                    "a page tree, outline, chain of actions or object stream leads back to itself",
+                    offset,
+                );
+            }
+            if !done.contains(&to) {
+                on_path.insert(to);
+                stack.push((to, 0));
+            }
+        }
+    }
 }
 
 /// Inspect every dictionary reachable inside one object.
@@ -849,6 +1210,16 @@ fn walk(doc: &Document<'_>, value: &Value, offset: usize, out: &mut Output<'_>) 
     match value {
         Value::Dict(dict) => {
             check_postscript(doc, dict, offset, out);
+            if let Some(files) = dict.get(b"EF")
+                && !matches!(doc.resolve(Some(files)), Value::Array(_))
+                && !is_manifest_spec(doc, dict)
+            {
+                out.foreign_attachment = true;
+            }
+            measure_links(doc, dict, offset, out);
+            if out.twice.is_none() {
+                out.twice = given_twice(dict).map(|key| (key, offset));
+            }
             for (key, item) in &dict.0 {
                 check_name(key, offset, out);
                 check_entry(doc, key, item, offset, out);
@@ -863,6 +1234,264 @@ fn walk(doc: &Document<'_>, value: &Value, offset: usize, out: &mut Output<'_>) 
         Value::Name(name) => check_name(name, offset, out),
         _ => {}
     }
+}
+
+/// Keys that decide what a document shows, of which a reader takes the
+/// first or the last when a dictionary has two.
+const DECIDING_KEYS: [&[u8]; 9] = [
+    b"Length",
+    b"Contents",
+    b"Kids",
+    b"Count",
+    b"Parent",
+    b"Type",
+    b"Filter",
+    b"Root",
+    b"Pages",
+];
+
+/// The first of [`DECIDING_KEYS`] that `dict` gives two different values.
+fn given_twice(dict: &Dict) -> Option<&'static str> {
+    if dict.0.len() < 2 {
+        return None;
+    }
+    DECIDING_KEYS.iter().find_map(|&key| {
+        let mut values = dict.all(key);
+        let first = values.next()?;
+        values
+            .any(|other| other != first)
+            .then(|| std::str::from_utf8(key).unwrap_or_default())
+    })
+}
+
+/// The filters the format defines, which are all a reader may apply.
+const FILTERS: [&[u8]; 17] = [
+    b"ASCIIHexDecode",
+    b"AHx",
+    b"ASCII85Decode",
+    b"A85",
+    b"LZWDecode",
+    b"LZW",
+    b"FlateDecode",
+    b"Fl",
+    b"RunLengthDecode",
+    b"RL",
+    b"CCITTFaxDecode",
+    b"CCF",
+    b"JBIG2Decode",
+    b"DCTDecode",
+    b"DCT",
+    b"JPXDecode",
+    b"Crypt",
+];
+
+/// Structures that a reader that follows the format and one that repairs
+/// what it reads take for two different documents: the content masking of
+/// pdf-insecurity.org, which shows one page to one reader and another to
+/// the next, and to a scanner that reads the file as one of them does.
+/// What a scanner can see of it: page content whose `/Length` does not
+/// end at its `endstream`, or whose data does not start on the line after
+/// its `stream`; a deciding key given twice; a cross-reference table that
+/// sends a reader to a different object than the one it names, to one that
+/// is commented out, or that marks an entry neither in use nor free. Also
+/// reported as malformed: a filter the format does not define, which some
+/// readers skip and others stop at.
+fn ambiguities(doc: &Document<'_>, out: &mut Output<'_>) {
+    let data = doc.data;
+    let mut found: Option<(String, usize)> = out
+        .twice
+        .map(|(key, offset)| (format!("a dictionary gives /{key} two values"), offset));
+    let mut unknown_filter = None;
+    let contents: HashSet<u32> = out.contents.iter().copied().collect();
+    for (index, object) in doc.objects.iter().enumerate() {
+        if !object.is_stream() || object.packed() {
+            continue;
+        }
+        let latest = doc.by_number.get(&object.number) == Some(&(index as u32));
+        let Some(dict) = doc.kept(index as u32).as_dict() else {
+            continue;
+        };
+        let filters = match doc.resolve(dict.get(b"Filter")) {
+            Value::Name(name) => vec![name.text()],
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|item| doc.resolve(Some(item)).as_name())
+                .collect(),
+            _ => Vec::new(),
+        };
+        if unknown_filter.is_none() && filters.iter().any(|filter| !FILTERS.contains(filter)) {
+            unknown_filter = Some(object.offset);
+        }
+        if found.is_some() || !latest || !contents.contains(&object.number) {
+            continue;
+        }
+        // Where the keyword stands, and the line after it.
+        let keyword = object.stream_start - 1;
+        let keyword = memmem::rfind(&data[..=keyword.min(data.len() - 1)], b"stream");
+        let line = keyword.map(|at| &data[at + 6..object.stream_start]);
+        if !matches!(line, Some(b"\r\n" | b"\n")) {
+            found = Some((
+                "page content does not start on the line after `stream`".into(),
+                object.offset,
+            ));
+            continue;
+        }
+        let rest = &data[object.stream_start..];
+        let length = doc.resolve(dict.get(b"Length")).as_usize();
+        let Some(after) = length
+            .and_then(|length| rest.get(length..))
+            .map(<[u8]>::trim_ascii_start)
+            .filter(|after| after.starts_with(b"endstream"))
+        else {
+            found = Some((
+                "the /Length of page content does not end at its `endstream`".into(),
+                object.offset,
+            ));
+            continue;
+        };
+        let inside = &rest[..length.unwrap_or_default()];
+        work::searched(inside.len(), None, 0);
+        if memmem::find(inside, b"endstream").is_some() {
+            found = Some((
+                "page content holds an `endstream` before the one its /Length ends at".into(),
+                object.offset,
+            ));
+            continue;
+        }
+        let after = &after[b"endstream".len()..];
+        let closed = |rest: &[u8]| rest.first().is_none_or(|&byte| !is_regular(byte));
+        let object_end = after.trim_ascii_start();
+        if !closed(after) || !object_end.starts_with(b"endobj") || !closed(&object_end[6..]) {
+            found = Some((
+                "page content is not followed by `endobj`".into(),
+                object.offset,
+            ));
+        }
+    }
+    if found.is_none() {
+        found = cross_reference_confusion(doc).map(|(why, at)| (why.to_string(), at));
+    }
+    if let Some(offset) = unknown_filter {
+        out.malformed("stream names a filter the format does not define", offset);
+    }
+    if let Some((why, offset)) = found {
+        out.report(
+            "pdf.ambiguous_structure",
+            Severity::Medium,
+            &format!("{why}: readers differ on what the document shows"),
+            offset,
+        );
+    }
+}
+
+/// See [`ambiguities`]: an entry of a cross-reference table that sends a
+/// reader that trusts it elsewhere than one that reads the objects where
+/// they stand, and where the table is.
+fn cross_reference_confusion(doc: &Document<'_>) -> Option<(&'static str, usize)> {
+    let data = doc.data;
+    // After bytes before the header, readers count from either, and a table
+    // that is right for one is wrong for the other: that is malformed.
+    let prefixed = !data.starts_with(b"%PDF-");
+    for at in memmem::find_iter(data, b"xref") {
+        // A table, not the `startxref` keyword or a name.
+        if at >= 5 && &data[at - 5..at] == b"start" || at > 0 && !is_whitespace(data[at - 1]) {
+            continue;
+        }
+        let mut parser = Parser::new(data, at + 4, usize::MAX);
+        loop {
+            parser.skip_whitespace();
+            let Some(first) = parser.integer() else {
+                break;
+            };
+            parser.skip_whitespace();
+            let Some(count) = parser.integer() else {
+                break;
+            };
+            for number in first..first.saturating_add(count) {
+                parser.skip_whitespace();
+                let (Some(offset), Some(_generation)) = ({
+                    let offset = parser.integer();
+                    parser.skip_whitespace();
+                    (offset, parser.integer())
+                }) else {
+                    return None;
+                };
+                parser.skip_whitespace();
+                let kind = parser.rest().first().copied();
+                parser.pos += 1;
+                match kind {
+                    Some(b'f') => continue,
+                    Some(b'n') => {}
+                    _ => return Some(("a cross-reference entry is neither in use nor free", at)),
+                }
+                let Some(place) = data.get(offset..) else {
+                    continue;
+                };
+                // A `%` that starts the line, or the place itself.
+                let line = &data[..offset];
+                let line = &line[line
+                    .iter()
+                    .rposition(|&byte| byte == b'\n' || byte == b'\r')
+                    .map_or(0, |at| at + 1)..];
+                work::done(line.len());
+                let (commented, place) = match place.strip_prefix(b"%") {
+                    Some(rest) => (true, rest),
+                    // A writer that put the next object right after the
+                    // `%%EOF` of an update is not hiding it.
+                    None => {
+                        let line = line.trim_ascii_start();
+                        let digit = place.first().is_some_and(u8::is_ascii_digit);
+                        (
+                            digit && line.starts_with(b"%") && !line.starts_with(b"%%EOF"),
+                            place,
+                        )
+                    }
+                };
+                let mut header = Parser::new(place, 0, 16);
+                let named = header.integer();
+                header.skip_whitespace();
+                let generation = header.integer();
+                header.skip_whitespace();
+                if generation.is_none() || !header.rest().starts_with(b"obj") {
+                    continue;
+                }
+                if named != Some(number) && !prefixed {
+                    return Some((
+                        "the cross-reference table sends a reader to another object",
+                        offset,
+                    ));
+                }
+                if commented {
+                    return Some((
+                        "the cross-reference table sends a reader to an object that is commented out",
+                        offset,
+                    ));
+                }
+            }
+        }
+    }
+    objects_after_the_end(doc)
+}
+
+/// See [`ambiguities`]: an object after the last `startxref`, which no
+/// table lists, that defines again one defined before it: an update that
+/// a reader that repairs what it reads applies, and one that follows the
+/// tables does not.
+fn objects_after_the_end(doc: &Document<'_>) -> Option<(&'static str, usize)> {
+    let last = memmem::rfind(doc.data, b"startxref")?;
+    work::done(doc.data.len() - last + doc.objects.len());
+    let before: HashSet<u32> = (doc.objects.iter())
+        .filter(|object| !object.packed() && object.offset < last)
+        .map(|object| object.number)
+        .collect();
+    (doc.objects.iter())
+        .find(|object| !object.packed() && object.offset > last && before.contains(&object.number))
+        .map(|object| {
+            (
+                "an object is defined again after the last cross-reference",
+                object.offset,
+            )
+        })
 }
 
 fn check_name(name: &Name, offset: usize, out: &mut Output<'_>) {
@@ -928,14 +1557,16 @@ fn check_entry(doc: &Document<'_>, key: &Name, value: &Value, offset: usize, out
             // grants over attachments are an array under the same key.
             Value::Array(_) => {}
             files => {
-                embedded_file(offset, out);
+                out.attachment(offset);
                 if let Value::Dict(files) = files {
-                    out.embedded
-                        .extend(files.0.iter().filter_map(|(_, file)| as_ref(file)));
+                    let named = files.0.iter().filter_map(|(_, file)| as_ref(file));
+                    let start = out.attached.len();
+                    out.attached.extend(named);
+                    out.embedded.extend_from_slice(&out.attached[start..]);
                 }
             }
         },
-        b"EmbeddedFiles" if !is_empty_tree(doc, value) => embedded_file(offset, out),
+        b"EmbeddedFiles" if !is_empty_tree(doc, value) => out.attachment(offset),
         // A page's content, or the glyph procedures of a Type 3 font. An
         // annotation's /Contents is a string and names nothing.
         b"Contents" => match (value, doc.resolve(Some(value))) {
@@ -1065,18 +1696,182 @@ fn embedded_file(offset: usize, out: &mut Output<'_>) {
 /// a packet of an XFA form: the programs that write those forms give their
 /// packets that type. The form is reported as one, and its packets are
 /// searched as packets and as files.
-fn report_file_streams(doc: &Document<'_>, out: &mut Output<'_>) {
+///
+/// Attachments that are all C2PA manifests, the provenance record that
+/// document and image programs now write, are reported at Info. A manifest
+/// is only taken for one when its content is: with a `budget` the files are
+/// decoded to tell, and without one, in a document that cannot be read,
+/// they are attachments.
+fn report_attachments(doc: &Document<'_>, budget: Option<&mut Budget>, out: &mut Output<'_>) {
     let packets: HashSet<usize> = out
         .xfa
         .iter()
         .filter_map(|number| doc.by_number.get(number))
         .map(|&index| doc.objects[index as usize].offset)
         .collect();
-    for offset in std::mem::take(&mut out.file_streams) {
-        if !packets.contains(&offset) {
-            embedded_file(offset, out);
+    let streams: HashSet<usize> = std::mem::take(&mut out.file_streams)
+        .into_iter()
+        .filter(|offset| !packets.contains(offset))
+        .collect();
+    let sightings = std::mem::take(&mut out.attachments);
+    let attached = std::mem::take(&mut out.attached);
+    let Some(first) = sightings.first().or(streams.iter().min()).copied() else {
+        return;
+    };
+    let mut files: Vec<usize> = doc
+        .objects
+        .iter()
+        .enumerate()
+        .filter(|(_, object)| streams.contains(&object.offset))
+        .map(|(index, _)| index)
+        .chain(
+            attached
+                .iter()
+                .filter_map(|number| doc.by_number.get(number).map(|&index| index as usize)),
+        )
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    let manifests = !std::mem::take(&mut out.foreign_attachment)
+        && budget.is_some_and(|budget| {
+            !files.is_empty()
+                && files.len() <= MAX_MANIFESTS
+                && files
+                    .iter()
+                    .all(|&index| is_c2pa_manifest(doc, index, budget))
+        });
+    if manifests {
+        out.report(
+            "pdf.c2pa_manifest",
+            Severity::Info,
+            "document carries a C2PA provenance manifest (Content Credentials)",
+            first,
+        );
+    } else {
+        embedded_file(first, out);
+    }
+}
+
+/// A file specification of a C2PA manifest says so, and names the file, if
+/// it does, without an extension or with `.c2pa`: a reader lists it with
+/// the attachments, and one named for a page or a program would be opened
+/// as one.
+fn is_manifest_spec(doc: &Document<'_>, spec: &Dict) -> bool {
+    let named_safely = |key: &[u8]| match spec.get(key) {
+        None => true,
+        Some(name) => doc.resolve(Some(name)).as_string().is_some_and(|name| {
+            // Text strings may be UTF-16 with a byte order mark; the letters
+            // of a file name are then every other byte.
+            let name: Vec<u8> = match name.strip_prefix(b"\xFE\xFF") {
+                Some(wide) => wide.iter().skip(1).step_by(2).copied().collect(),
+                None => name.to_vec(),
+            };
+            let file = name
+                .rsplit(|&byte| byte == b'/' || byte == b'\\')
+                .next()
+                .unwrap_or(&[]);
+            !file.contains(&b'.') || file.to_ascii_lowercase().ends_with(b".c2pa")
+        }),
+    };
+    doc.name_is(spec.get(b"AFRelationship"), b"C2PA_Manifest")
+        && named_safely(b"F")
+        && named_safely(b"UF")
+}
+
+/// More files than this are not looked at as manifests: a document has one,
+/// or one for each of the documents it was made from.
+const MAX_MANIFESTS: usize = 16;
+
+/// Whether an object is a stream of the type C2PA gives its manifests
+/// whose content is a manifest store.
+fn is_c2pa_manifest(doc: &Document<'_>, index: usize, budget: &mut Budget) -> bool {
+    let object = &doc.objects[index];
+    let value = doc.value(object);
+    let Some(dict) = value.as_dict().filter(|_| object.is_stream()) else {
+        return false;
+    };
+    doc.name_is(dict.get(b"Subtype"), b"application/c2pa")
+        && doc
+            .decode(object, dict, budget)
+            .is_ok_and(|content| c2pa_store_data(&content).is_some())
+}
+
+/// The UUID of a C2PA manifest store's description box.
+const C2PA_UUID: &[u8; 16] = b"c2pa\x00\x11\x00\x10\x80\x00\x00\xaa\x00\x38\x9b\x71";
+
+/// What a C2PA manifest store carries as data, to be scanned as files: the
+/// content of its binary boxes, a thumbnail or an icon. None if it is not a
+/// store: one JUMBF superbox (`jumb`) over all of the data, the first of
+/// whose boxes is a description (`jumd`) with the C2PA UUID and the label
+/// `c2pa`, and every box down the tree one that C2PA writes, filling its
+/// superbox exactly.
+fn c2pa_store_data(data: &[u8]) -> Option<Vec<&[u8]>> {
+    let top = boxes(data)?;
+    let [(b"jumb", store)] = top.as_slice() else {
+        return None;
+    };
+    let children = boxes(store)?;
+    let (b"jumd", description) = children.first()? else {
+        return None;
+    };
+    // The UUID, a byte of flags of which 2 says a label follows, and the
+    // label, ended by a zero byte.
+    let labelled = description.get(16).is_some_and(|flags| flags & 2 != 0);
+    let label = description
+        .get(17..)
+        .is_some_and(|label| label.starts_with(b"c2pa\0"));
+    if !(description.starts_with(C2PA_UUID) && labelled && label) {
+        return None;
+    }
+    let mut carried = Vec::new();
+    jumbf_data(store, 0, &mut carried)?;
+    Some(carried)
+}
+
+/// Superboxes nest this deep at most: a store, a manifest, its assertions,
+/// and one more for what an assertion may hold.
+const MAX_JUMBF_DEPTH: usize = 6;
+
+/// Gather the content of the binary boxes of a superbox's content, or None
+/// if a box is not one C2PA writes or the boxes do not fill it.
+fn jumbf_data<'d>(content: &'d [u8], depth: usize, carried: &mut Vec<&'d [u8]>) -> Option<()> {
+    if depth > MAX_JUMBF_DEPTH {
+        return None;
+    }
+    for (kind, inner) in boxes(content)? {
+        match kind {
+            b"jumb" => jumbf_data(inner, depth + 1, carried)?,
+            b"bidb" => carried.push(inner),
+            b"uuid" => carried.push(inner.get(16..)?),
+            b"jumd" | b"cbor" | b"json" | b"bfdb" | b"c2sh" | b"free" => {}
+            _ => return None,
         }
     }
+    Some(())
+}
+
+/// The ISO boxes that fill `data` exactly, or none if they do not.
+fn boxes(data: &[u8]) -> Option<Vec<(&[u8; 4], &[u8])>> {
+    let mut found = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let size = u32::from_be_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
+        let kind: &[u8; 4] = data.get(pos + 4..pos + 8)?.try_into().ok()?;
+        let (header, size) = match size {
+            0 => (8, data.len() - pos),
+            1 => {
+                let wide = u64::from_be_bytes(data.get(pos + 8..pos + 16)?.try_into().ok()?);
+                (16, usize::try_from(wide).ok()?)
+            }
+            size => (8, size),
+        };
+        let end = pos
+            .checked_add(size)
+            .filter(|&end| size >= header && end <= data.len())?;
+        found.push((kind, &data[pos + header..end]));
+        pos = end;
+    }
+    Some(found)
 }
 
 fn rich_media(offset: usize, out: &mut Output<'_>) {
@@ -1156,10 +1951,10 @@ impl Fallback {
         }
         for (end, keyword) in self.ends.iter_mut().zip([&b"endobj"[..], b"stream"]) {
             if self.searched_from.is_none() || (*end != usize::MAX && *end < start) {
-                *end = source
-                    .get(start..)
-                    .and_then(|rest| memmem::find(rest, keyword))
-                    .map_or(usize::MAX, |at| start + at);
+                let rest = source.get(start..).unwrap_or_default();
+                let found = memmem::find(rest, keyword);
+                work::searched(rest.len(), found, keyword.len());
+                *end = found.map_or(usize::MAX, |at| start + at);
             }
         }
         self.searched_from = Some(start);
@@ -1253,8 +2048,14 @@ fn scan_embedded_files(
         }
         match doc.decode(object, dict, budget) {
             Ok(content) => {
+                // A manifest store is not a file of its own, but what it
+                // carries is.
+                let manifest = doc.name_is(dict.get(b"Subtype"), b"application/c2pa");
+                let parts = manifest.then(|| c2pa_store_data(&content)).flatten();
                 let mut inner = Vec::new();
-                nested(&content, budget, &mut inner);
+                for part in parts.unwrap_or_else(|| vec![&content]) {
+                    nested(part, budget, &mut inner);
+                }
                 for finding in inner {
                     if finding.code.starts_with("limit.") {
                         out.findings.push(finding);
@@ -1264,7 +2065,7 @@ fn scan_embedded_files(
                     }
                 }
             }
-            Err(DecodeError::Limit) => out.limit(LimitExceeded::Decompression),
+            Err(DecodeError::Limit) => out.limit(budget.decode_limit()),
             Err(_) => out.malformed("embedded file cannot be decoded", object.offset),
         }
         budget.leave();
@@ -1275,10 +2076,33 @@ fn scan_embedded_files(
 /// `PS` operator, which hands its string operand to a PostScript interpreter.
 /// The streams are read a block at a time as they are decoded.
 fn scan_content_streams(doc: &Document<'_>, budget: &mut Budget, out: &mut Output<'_>) {
-    let named = out
+    // A page's content is a stream or an array of them, and the array may
+    // stand in an object stream, which the walk that names it has not
+    // opened yet: an array named here holds the streams.
+    let mut named = Vec::new();
+    let mut misplaced = None;
+    for &index in out
         .contents
         .iter()
-        .filter_map(|number| doc.by_number.get(number).map(|&index| index as usize));
+        .filter_map(|number| doc.by_number.get(number))
+    {
+        let object = &doc.objects[index as usize];
+        match doc.kept(index) {
+            Value::Array(items) => {
+                for item in items {
+                    match item {
+                        Value::Ref(number) => named.extend(doc.by_number.get(number)),
+                        _ => misplaced = misplaced.or(Some(object.offset)),
+                    }
+                }
+            }
+            _ => named.push(index),
+        }
+    }
+    if let Some(offset) = misplaced {
+        out.malformed("page content is not a stream", offset);
+    }
+    let named = named.into_iter().map(|index| index as usize);
     let typed = doc
         .objects
         .iter()
@@ -1303,6 +2127,11 @@ fn scan_content_streams(doc: &Document<'_>, budget: &mut Budget, out: &mut Outpu
         let object = &doc.objects[index];
         let value = doc.value(object);
         let Some(dict) = value.as_dict().filter(|_| object.is_stream()) else {
+            // Content is streams; an array or a dictionary in its place is
+            // what readers that follow it into itself are given.
+            if matches!(value, Value::Array(_) | Value::Dict(_)) {
+                out.malformed("page content is not a stream", object.offset);
+            }
             continue;
         };
         let mut operators = Operators::new();
@@ -1321,7 +2150,7 @@ fn scan_content_streams(doc: &Document<'_>, budget: &mut Budget, out: &mut Outpu
                     draws.insert(index, found.drawn);
                 }
             }
-            Err(DecodeError::Limit) => return out.limit(LimitExceeded::Decompression),
+            Err(DecodeError::Limit) => return out.limit(budget.decode_limit()),
             // A stream no reader can decode draws nothing.
             Err(_) => {}
         }
@@ -1621,6 +2450,7 @@ impl Calls {
                     continue;
                 };
                 *next += 1;
+                work::done(1);
                 match states.get(&target) {
                     Some(State::OnPath) => {
                         // The cycle closes at a form, or at a name that the
@@ -1680,7 +2510,7 @@ fn scan_xfa(doc: &Document<'_>, budget: &mut Budget, out: &mut Output<'_>) {
                     );
                 }
             }
-            Err(DecodeError::Limit) => return out.limit(LimitExceeded::Decompression),
+            Err(DecodeError::Limit) => return out.limit(budget.decode_limit()),
             // An unread packet may hold the script.
             Err(_) => out.malformed("XFA packet cannot be decoded", object.offset),
         }
@@ -2020,6 +2850,174 @@ mod tests {
         );
         let text = stream("/Type /EmbeddedFile", b"plain notes");
         assert_eq!(codes(&pdf(&[CATALOG, &text])), ["pdf.embedded_file"]);
+    }
+
+    /// A JUMBF box of `kind` around `content`.
+    fn jumbf(kind: &[u8; 4], content: &[u8]) -> Vec<u8> {
+        let size = (content.len() + 8) as u32;
+        [&size.to_be_bytes()[..], kind, content].concat()
+    }
+
+    /// A C2PA manifest store holding one manifest box.
+    fn manifest_store() -> Vec<u8> {
+        let description = [&C2PA_UUID[..], b"\x03c2pa\0"].concat();
+        let manifest = jumbf(b"jumb", &jumbf(b"jumd", b"c2ma"));
+        jumbf(b"jumb", &[jumbf(b"jumd", &description), manifest].concat())
+    }
+
+    /// Attached as the programs that write C2PA attach it: a file
+    /// specification in the tree of attachments and in `/AF`.
+    fn with_manifest(store: &[u8], others: &[&[u8]]) -> Vec<u8> {
+        let filespec = "/AFRelationship /C2PA_Manifest /F (Content Credentials.c2pa)";
+        with_manifest_in(filespec, store, others)
+    }
+
+    fn with_manifest_in(filespec: &str, store: &[u8], others: &[&[u8]]) -> Vec<u8> {
+        let catalog = b"<< /Type /Catalog /Pages 2 0 R /AF [4 0 R] \
+            /Names << /EmbeddedFiles << /Names [(Content Credentials) 4 0 R] >> >> >>";
+        let pages = b"<< /Type /Pages /Kids [] /Count 0 >>";
+        let file = stream("/Type /EmbeddedFile /Subtype /application#2Fc2pa", store);
+        let filespec = format!("<< /Type /Filespec {filespec} /EF << /F 3 0 R >> >>");
+        let mut objects: Vec<&[u8]> = vec![catalog, pages, &file, filespec.as_bytes()];
+        objects.extend_from_slice(others);
+        pdf(&objects)
+    }
+
+    #[test]
+    fn c2pa_manifests_are_not_attachments() {
+        let manifest = [("pdf.c2pa_manifest", Severity::Info)];
+        assert_eq!(run(&with_manifest(&manifest_store(), &[])), manifest);
+
+        // Another file beside it is an attachment.
+        let notes = stream("/Type /EmbeddedFile", b"plain notes");
+        assert_eq!(
+            codes(&with_manifest(&manifest_store(), &[&notes])),
+            ["pdf.embedded_file"]
+        );
+        // So is a file of that type that is not a manifest store: another
+        // UUID or label, bytes after the store, or a box cut short.
+        let mut other_uuid = manifest_store();
+        other_uuid[16] ^= 1;
+        let mut other_label = manifest_store();
+        other_label[33] = b'x';
+        let mut longer = manifest_store();
+        longer.extend_from_slice(b"MZ");
+        let mut cut = manifest_store();
+        cut.truncate(cut.len() - 1);
+        let elf = b"\x7fELF\x02\x01".to_vec();
+        for store in [other_uuid, other_label, longer, cut, elf] {
+            assert_eq!(codes(&with_manifest(&store, &[]))[0], "pdf.embedded_file");
+        }
+        // And one whose file specification does not say it is a manifest,
+        // or names it for what a reader would open as a page or a program.
+        for filespec in [
+            "/F (Content Credentials)",
+            "/AFRelationship /Data /F (Content Credentials)",
+            "/AFRelationship /C2PA_Manifest /F (Content Credentials.html)",
+            "/AFRelationship /C2PA_Manifest /UF <FEFF0061002E006500780065>",
+        ] {
+            let file = with_manifest_in(filespec, &manifest_store(), &[]);
+            assert_eq!(codes(&file), ["pdf.embedded_file"], "{filespec}");
+        }
+        let unnamed = with_manifest_in("/AFRelationship /C2PA_Manifest", &manifest_store(), &[]);
+        assert_eq!(codes(&unnamed), ["pdf.c2pa_manifest"]);
+
+        // What a manifest carries is scanned as files: here a program in
+        // the box of a thumbnail.
+        let store = manifest_store();
+        let thumbnail = jumbf(b"bidb", b"\x7fELF\x02\x01");
+        let carrying = jumbf(
+            b"jumb",
+            &[&store[8..], &jumbf(b"jumb", &thumbnail)].concat(),
+        );
+        assert_eq!(
+            run(&with_manifest(&carrying, &[])),
+            [
+                ("pdf.c2pa_manifest", Severity::Info),
+                ("type.executable", Severity::Critical),
+            ]
+        );
+        // A box C2PA does not write is not part of a manifest.
+        let odd = jumbf(b"jumb", &[&store[8..], &jumbf(b"mdat", b"x")].concat());
+        assert_eq!(codes(&with_manifest(&odd, &[])), ["pdf.embedded_file"]);
+    }
+
+    #[test]
+    fn links_over_most_of_a_page_are_lures() {
+        let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Annots [4 0 R] >>";
+        let link = |rect: &str, action: &str| {
+            format!("<< /Type /Annot /Subtype /Link /Rect [{rect}] /A {action} >>")
+        };
+        let web = "<< /S /URI /URI (https://example.com/) >>";
+        let run_with =
+            |annotation: String| run(&pdf(&[PLAIN_CATALOG, PAGES, page, annotation.as_bytes()]));
+        // A picture's worth of the page, a fifth of it.
+        assert!(run_with(link("0 0 600 160", web)).contains(&("pdf.link_lure", Severity::Low)));
+        // A line of text, and a link within the document.
+        assert!(
+            !codes(&pdf(&[
+                PLAIN_CATALOG,
+                PAGES,
+                page,
+                link("50 700 400 714", web).as_bytes()
+            ]))
+            .contains(&"pdf.link_lure")
+        );
+        let inside = link("0 0 600 800", "<< /S /GoTo /D [3 0 R /Fit] >>");
+        assert!(
+            !codes(&pdf(&[PLAIN_CATALOG, PAGES, page, inside.as_bytes()]))
+                .contains(&"pdf.link_lure")
+        );
+    }
+
+    #[test]
+    fn trees_and_chains_that_lead_back_are_loops() {
+        let looped = |objects: &[&[u8]]| codes(&pdf(objects)).contains(&"pdf.reference_loop");
+        // A page tree that lists itself, or a node further down.
+        let pages = b"<< /Type /Pages /Kids [3 0 R 2 0 R] /Count 2 >>";
+        assert!(looped(&[PLAIN_CATALOG, pages, PAGE]));
+        let pages = b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>";
+        let deeper = b"<< /Type /Pages /Kids [2 0 R] /Count 1 >>";
+        assert!(looped(&[PLAIN_CATALOG, pages, PAGE, deeper]));
+        // Outline items whose next sibling is an earlier one; links back to
+        // the previous one and the parent are what outlines have.
+        let catalog = b"<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>";
+        let outlines = b"<< /Type /Outlines /First 5 0 R /Last 6 0 R >>";
+        let first = b"<< /Title (a) /Parent 4 0 R /Next 6 0 R >>";
+        let second = b"<< /Title (b) /Parent 4 0 R /Prev 5 0 R >>";
+        assert!(!looped(&[catalog, PAGES, PAGE, outlines, first, second]));
+        let second = b"<< /Title (b) /Parent 4 0 R /Prev 5 0 R /Next 5 0 R >>";
+        assert!(looped(&[catalog, PAGES, PAGE, outlines, first, second]));
+        // A chain of actions, and an object stream that extends itself.
+        let action = b"<< /S /GoTo /D [3 0 R /Fit] /Next 4 0 R >>";
+        assert!(looped(&[PLAIN_CATALOG, PAGES, PAGE, action]));
+        let extends = stream("/Type /ObjStm /N 0 /First 0 /Extends 4 0 R", b"");
+        assert!(looped(&[PLAIN_CATALOG, PAGES, PAGE, &extends]));
+    }
+
+    #[test]
+    fn content_is_streams() {
+        // An array of content streams that stands in an object stream: the
+        // streams are read.
+        let page = b"<< /Type /Page /Parent 2 0 R /Contents 10 0 R >>";
+        let inner = b"10 0 [5 0 R]";
+        let packed = stream(
+            "/Type /ObjStm /N 1 /First 5 /Filter /FlateDecode",
+            &compress_to_vec_zlib(inner, 6),
+        );
+        let content = stream("", b"(x) PS");
+        assert_eq!(
+            codes(&pdf(&[CATALOG, PAGES, page, &packed, &content])),
+            ["pdf.postscript"]
+        );
+        // Arrays and dictionaries in their place, which lead a reader that
+        // follows them back to themselves.
+        let page = b"<< /Type /Page /Parent 2 0 R /Contents [4 0 R 5 0 R] >>";
+        let text = stream("", b"BT ET");
+        for misplaced in [&b"[6 0 R]"[..], b"<< /bar 5 0 R >>"] {
+            let objects = [CATALOG, PAGES, page, &text, misplaced, b"[5 0 R]"];
+            assert_eq!(codes(&pdf(&objects)), ["pdf.malformed"]);
+        }
     }
 
     /// A document whose only script sits in an encrypted object stream.
@@ -2503,7 +3501,7 @@ mod tests {
             data.extend_from_slice(between);
             data.extend_from_slice(b"3 0 obj\n");
             data.extend_from_slice(second);
-            data.extend_from_slice(b"\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n");
+            data.extend_from_slice(b"\nendobj\ntrailer\n<< /Root 1 0 R >>\nstartxref\n0\n%%EOF\n");
             codes(&data)
         };
         let other = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 9 9] >>";
@@ -2582,10 +3580,117 @@ mod tests {
             run(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, layer])),
             [("pdf.print_only", Severity::Info)]
         );
-        let signature = b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents <00> >>";
+    }
+
+    /// A document with one page, whose content is object 4, signed by
+    /// object 5 as `ranges` says: `None` for what a signer writes.
+    fn signed(ranges: Option<&str>, contents: &str) -> Vec<u8> {
+        let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 9 9] /Contents 4 0 R >>";
+        let content = stream("", b"0 0 9 9 re f");
+        let placeholder = "[0 0000000000 0000000000 0000000000]";
+        let signature = format!(
+            "<< /Type /Sig /Filter /Adobe.PPKLite /ByteRange {placeholder} /Contents {contents} >>"
+        );
+        let mut data = pdf(&[PLAIN_CATALOG, PAGES, page, &content, signature.as_bytes()]);
+        let at = memmem::find(&data, placeholder.as_bytes()).unwrap();
+        let value = memmem::find(&data, contents.as_bytes()).unwrap();
+        let after = value + contents.len();
+        let written = ranges.map_or_else(
+            || format!("[0 {value} {after} {}]", data.len() - after),
+            str::to_string,
+        );
+        let written = format!("{written:<width$}", width = placeholder.len());
+        data.splice(at..at + placeholder.len(), written.bytes());
+        data
+    }
+
+    #[test]
+    fn signatures_sign_what_they_claim() {
+        let value = "<3082ABCD 00>";
+        let plain = signed(None, value);
+        assert_eq!(run(&plain), []);
+        // Filling in a form or signing again after signing, as readers allow.
+        let update =
+            |body: &str| [plain.as_slice(), body.as_bytes(), b"startxref\n0\n%%EOF\n"].concat();
+        let sorted = |data: &[u8]| {
+            let mut found = run(data);
+            found.sort();
+            found
+        };
+        let noted = [
+            ("pdf.incremental_update", Severity::Info),
+            ("pdf.signature_modified", Severity::Info),
+        ];
+        assert_eq!(sorted(&update("6 0 obj << /T (field) >> endobj\n")), noted);
+        // The page drawn anew where no signature reaches.
+        let content = stream("", b"0 0 1 1 re f");
+        let shadowed = format!("4 0 obj\n{}\nendobj\n", String::from_utf8_lossy(&content));
         assert_eq!(
-            run(&pdf(&[PLAIN_CATALOG, PAGES, PAGE, signature])),
-            [("pdf.signature_modified", Severity::Info)]
+            sorted(&update(&shadowed)),
+            [
+                ("pdf.incremental_update", Severity::Info),
+                ("pdf.signature_modified", Severity::Info),
+                ("pdf.unsigned_content", Severity::Medium),
+            ]
+        );
+
+        let invalid = [("pdf.signature_invalid", Severity::Medium)];
+        // Ranges past the end of the file, or not from its start.
+        assert_eq!(run(&signed(Some("[0 10 20 99999]"), value)), invalid);
+        assert_eq!(run(&signed(Some("[5 10 20 30]"), value)), invalid);
+        // A gap that leaves the page out along with the value.
+        assert_eq!(run(&signed(Some("[0 10 20 30]"), value)), invalid);
+        // No value of its own, or no range at all.
+        assert_eq!(run(&signed(None, "4 0 R")).first(), invalid.first());
+        let removed = String::from_utf8_lossy(&plain).replace("/ByteRange", "/Removed");
+        assert!(run(removed.as_bytes()).contains(&invalid[0]));
+        // In an update that it does not sign: written again as it was, as
+        // a reader that saves the document does, or not.
+        let text = String::from_utf8_lossy(&plain).into_owned();
+        let range = text.find("/ByteRange [").unwrap();
+        let range = text[range..].split(']').next().unwrap().to_string() + "]";
+        let again = format!("7 0 obj << /Type /Sig {range} /Contents <00> >> endobj\n");
+        assert_eq!(sorted(&update(&again)), noted);
+        let other = again.replace("/ByteRange [0 ", "/ByteRange [0 1");
+        assert!(run(&update(&other)).contains(&invalid[0]));
+        // Usage rights are not looked at.
+        let rights = "<< /Type /Sig /ByteRange [0 10 20 99999] /Contents <00> \
+                      /Reference [<< /TransformMethod /UR3 >>] >>";
+        let catalog = format!("<< /Type /Catalog /Pages 2 0 R /Perms << /UR3 {rights} >> >>");
+        assert_eq!(run(&pdf(&[catalog.as_bytes(), PAGES, PAGE])), []);
+    }
+
+    #[test]
+    fn content_that_readers_find_in_different_places_is_ambiguous() {
+        let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 9 9] /Contents 4 0 R >>";
+        let with = |content: &[u8]| pdf(&[PLAIN_CATALOG, PAGES, page, content]);
+        let shown = stream("", b"0 0 9 9 re f");
+        assert_eq!(run(&with(&shown)), []);
+        let ambiguous = [("pdf.ambiguous_structure", Severity::Medium)];
+        // A /Length that reaches past a first `endstream`, which a reader
+        // that looks for the keyword stops at.
+        let two = stream("", b"0 0 9 9 re f\nendstream\n0 0 1 1 re f");
+        assert_eq!(run(&with(&two)), ambiguous);
+        // A keyword that runs on, or no `endobj` after the stream.
+        let mut runs_on = shown.clone();
+        runs_on.push(b'x');
+        assert_eq!(run(&with(&runs_on)), ambiguous);
+        let unclosed =
+            String::from_utf8_lossy(&with(&shown)).replace("endstream\nendobj", "endstream\n");
+        assert_eq!(run(unclosed.as_bytes()), ambiguous);
+        // The page drawn anew after the last cross-reference, where only a
+        // reader that repairs what it reads looks.
+        let mut after = with(&shown);
+        after.extend_from_slice(b"4 0 obj\n");
+        after.extend_from_slice(&stream("", b"0 0 1 1 re f"));
+        after.extend_from_slice(b"\nendobj\n");
+        assert!(run(&after).contains(&ambiguous[0]));
+        // A filter no reader is required to know.
+        let unknown = stream("/Filter /Rot13Decode", b"0 0 9 9 re f");
+        let found = run(&with(&unknown));
+        assert!(
+            found.iter().any(|(code, _)| *code == "pdf.malformed"),
+            "{found:?}"
         );
     }
 
@@ -2800,24 +3905,34 @@ mod tests {
     /// for each repetition: each is read a few times at most.
     #[test]
     fn repeated_structures_cost_what_the_file_does() {
-        let started = std::time::Instant::now();
         let file = |body: &[u8]| [b"%PDF-1.7\n".as_slice(), body, b"\n%%EOF\n"].concat();
+        // What is read for a file of `size` bytes, once inflated: a few times
+        // that, where reading each structure to the end once took the square.
+        let cost = |data: &[u8], size: usize| {
+            let (found, work) = work::counted(|| codes(data));
+            assert!(work < 16 * size as u64, "{work} for {size}");
+            found
+        };
 
         // Trailers whose strings never close, each read to the end.
         let trailers =
             file(&[&b"1 0 obj << >> endobj\n"[..], &b"trailer(".repeat(200_000)].concat());
-        assert!(codes(&trailers).contains(&"limit.complexity"));
+        assert!(cost(&trailers, trailers.len()).contains(&"limit.complexity"));
 
         // Broken objects, each of whose names was looked for up to the next
         // `endobj`, which there is none of. The last name is still found.
         let broken = file(&[b"1 0 obj >\n".repeat(100_000), b"2 0 obj > /JS\n".to_vec()].concat());
-        assert_eq!(codes(&broken), ["pdf.malformed", "pdf.javascript"]);
+        assert_eq!(
+            cost(&broken, broken.len()),
+            ["pdf.malformed", "pdf.javascript"]
+        );
 
         // `/Encrypt` in every object.
         let named: Vec<u8> = (0..200_000)
             .flat_map(|n| format!("{n} 0 obj << /Encrypt 1 >> endobj\n").into_bytes())
             .collect();
-        assert!(codes(&file(&named)).contains(&"pdf.encrypted"));
+        let named = file(&named);
+        assert!(cost(&named, named.len()).contains(&"pdf.encrypted"));
 
         // An object stream whose entries all point at one large array.
         let entries = 20_000;
@@ -2832,7 +3947,8 @@ mod tests {
             &packed,
         );
         let overlapping = pdf(&[PLAIN_CATALOG, PAGES, PAGE, &entries_object]);
-        assert!(codes(&overlapping).contains(&"limit.complexity"));
+        let inflated = overlapping.len() + index.len() + array.len();
+        assert!(cost(&overlapping, inflated).contains(&"limit.complexity"));
 
         // Forms without resources, each drawing a name that one large table
         // lists for all of them.
@@ -2847,11 +3963,8 @@ mod tests {
                 n + 2
             );
         }
-        assert_eq!(codes(&file(body.as_bytes())), ["pdf.draw_recursion"]);
-        // Some 2 s in a debug build on one core; the trailers alone took more
-        // than a minute of an optimized build when each was read to the end.
-        // The bound leaves room for a shared runner.
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        let forms = file(body.as_bytes());
+        assert_eq!(cost(&forms, forms.len()), ["pdf.draw_recursion"]);
     }
 
     #[test]

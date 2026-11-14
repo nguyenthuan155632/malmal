@@ -38,7 +38,9 @@ Options:
   --pdf-dpi <N>        sanitize: dots per inch of a rebuilt PDF's pages,
                        36-600 [default: 150]
   --pdf-jpeg           sanitize: keep a page of a rebuilt PDF as a JPEG, at
-                       --jpeg-quality, where that is smaller";
+                       --jpeg-quality, where that is smaller
+  --pdf-no-text        sanitize: leave out the text that a rebuilt PDF keeps,
+                       which does not draw, for searching and copying";
 
 const EXIT_STATUS: &str = "  -h, --help           Print this help
   -V, --version        Print version
@@ -55,6 +57,7 @@ struct Args {
     jpeg_quality: u8,
     pdf_dpi: u16,
     pdf_jpeg: bool,
+    pdf_text: bool,
     common: Common,
     files: Vec<String>,
     /// Where among the arguments the last of `files` is.
@@ -98,6 +101,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
         jpeg_quality: 90,
         pdf_dpi: 150,
         pdf_jpeg: false,
+        pdf_text: true,
         common: Common::default(),
         files: Vec::new(),
         last_file_at: 0,
@@ -119,6 +123,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
                 .ok_or("--jpeg-quality needs a number from 1 to 100")?;
         } else if arg == "--pdf-jpeg" && sanitize {
             parsed.pdf_jpeg = true;
+        } else if arg == "--pdf-no-text" && sanitize {
+            parsed.pdf_text = false;
         } else if arg == "--pdf-dpi" && sanitize {
             parsed.pdf_dpi = args
                 .next()
@@ -289,6 +295,7 @@ fn sanitize(args: &Args, scanner: &malmal::Scanner) -> ExitCode {
     let mut options = Options::default();
     options.jpeg_quality = args.jpeg_quality;
     options.pdf_dpi = args.pdf_dpi;
+    options.pdf_text = args.pdf_text;
     if args.pdf_jpeg {
         options.pdf_pages = malmal::cdr::PageImage::Jpeg;
     }

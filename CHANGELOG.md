@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `--max-memory` (512 MiB) for `malmal` and `malmald`, and `ScannerBuilder::memory_limit`
+  with `MemoryLimit` in the library: a scan that holds more than that beyond what its
+  thread held when it began is stopped with `limit.memory`. The tools count what each
+  thread allocates; the limit is checked as each block of a PDF stream is decoded and
+  between steps. Two files that inflate to 200 MiB peaked at 205 MiB without it and
+  55 MiB with a limit of 64 MiB.
+- `pdf.c2pa_manifest` (Info): attachments that are all C2PA manifests (Content
+  Credentials), checked down to their JUMBF boxes, are no longer `pdf.embedded_file`. What
+  the manifests carry is still scanned.
+- `pdf.reference_loop` (Medium): a page tree, outline, chain of actions or chain of object
+  streams that leads back to itself.
+- `pdf.link_lure` (Low): a link to a web page that covers a fifth or more of a page. On
+  CIC-Evasive-PDFMal2022 the default policy now refuses 98.65% of the malicious files,
+  against 98.19%, and accepts as many clean ones, 87.32%.
+- `image.vendor_trailer` recognizes the trailer that OPPO cameras write after a JPEG
+  image.
+- `malmal_scanner_set_max_memory` in the C interface and `Scanner(max_memory=…)` in
+  Python, 512 MiB by default: the library counts what each thread allocates, as the
+  commands do. PNG chunks, SVGZ and JPEG XL boxes are inflated in blocks against the
+  limit, and a PostScript ASCII85 string is held to what is left of it.
+- `pdf.signature_invalid` (Medium): a signature whose byte ranges do not fit the file or
+  leave more than its value out, that has no value of its own, lies outside what it
+  signs, or sits in an object stream (signature forgery and wrapping).
+  `pdf.unsigned_content` (Medium): page content written after what the last signature
+  signs. Usage rights signatures are not judged.
+- `pdf.ambiguous_structure` (Medium): structures that readers take for different
+  documents (content masking): stream lengths and keywords, keys given twice,
+  cross-reference entries that point elsewhere or at a comment, objects defined again
+  after the last `startxref`. On CIC-Evasive-PDFMal2022, 1,558 malicious files and no
+  clean one.
+- `pdf.disguised_link` (Medium): a web link through a URL shortener, to a numeric address
+  or a punycode host, or to a name of made-up syllables. The default policy now refuses
+  99.07% of the CIC malicious files, against 98.67%, and accepts as many clean ones.
+- A rebuilt PDF keeps the text of its pages, where it was, as characters that can be
+  searched and copied and do not draw; `--pdf-no-text` and `Options::pdf_text` leave it
+  out.
+
+### Fixed
+
+- Page content given as an array that sits in an object stream was not scanned.
+- Page content that is not a stream, calculator functions that ask for more values than
+  their stack holds or compute numbers past floating point on their domain, and filters
+  the format does not define are `pdf.malformed`.
+
 ## 0.3.0
 
 ### Added

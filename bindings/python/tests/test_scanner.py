@@ -130,6 +130,29 @@ class ScannerTest(unittest.TestCase):
                 scanner.sanitize(read("clean/pixels-spell-pdf.png"))
             self.assertIn("image.polyglot", str(raised.exception))
 
+    def test_max_memory(self):
+        # An attachment of 48 MiB of zeros, run-length encoded.
+        runs = b"\x81\0" * ((48 << 20) // 128) + b"\x80"
+        pdf = (
+            b"%PDF-1.7\n1 0 obj << /Type /Catalog /Names << /EmbeddedFiles"
+            b" << /Names [(a) 3 0 R] >> >> >> endobj\n2 0 obj << /Type /EmbeddedFile"
+            b" /Filter /RunLengthDecode /Length "
+            + str(len(runs)).encode()
+            + b" >> stream\n"
+            + runs
+            + b"\nendstream endobj\n3 0 obj << /Type /Filespec /F (a) /EF << /F 2 0 R >> >>"
+            b" endobj\ntrailer << /Root 1 0 R >>\n%EOF\n"
+        )
+
+        def codes(scanner):
+            return [finding["code"] for finding in scanner.scan(pdf).findings]
+
+        self.assertNotIn("limit.memory", codes(malmal.Scanner()))
+        self.assertIn("limit.memory", codes(malmal.Scanner(max_memory=16 << 20)))
+        self.assertNotIn("limit.memory", codes(malmal.Scanner(max_memory=None)))
+        with self.assertRaises(ValueError):
+            malmal.Scanner(max_memory=-1)
+
     def test_closed_scanner(self):
         scanner = malmal.Scanner(strict=True)
         scanner.close()

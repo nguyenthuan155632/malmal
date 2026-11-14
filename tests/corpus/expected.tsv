@@ -260,7 +260,7 @@ prototypes/files/struct-gif-no-ct.gif	Suspicious	image.malformed
 prototypes/files/struct-jpeg-bad-seg-len.jpg	Suspicious	image.malformed
 prototypes/files/struct-pdf-bad-startxref.pdf	Clean	
 prototypes/files/struct-pdf-deep-objstm.pdf	Malicious	pdf.launch,pdf.open_action
-prototypes/files/struct-pdf-selfref.pdf	Clean	
+prototypes/files/struct-pdf-selfref.pdf	Suspicious	pdf.ambiguous_structure
 prototypes/files/struct-pdf-two-eof.pdf	Malicious	pdf.incremental_update,pdf.javascript,pdf.malformed,pdf.open_action
 prototypes/files/struct-png-huge-chunk-len.png	Suspicious	image.malformed
 prototypes/files/struct-png-neg-dims.png	Suspicious	image.malformed

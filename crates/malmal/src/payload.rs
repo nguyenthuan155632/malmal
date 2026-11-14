@@ -118,6 +118,7 @@ impl Ahead {
                 .iter()
                 .position(|b| !(b.is_ascii_graphic() || b.is_ascii_whitespace()))
                 .unwrap_or(data.len() - at);
+            crate::work::done(length + 1);
             self.text = (at, at + length);
         }
         &data[at..self.text.1.min(at + CODE_TAIL_WINDOW)]
@@ -290,7 +291,9 @@ pub fn scan(data: &[u8], scope: Scope) -> Vec<PayloadHit> {
 }
 
 pub(crate) fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    memchr::memmem::find(haystack, needle)
+    let found = memchr::memmem::find(haystack, needle);
+    crate::work::searched(haystack.len(), found, needle.len());
+    found
 }
 
 #[cfg(test)]
@@ -411,13 +414,14 @@ mod tests {
 
     #[test]
     fn tails_close_together_are_read_once() {
-        let started = std::time::Instant::now();
-        let mut data = b"<?=a(".repeat(400_000);
-        assert_eq!(kinds(&data, Scope::Binary), []);
+        let mut data = b"<?=a(".repeat(20_000);
+        let (found, work) = crate::work::counted(|| kinds(&data, Scope::Binary));
+        assert_eq!(found, []);
+        // Each byte read a few times, not once for each tag before it.
+        assert!(work < 8 * data.len() as u64, "{work}");
         // What follows the last one is still a tag.
         data.extend_from_slice(b"\x00<?= system($x) ?>");
         assert_eq!(kinds(&data, Scope::Binary), [PayloadKind::Php]);
-        assert!(started.elapsed() < std::time::Duration::from_secs(3));
 
         // A closing sequence past the printable run, or one that only
         // starts inside it, is not the tag's.

@@ -338,7 +338,7 @@ Done after the first release, from the list of known limits and what a deploymen
       through the analyzer and refused when it does. 300 SVG files from a desktop system
       pass, and 60 of them render pixel for pixel as before.
 - [x] PDF (`cdr-pdf`), the Dangerzone way: `hayro` draws each page and a small writer here
-      puts the drawings in a new PDF. Text is no longer text.
+      puts the drawings in a new PDF. Text is no longer text (until M13).
 - [x] `Options::types`: the types to rebuild, so that unused decoders are never run.
 - [x] `cdr-pdf` is opt-in for the commands and the C library: it turns a document into
       pictures, doubles the binaries, and rests on a renderer that calls itself
@@ -355,8 +355,8 @@ Not done:
   assembly on x86-64 (it needs `nasm`, and cannot be told not to), and `rav1d` has no
   safe API of its own.
 - HEIC: no HEVC decoder in Rust.
-- A rebuilt PDF that keeps its text, which is the difference between this and a real
-  sanitizer for PDF.
+- A rebuilt PDF that keeps its fonts, links and forms. Its text it keeps, since M13, as
+  characters that do not draw.
 
 ### M12 — A time limit that holds
 
@@ -406,11 +406,53 @@ Taken from a comparison with quelda (github.com/tranhuucanh/quelda), a PDF scann
 - [x] The daemon's workers held only by scans; `--file-budget` for the files held at
       once, `--min-rate` for clients that send or read slowly; multipart boundaries found
       in linear time; spool writes buffered. Soaked over the four endpoints.
-- [ ] Not done: PDF Insecurity (not downloaded); a ceiling on what scans take in memory
-      (scans are not made to wait for memory; `--file-budget` counts the files only);
-      reading object streams, attachments, XFA and metadata in blocks; recursion through
-      patterns, soft masks and glyphs; page tree and bookmark loops; embedded fonts and
-      colour profiles; presets and locked rules.
+- [x] `--max-memory` and `ScannerBuilder::memory_limit`: what one scan's thread holds,
+      counted by the tools' allocator and checked per decoded PDF block and between
+      steps. 200 MiB bombs 205 MiB → 55 MiB at 64 MiB; eight at once on four workers,
+      807 MiB → 201 MiB. No file of CIC, the corpus or PDF Insecurity reaches 16 MiB.
+- [x] Measured on the PDF Insecurity samples (pdf-insecurity.org, RUB-NDS/PDF101), 335
+      distinct files: 57 malicious, 155 suspicious, 123 clean before; 57, 163, 115 after
+      `pdf.reference_loop`, content that is not a stream and the calculator stack. Still
+      clean: signature and content-masking attacks and hidden metadata, which carry no
+      active content; documents whose only action is a link; the unmodified originals.
+- [x] C2PA manifests (`pdf.c2pa_manifest`) and OPPO camera trailers told apart from
+      attachments and trailing data, checked to the last box; no verdict changed on CIC.
+- [x] `pdf.link_lure`: a web link over a fifth of the page. CIC: 98.19 % → 98.65 % of the
+      malicious refused, the clean unchanged at 87.32 %. At a tenth, 15 clean files
+      (logos) were marked.
+- [x] The memory limit in C (`malmal_scanner_set_max_memory`, the library counting with
+      the allocator the CLI uses) and Python (`Scanner(max_memory=…)`), and inside the
+      steps that are not PDF streams: PNG chunks, SVGZ, JPEG XL boxes inflate in blocks
+      against it; a PostScript ASCII85 string is held to what is left of it.
+- [x] Tests of the loops that used to grow with the square of the file count the bytes
+      read and the steps taken (`work.rs`, in test builds only) and compare them with
+      the file, instead of timing it: payload tails, PostScript resources and strings,
+      SVG references and CSS addresses, PDF trailers, objects, object streams, forms
+      and `/Encrypt`. Put back, each fix's absence counts 10³ to 10⁴ times the file.
+      The daemon's two timed tests wait on what the client sees, not on a clock.
+- [x] Signatures (`pdf.signature_invalid`, `pdf.unsigned_content`): ranges checked
+      against the file and against the signature's own value; copies outside what is
+      signed; usage rights left alone. Calculator functions run on the corners of their
+      domain. Content masking (`pdf.ambiguous_structure`): page content whose length,
+      keywords or line ends readers take differently; deciding keys given twice;
+      cross-reference entries that point elsewhere, at a comment, or are neither kind;
+      objects defined again after the last `startxref`. Unknown filters are malformed.
+      Each rule was kept only if it marked no clean file of CIC; three that did (free
+      entries that point at their object, `%` anywhere earlier on the line, any object
+      after the last `startxref`) were narrowed or dropped. PDF Insecurity: 110 clean →
+      50; CIC: `pdf.ambiguous_structure` on 1,558 malicious files and no clean one.
+- [x] `pdf.disguised_link`: shorteners, numeric hosts, punycode, made-up syllable names.
+      CIC: 98.67 % → 99.07 % of the malicious refused, the clean unchanged at 87.32 %.
+- [x] A rebuilt PDF keeps its text (`Options::pdf_text`, `--pdf-no-text` to leave it
+      out): hayro reports each glyph it draws with its Unicode text and position, and
+      the writer puts the characters under the picture in Type 3 fonts whose glyphs
+      draw nothing, with a `ToUnicode` map. On 80 clean CIC files, pdftotext finds
+      97.9 % of the words of the first three pages in the rebuilt copy (median 99.3 %).
+- [ ] Not done: reading object streams, attachments, XFA and metadata in blocks;
+      recursion through patterns, soft masks and glyphs; embedded fonts and colour
+      profiles; presets and locked rules; the content masking that no structure shows
+      (unknown operators, inner and outer documents, page trees with too few leaves);
+      checking links against a list of known bad sites.
 
 ## Order and dependencies
 

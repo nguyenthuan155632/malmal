@@ -6,7 +6,16 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
 use malmal::cdr::{Error, Options};
-use malmal::{HashList, Policy, ScanHints, Scanner};
+use malmal::{HashList, MemoryLimit, Policy, ScanHints, Scanner};
+
+pub mod memory;
+
+#[global_allocator]
+static ALLOCATOR: memory::Counting = memory::Counting;
+
+/// What one scan may hold unless `malmal_scanner_set_max_memory` says
+/// otherwise: the default of the commands' `--max-memory`.
+const DEFAULT_MAX_MEMORY: u64 = 512 << 20;
 
 const MALMAL_CLEAN: c_int = 0;
 const MALMAL_ERROR: c_int = 3;
@@ -104,7 +113,10 @@ pub unsafe extern "C" fn malmal_scanner_new_with_allow(
             .split(|&byte| byte == b'\n')
             .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
             .filter(|line| !line.is_empty());
-        let builder = Scanner::builder().policy(policy).hashlist(hashlist);
+        let builder = Scanner::builder()
+            .policy(policy)
+            .hashlist(hashlist)
+            .memory_limit(memory_limit(DEFAULT_MAX_MEMORY));
         Ok::<_, String>(builder.pdf_passwords(passwords).build())
     });
     let message = match built {
@@ -118,6 +130,28 @@ pub unsafe extern "C" fn malmal_scanner_new_with_allow(
         unsafe { *error = message.into_raw() };
     }
     ptr::null_mut()
+}
+
+/// A memory limit of `max` bytes for each scan, measured by this library's
+/// allocator.
+fn memory_limit(max: u64) -> MemoryLimit {
+    MemoryLimit {
+        max,
+        measure: memory::held,
+    }
+}
+
+/// # Safety
+/// `scanner` must be null or a pointer from `malmal_scanner_new` that has
+/// not been freed, and not in use by another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn malmal_scanner_set_max_memory(scanner: *mut malmal_scanner, max: u64) {
+    if scanner.is_null() {
+        return;
+    }
+    // SAFETY: the caller guarantees a live scanner that nothing else uses.
+    let scanner = unsafe { &mut (*scanner).0 };
+    scanner.set_memory_limit((max > 0).then(|| memory_limit(max)));
 }
 
 /// # Safety
@@ -385,6 +419,35 @@ mod tests {
             )
         };
         assert_eq!(verdict, 1);
+        unsafe { malmal_scanner_free(scanner) };
+    }
+
+    #[test]
+    fn scans_stop_at_their_memory_limit() {
+        // An attachment of 48 MiB of zeros, run-length encoded.
+        let runs = (48 << 20) / 128;
+        let data = [b"\x81\0".repeat(runs), b"\x80".to_vec()].concat();
+        let mut pdf = format!(
+            "%PDF-1.7\n1 0 obj << /Type /Catalog /Names << /EmbeddedFiles << /Names [(a) 3 0 R] >> >> >> endobj\n\
+             2 0 obj << /Type /EmbeddedFile /Filter /RunLengthDecode /Length {} >> stream\n",
+            data.len()
+        )
+        .into_bytes();
+        pdf.extend_from_slice(&data);
+        pdf.extend_from_slice(
+            b"\nendstream endobj\n3 0 obj << /Type /Filespec /F (a) /EF << /F 2 0 R >> >> endobj\n\
+              trailer << /Root 1 0 R >>\n%%EOF\n",
+        );
+        let scanner = unsafe { malmal_scanner_new(0, ptr::null(), 0) };
+        let (_, report) = scan(scanner, &pdf, c"a.pdf");
+        assert!(!report.contains("limit.memory"), "{report}");
+        unsafe { malmal_scanner_set_max_memory(scanner, 16 << 20) };
+        let (verdict, report) = scan(scanner, &pdf, c"a.pdf");
+        assert_eq!(verdict, 1);
+        assert!(report.contains("limit.memory"), "{report}");
+        unsafe { malmal_scanner_set_max_memory(scanner, 0) };
+        let (_, report) = scan(scanner, &pdf, c"a.pdf");
+        assert!(!report.contains("limit.memory"), "{report}");
         unsafe { malmal_scanner_free(scanner) };
     }
 

@@ -39,7 +39,7 @@
 //! | BMP, TIFF, ICO | PNG; of an icon, the largest image |
 //! | JPEG XL | PNG; of an animation, the first frame |
 //! | SVG, with the `cdr-svg` feature | SVG, filtered down to what draws a picture |
-//! | PDF, with the `cdr-pdf` feature | PDF in which every page is a picture of the page |
+//! | PDF, with the `cdr-pdf` feature | PDF in which every page is a picture of the page, with its text, which does not draw |
 //!
 //! An animation keeps its frame delays and the number of times it plays.
 //! Every other type is refused with [`Error::Unsupported`] rather than
@@ -102,6 +102,10 @@ pub struct Options {
     pub pdf_dpi: u16,
     /// How the picture of each page is kept in a rebuilt PDF.
     pub pdf_pages: PageImage,
+    /// Whether a rebuilt PDF keeps the text of its pages, where it was, as
+    /// characters that can be selected, searched and copied and that do not
+    /// draw: the picture is what shows. Nothing else of a font is kept.
+    pub pdf_text: bool,
 }
 
 /// How the picture of a page is kept in a rebuilt PDF.
@@ -125,6 +129,7 @@ impl Default for Options {
             types: None,
             pdf_dpi: 150,
             pdf_pages: PageImage::Lossless,
+            pdf_text: true,
         }
     }
 }
@@ -298,10 +303,11 @@ fn rebuild_inner(
 }
 
 /// A PDF whose pages are pictures of the pages of `data`, and nothing else:
-/// each page is drawn and the drawing is what the new file holds. Text can
-/// no longer be selected or searched, links and forms are gone, and so is
-/// everything else a PDF can carry. A document that one of `passwords`
-/// opens comes back as one that needs none.
+/// each page is drawn and the drawing is what the new file holds, along
+/// with, if [`Options::pdf_text`] says so, the characters of its text where
+/// they stood, in a font of this module's that draws nothing. Links and
+/// forms are gone, and so is everything else a PDF can carry. A document
+/// that one of `passwords` opens comes back as one that needs none.
 #[cfg(feature = "cdr-pdf")]
 fn pdf(
     data: &[u8],
@@ -366,7 +372,19 @@ fn pdf(
             .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
             .collect();
         let jpeg = (options.pdf_pages == PageImage::Jpeg).then_some(options.jpeg_quality);
-        written.page(width, height, drawn.width(), drawn.height(), &colours, jpeg)?;
+        let text = if options.pdf_text {
+            deadline.check()?;
+            text_of(page, &interpreter, height)
+        } else {
+            Vec::new()
+        };
+        let picture = Picture {
+            wide: drawn.width(),
+            high: drawn.height(),
+            colours: &colours,
+            jpeg,
+        };
+        written.page(width, height, picture, &text)?;
         if written.len() as u64 > limits.max_decompressed {
             return Err(Error::TooLarge);
         }
@@ -384,16 +402,154 @@ fn pdf(
     })
 }
 
-/// A PDF being written of which every page is one picture. Objects 1 and 2
-/// are the catalogue and the list of pages; each page then takes three:
-/// itself, the line that paints its picture, and the picture.
+/// The characters a page draws, each as its text, where it stands on the
+/// page and how far it reaches: the transform, from a square one unit on a
+/// side at the origin to the box of the character on a page `height`
+/// points high whose origin is its lower left corner.
+#[cfg(feature = "cdr-pdf")]
+fn text_of(
+    page: &hayro::hayro_syntax::page::Page<'_>,
+    settings: &hayro::hayro_interpret::InterpreterSettings,
+    height: f32,
+) -> Vec<Character> {
+    use hayro::hayro_interpret::util::TransformExt;
+    use hayro::hayro_interpret::{Context, InterpreterCache, interpret_page};
+    use hayro::kurbo::{Affine, Rect};
+
+    let cache = InterpreterCache::new();
+    // Points, from the top left corner, as the page is drawn.
+    let transform = page.initial_transform(true).to_kurbo();
+    let (wide, high) = page.render_dimensions();
+    let bounds = Rect::new(0.0, 0.0, f64::from(wide), f64::from(high));
+    let mut context = Context::new(transform, bounds, &cache, page.xref(), settings.clone());
+    let mut found = Characters {
+        upright: Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, f64::from(height)]),
+        found: Vec::new(),
+    };
+    interpret_page(page, &mut context, &mut found);
+    found.found
+}
+
+/// A character of the text of a page: see [`text_of`].
+#[cfg(feature = "cdr-pdf")]
+struct Character {
+    text: String,
+    place: [f64; 6],
+}
+
+/// The most characters kept of a page, which is some hundred times what a
+/// page of text has.
+#[cfg(feature = "cdr-pdf")]
+const MAX_CHARACTERS: usize = 1 << 18;
+
+/// A device that draws nothing and keeps the characters of a page.
+#[cfg(feature = "cdr-pdf")]
+struct Characters {
+    upright: hayro::kurbo::Affine,
+    found: Vec<Character>,
+}
+
+#[cfg(feature = "cdr-pdf")]
+impl<'a> hayro::hayro_interpret::Device<'a> for Characters {
+    fn draw_path(
+        &mut self,
+        _: &hayro::kurbo::BezPath,
+        _: hayro::hayro_interpret::DrawProps<'a>,
+        _: &hayro::hayro_interpret::DrawMode,
+    ) {
+    }
+    fn push_clip_path(&mut self, _: &hayro::hayro_interpret::ClipPath) {}
+    fn push_transparency_group(
+        &mut self,
+        _: f32,
+        _: Option<hayro::hayro_interpret::SoftMask<'a>>,
+        _: hayro::hayro_interpret::BlendMode,
+    ) {
+    }
+    fn draw_glyph_run(
+        &mut self,
+        run: &hayro::hayro_interpret::font::GlyphRun<'_, 'a>,
+        props: hayro::hayro_interpret::DrawProps<'a>,
+        _: &hayro::hayro_interpret::DrawMode,
+    ) {
+        use hayro::hayro_interpret::hayro_cmap::BfString;
+        use hayro::kurbo::Affine;
+        let glyphs = run.glyphs();
+        // Where each glyph is drawn: from glyph space, in which an em is a
+        // thousand units, to the page.
+        let placed = |glyph: &hayro::hayro_interpret::font::PositionedGlyph<'_>| {
+            self.upright * props.transform * glyph.transform()
+        };
+        for (index, glyph) in glyphs.iter().enumerate() {
+            if self.found.len() >= MAX_CHARACTERS {
+                return;
+            }
+            let text = match glyph.as_unicode() {
+                Some(BfString::Char(character)) => character.to_string(),
+                Some(BfString::String(text)) => text,
+                None => continue,
+            };
+            let text: String = text.chars().filter(|c| !c.is_control()).collect();
+            if text.is_empty() || text.len() > 32 {
+                continue;
+            }
+            let place = placed(glyph);
+            // The box reaches as far along as the next glyph starts, or
+            // half an em for the last of the run.
+            let next = glyphs.get(index + 1).map(|next| {
+                let start = placed(next) * hayro::kurbo::Point::ORIGIN;
+                (place.inverse() * start).x
+            });
+            let advance = next.filter(|x| (1.0..4000.0).contains(x)).unwrap_or(500.0);
+            let place = (place * Affine::scale_non_uniform(advance, 1000.0)).as_coeffs();
+            if place.iter().all(|value| value.is_finite())
+                && place[0] * place[3] - place[1] * place[2] != 0.0
+            {
+                self.found.push(Character { text, place });
+            }
+        }
+    }
+    fn draw_image(
+        &mut self,
+        _: hayro::hayro_interpret::Image<'a, '_>,
+        _: hayro::hayro_interpret::ImageDrawProps<'a>,
+    ) {
+    }
+    fn pop_clip(&mut self) {}
+    fn pop_transparency_group(&mut self) {}
+}
+
+/// The picture of a page: `wide` by `high` pixels of `colours`, three bytes
+/// to a pixel, kept pixel for pixel, or as a JPEG of the quality given if
+/// that comes out smaller.
+#[cfg(feature = "cdr-pdf")]
+struct Picture<'c> {
+    wide: u16,
+    high: u16,
+    colours: &'c [u8],
+    jpeg: Option<u8>,
+}
+
+/// A PDF being written of which every page is one picture, and the text
+/// that was on it. Objects 1 to 3 are the catalogue, the list of pages and
+/// the fonts of the text; each page then takes three: itself, what it
+/// draws, and the picture; the fonts come last.
 #[cfg(feature = "cdr-pdf")]
 #[derive(Default)]
 struct PagesPdf {
     data: Vec<u8>,
-    /// Where each object after the first two starts.
+    /// Where each object after the first three starts.
     offsets: Vec<usize>,
+    pages: u32,
+    /// The text of each character code of the fonts: code `n` is code
+    /// `n % 256` of font `n / 256`.
+    codes: Vec<String>,
+    coded: std::collections::HashMap<String, usize>,
 }
+
+/// Most character codes the text of a document is given, 256 to a font.
+#[cfg(feature = "cdr-pdf")]
+const MAX_CODES: usize = 1 << 16;
 
 #[cfg(feature = "cdr-pdf")]
 impl PagesPdf {
@@ -402,7 +558,7 @@ impl PagesPdf {
     }
 
     fn pages(&self) -> u32 {
-        (self.offsets.len() / 3) as u32
+        self.pages
     }
 
     fn object(&mut self, dictionary: &str, stream: Option<&[u8]>) {
@@ -412,7 +568,7 @@ impl PagesPdf {
                 .extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
         }
         self.offsets.push(self.data.len());
-        let number = self.offsets.len() + 2;
+        let number = self.offsets.len() + 3;
         let head = format!("{number} 0 obj\n<< {dictionary} >>\n");
         self.data.extend_from_slice(head.as_bytes());
         if let Some(stream) = stream {
@@ -423,30 +579,75 @@ impl PagesPdf {
         self.data.extend_from_slice(b"endobj\n");
     }
 
-    /// Add a page `width` by `height` points that shows `colours`, three
-    /// bytes to a pixel, over all of it: pixel for pixel, or as a JPEG of
-    /// the quality given if that comes out smaller.
+    /// The code of `text`, if it has one or there are codes left.
+    fn code(&mut self, text: &str) -> Option<usize> {
+        if let Some(&code) = self.coded.get(text) {
+            return Some(code);
+        }
+        let code = self.codes.len();
+        (code < MAX_CODES).then(|| {
+            self.codes.push(text.to_owned());
+            self.coded.insert(text.to_owned(), code);
+            code
+        })
+    }
+
+    /// Add a page `width` by `height` points that shows `picture` over all
+    /// of it, and holds `text`, which does not draw.
     fn page(
         &mut self,
         width: f32,
         height: f32,
-        wide: u16,
-        high: u16,
-        colours: &[u8],
-        jpeg: Option<u8>,
+        picture: Picture<'_>,
+        text: &[Character],
     ) -> Result<(), Error> {
-        let first = self.offsets.len() + 3;
+        let Picture {
+            wide,
+            high,
+            colours,
+            jpeg,
+        } = picture;
+        let first = self.offsets.len() + 4;
         self.object(
             &format!(
                 "/Type /Page /Parent 2 0 R /MediaBox [0 0 {width} {height}] \
-                 /Resources << /XObject << /P {} 0 R >> >> /Contents {} 0 R",
+                 /Resources << /XObject << /P {} 0 R >> /Font 3 0 R >> /Contents {} 0 R",
                 first + 2,
                 first + 1
             ),
             None,
         );
-        let paint = format!("q {width} 0 0 {height} 0 0 cm /P Do Q");
-        self.object(&format!("/Length {}", paint.len()), Some(paint.as_bytes()));
+        let mut paint = format!("q {width} 0 0 {height} 0 0 cm /P Do Q");
+        if !text.is_empty() {
+            use std::fmt::Write as _;
+            // Characters that are not drawn, in a font of glyphs that
+            // would draw nothing if they were.
+            paint += "\nBT 3 Tr";
+            let mut font = None;
+            for character in text {
+                let Some(code) = self.code(&character.text) else {
+                    continue;
+                };
+                if font != Some(code / 256) {
+                    font = Some(code / 256);
+                    let _ = write!(paint, "\n/T{} 1 Tf", code / 256);
+                }
+                let [a, b, c, d, e, f] = character
+                    .place
+                    .map(|value| (value * 1000.0).round() / 1000.0);
+                let _ = write!(
+                    paint,
+                    "\n{a} {b} {c} {d} {e} {f} Tm <{:02X}> Tj",
+                    code % 256
+                );
+            }
+            paint += "\nET";
+        }
+        let paint = miniz_oxide::deflate::compress_to_vec_zlib(paint.as_bytes(), 6);
+        self.object(
+            &format!("/Filter /FlateDecode /Length {}", paint.len()),
+            Some(&paint),
+        );
 
         // A page of black on white needs one channel, not three.
         let grey = colours
@@ -483,13 +684,76 @@ impl PagesPdf {
             ),
             Some(&packed),
         );
+        self.pages += 1;
         Ok(())
+    }
+
+    /// Write the fonts of the text: each a Type 3 font of 256 glyphs that
+    /// draw nothing and are an em wide, with what each one stands for.
+    fn fonts(&mut self) -> Vec<usize> {
+        use std::fmt::Write as _;
+        let fonts = self.codes.len().div_ceil(256);
+        if fonts == 0 {
+            return Vec::new();
+        }
+        let nothing = self.offsets.len() + 4;
+        self.object("/Length 9", Some(b"1000 0 d0"));
+        let names: String = (0..256)
+            .map(|code| format!("/g{code}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let procs: String = (0..256)
+            .map(|code| format!("/g{code} {nothing} 0 R"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let widths = vec!["1000"; 256].join(" ");
+        let mut numbers = Vec::new();
+        for font in 0..fonts {
+            let codes = &self.codes[font * 256..self.codes.len().min(font * 256 + 256)];
+            let mut map = String::from(
+                "/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n\
+                 /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+                 /CMapName /Adobe-Identity-UCS def /CMapType 2 def\n\
+                 1 begincodespacerange <00> <FF> endcodespacerange\n",
+            );
+            for chunk in codes.chunks(100).enumerate() {
+                let (index, chunk) = chunk;
+                let _ = writeln!(map, "{} beginbfchar", chunk.len());
+                for (at, text) in chunk.iter().enumerate() {
+                    let units: String = text
+                        .encode_utf16()
+                        .map(|unit| format!("{unit:04X}"))
+                        .collect();
+                    let _ = writeln!(map, "<{:02X}> <{units}>", index * 100 + at);
+                }
+                map += "endbfchar\n";
+            }
+            map += "endcmap CMapName currentdict /CMap defineresource pop end end";
+            let packed = miniz_oxide::deflate::compress_to_vec_zlib(map.as_bytes(), 6);
+            let unicode = self.offsets.len() + 4;
+            self.object(
+                &format!("/Filter /FlateDecode /Length {}", packed.len()),
+                Some(&packed),
+            );
+            numbers.push(self.offsets.len() + 4);
+            self.object(
+                &format!(
+                    "/Type /Font /Subtype /Type3 /FontBBox [0 -200 1000 800] \
+                     /FontMatrix [0.001 0 0 0.001 0 0] /Resources << >> \
+                     /CharProcs << {procs} >> /Encoding << /Type /Encoding /Differences [0 {names}] >> \
+                     /FirstChar 0 /LastChar 255 /Widths [{widths}] /ToUnicode {unicode} 0 R"
+                ),
+                None,
+            );
+        }
+        numbers
     }
 
     fn finish(mut self) -> Vec<u8> {
         let pages = self.pages();
+        let fonts = self.fonts();
         let kids: Vec<String> = (0..pages)
-            .map(|page| format!("{} 0 R", 3 + page * 3))
+            .map(|page| format!("{} 0 R", 4 + page * 3))
             .collect();
         let catalogue = self.data.len();
         self.data
@@ -500,16 +764,22 @@ impl PagesPdf {
             kids.join(" ")
         );
         self.data.extend_from_slice(entry.as_bytes());
+        let resources = self.data.len();
+        let named: Vec<String> = (fonts.iter().enumerate())
+            .map(|(index, number)| format!("/T{index} {number} 0 R"))
+            .collect();
+        let entry = format!("3 0 obj\n<< {} >>\nendobj\n", named.join(" "));
+        self.data.extend_from_slice(entry.as_bytes());
 
         // The table of where every object is, which a reader starts from.
         let table = self.data.len();
-        let mut tail = format!("xref\n0 {}\n0000000000 65535 f \n", self.offsets.len() + 3);
-        for offset in [catalogue, list].iter().chain(&self.offsets) {
+        let mut tail = format!("xref\n0 {}\n0000000000 65535 f \n", self.offsets.len() + 4);
+        for offset in [catalogue, list, resources].iter().chain(&self.offsets) {
             tail += &format!("{offset:010} 00000 n \n");
         }
         tail += &format!(
             "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{table}\n%%EOF\n",
-            self.offsets.len() + 3
+            self.offsets.len() + 4
         );
         self.data.extend_from_slice(tail.as_bytes());
         self.data
@@ -1762,6 +2032,84 @@ mod tests {
         assert!(matches!(run(b"%PDF-1.7\nnothing"), Err(Error::Decode(_))));
     }
 
+    /// What a document says, read from the characters of its first page.
+    #[cfg(feature = "cdr-pdf")]
+    fn said(data: &[u8]) -> Vec<(String, [i32; 2])> {
+        use hayro::hayro_syntax::Pdf;
+        let document = Pdf::new(hayro::hayro_syntax::PdfData::from(data.to_vec())).unwrap();
+        let page = &document.pages()[0];
+        let (_, height) = page.render_dimensions();
+        let settings = hayro::hayro_interpret::InterpreterSettings::default();
+        (text_of(page, &settings, height).into_iter())
+            .map(|character| {
+                let [.., x, y] = character.place;
+                (character.text, [x.round() as i32, y.round() as i32])
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "cdr-pdf")]
+    #[test]
+    fn pdf_text_is_kept_where_it_was_and_does_not_draw() {
+        let content: &[u8] = b"BT /F1 24 Tf 72 700 Td (Hi there) Tj ET \
+                               BT /F1 18 Tf 0 1 -1 0 300 300 Tm (Up) Tj ET";
+        let objects: [&[u8]; 5] = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            &[
+                format!("<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+                content,
+                b"\nendstream",
+            ]
+            .concat(),
+        ];
+        let mut data = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(data.len());
+            data.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            data.extend_from_slice(object);
+            data.extend_from_slice(b"\nendobj\n");
+        }
+        let table = data.len();
+        data.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for offset in offsets {
+            data.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        let tail = format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{table}\n%%EOF\n");
+        data.extend_from_slice(tail.as_bytes());
+
+        let before = said(&data);
+        let text: String = before.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(text, "Hi thereUp");
+        assert_eq!(before[0].1, [72, 700]);
+        let rebuilt = run(&data).unwrap();
+        assert!(scans_clean(&rebuilt.data));
+        assert!(contains(&rebuilt.data, b"/Subtype /Type3"));
+        // The same characters, where they were, upright or not.
+        assert_eq!(said(&rebuilt.data), before);
+        // None of it is drawn: the picture is the one of the page without.
+        let without = Options {
+            pdf_text: false,
+            ..Options::default()
+        };
+        let plain = rebuild(&data, &Limits::default(), &without).unwrap().data;
+        assert!(!contains(&plain, b"Type3"));
+        assert_eq!(said(&plain), []);
+        let image = |data: &[u8]| {
+            let at = data.windows(6).position(|w| w == b"/Image").unwrap();
+            let end = data[at..]
+                .windows(9)
+                .position(|w| w == b"endstream")
+                .unwrap();
+            data[at..at + end].to_vec()
+        };
+        assert!(image(&rebuilt.data) == image(&plain));
+    }
+
     #[cfg(feature = "cdr-pdf")]
     #[test]
     fn pdf_pages_can_be_kept_as_jpeg() {
@@ -1785,14 +2133,24 @@ mod tests {
             .collect();
         let page = |jpeg| {
             let mut written = PagesPdf::default();
-            written
-                .page(120.0, 80.0, 120, 80, &photograph, jpeg)
-                .unwrap();
+            let picture = Picture {
+                wide: 120,
+                high: 80,
+                colours: &photograph,
+                jpeg,
+            };
+            written.page(120.0, 80.0, picture, &[]).unwrap();
             written.finish()
         };
         let (lossless, lossy) = (page(None), page(Some(75)));
-        assert!(contains(&lossless, b"/Filter /FlateDecode"));
-        assert!(contains(&lossy, b"/Filter /DCTDecode /Length"));
+        assert!(contains(
+            &lossless,
+            b"/BitsPerComponent 8 /Filter /FlateDecode"
+        ));
+        assert!(contains(
+            &lossy,
+            b"/BitsPerComponent 8 /Filter /DCTDecode /Length"
+        ));
         assert!(lossy.len() < lossless.len());
         // A reader takes both: this one draws them again.
         for written in [lossless, lossy] {

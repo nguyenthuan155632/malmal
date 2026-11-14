@@ -5,11 +5,10 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use miniz_oxide::inflate::{TINFLStatus, decompress_to_vec_with_limit};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
-use crate::limits::{Budget, LimitExceeded};
+use crate::limits::{Budget, LimitExceeded, Unpacked};
 use crate::report::{Finding, Severity};
 
 /// Attributes whose value is a URL the browser may load or navigate to.
@@ -389,10 +388,13 @@ impl Analyzer<'_> {
         let mut close = 0;
         let mut from = 0;
         while let Some(index) = css[from..].find("url(") {
+            crate::work::done(index + 4);
             let start = from + index + 4;
             from = start;
             if close < start {
-                close = css[start..].find(')').map_or(css.len(), |at| start + at);
+                let found = css[start..].find(')');
+                crate::work::searched(css.len() - start, found, 1);
+                close = found.map_or(css.len(), |at| start + at);
             }
             let url = css[start..close.max(start)]
                 .trim_start()
@@ -497,6 +499,8 @@ impl Analyzer<'_> {
         while let Some(amp) = rest.find('&') {
             out.push_str(&rest[..amp]);
             let after = &rest[amp + 1..];
+            let semicolon = after.find(';');
+            crate::work::searched(amp + 1 + after.len(), semicolon.map(|at| amp + 1 + at), 1);
             let Some((name, tail)) = after.split_once(';') else {
                 // No reference after this one ends either: each `&` left
                 // is dropped, as it is here. Looking for a `;` from each of
@@ -706,18 +710,10 @@ pub(crate) fn gunzip(data: &[u8], cap: u64, budget: &mut Budget) -> Result<Vec<u
     }
     let deflate = data.get(pos..).ok_or(GunzipError::Corrupt)?;
 
-    let limit = budget.remaining().min(cap);
-    match decompress_to_vec_with_limit(deflate, limit as usize) {
-        Ok(inflated) => {
-            let _ = budget.consume(inflated.len() as u64);
-            Ok(inflated)
-        }
-        Err(error) if error.status == TINFLStatus::HasMoreOutput => {
-            let _ = budget.consume(limit);
-            Err(GunzipError::Limit)
-        }
-        Err(_) => Err(GunzipError::Corrupt),
-    }
+    crate::limits::inflate(deflate, false, cap, budget).map_err(|error| match error {
+        Unpacked::Corrupt => GunzipError::Corrupt,
+        Unpacked::Limit => GunzipError::Limit,
+    })
 }
 
 #[cfg(test)]
@@ -1040,12 +1036,21 @@ mod tests {
 
     #[test]
     fn unclosed_references_and_urls_cost_what_the_file_does() {
-        let started = std::time::Instant::now();
-        let ampersands = wrap(&format!(r#"<g id="{}"/>"#, "&".repeat(400_000)));
-        assert_eq!(codes(&ampersands), ["svg.malformed"]);
-        let urls = wrap(&format!(r#"<g style="{}"/>"#, "url(".repeat(100_000)));
-        assert_eq!(codes(&urls), [""; 0]);
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // Each byte is read a few times, not once for each `&` or `url(`
+        // before it.
+        let cost = |svg: &str, expected: &[&str]| {
+            let (found, work) = crate::work::counted(|| codes(svg));
+            assert_eq!(found, expected);
+            assert!(work < 8 * svg.len() as u64, "{work} for {}", svg.len());
+        };
+        cost(
+            &wrap(&format!(r#"<g id="{}"/>"#, "&".repeat(40_000))),
+            &["svg.malformed"],
+        );
+        cost(
+            &wrap(&format!(r#"<g style="{}"/>"#, "url(".repeat(10_000))),
+            &[],
+        );
 
         // What is read of them is what was read before.
         let mut analyzer = Analyzer {
