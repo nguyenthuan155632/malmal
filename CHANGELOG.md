@@ -28,7 +28,21 @@
   integer or floating point.
 - An animated JPEG XL is rebuilt as an animated PNG of every frame, with its delays.
 - PSD: composites compressed with ZIP, with or without prediction, and multichannel
-  documents, drawn in the colours of their inks.
+  documents, drawn in the colours of their inks; duotones in the colours of their inks,
+  through their curves.
+- A JPEG XL made from a JPEG gives back the JPEG, rebuilt with its coefficients kept,
+  where it shows what the JPEG XL does.
+- A TIFF whose strips or tiles are JPEG pictures is rebuilt as one JPEG of their
+  coefficients, without decoding them.
+- A lossy WebP turned by its Exif stays lossy, with Exif of nothing but its orientation.
+- A TIFF of one page of floating-point samples stays a TIFF of them, past black and
+  white too, instead of a PNG clipped to 16 bits.
+- Lossless WebP is written by an encoder of malmal's own (colour table, prediction block
+  by block, copies of earlier pixels), about 5 to 60% smaller; the alpha of a lossy WebP
+  is filtered the way that codes smallest. Each is decoded again and kept only if every
+  pixel comes back.
+- AVIF is decoded on up to four threads for large images, and not waited for past
+  `max_duration`.
 
 ### Added
 
@@ -44,6 +58,12 @@
   coefficients and a TIFF or PSD its samples (written as a TIFF), with its colour
   profile rebuilt from the tags that define its colours, copied byte for byte and
   checked to print every ink as the original does.
+
+- `Options::profiles` (`Profiles::Keep`), `malmal sanitize --keep-profile` and
+  `keep_profile` in the C, Python and Ruby interfaces: colours under an RGB profile
+  other than sRGB (Display P3, Adobe RGB) stay as they are in a JPEG (its coefficients),
+  PNG, TIFF, WebP (lossy too) or BMP, with the profile rebuilt from the tags that define
+  its colours and checked on a 17³ grid at 16 bits.
 
 ## 0.4.2
 

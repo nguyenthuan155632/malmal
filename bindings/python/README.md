@@ -32,7 +32,7 @@ scanner = malmal.Scanner(
 
 With `wait`, a scan that has not ended in time is reported with `limit.time`, never clean,
 and left running on its thread; `scanner.overdue` counts those, and above 0 the program is
-due a restart. `sanitize` also takes `types`, `keep_cmyk`, `pdf_dpi`, `pdf_jpeg`, `pdf_text` and
+due a restart. `sanitize` also takes `types`, `keep_cmyk`, `keep_profile`, `pdf_dpi`, `pdf_jpeg`, `pdf_text` and
 `pdf_vector_text`.
 
 `sanitize` scans and then writes a clean image anew from its pixels, so that nothing but the

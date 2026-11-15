@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use malmal::cdr::{Inks, Options, PageImage};
+use malmal::cdr::{Inks, Options, PageImage, Profiles};
 use malmal::{FileType, HashList, Limits, Policy, Scanner};
 use serde::Deserialize;
 
@@ -152,6 +152,9 @@ pub struct SanitizeOptions {
     /// Keep the inks of a CMYK image as inks.
     #[serde(default)]
     keep_cmyk: bool,
+    /// Keep colours of an RGB profile other than sRGB in it.
+    #[serde(default)]
+    keep_profile: bool,
     pdf_dpi: Option<u16>,
     /// Keep a page as JPEG where that is smaller.
     #[serde(default)]
@@ -192,6 +195,9 @@ impl SanitizeOptions {
         }
         if parsed.keep_cmyk {
             options.inks = Inks::Keep;
+        }
+        if parsed.keep_profile {
+            options.profiles = Profiles::Keep;
         }
         if parsed.pdf_jpeg {
             options.pdf_pages = PageImage::Jpeg;
@@ -266,7 +272,7 @@ mod tests {
     fn sanitize_options() {
         let options = SanitizeOptions::parse(
             r#"{"jpeg_quality": 70, "types": ["png"], "pdf_dpi": 100, "pdf_jpeg": true,
-                "keep_cmyk": true, "pdf_text": false, "pdf_vector_text": false}"#,
+                "keep_cmyk": true, "keep_profile": true, "pdf_text": false, "pdf_vector_text": false}"#,
         )
         .unwrap();
         assert_eq!(options.jpeg_quality, 70);
@@ -274,6 +280,7 @@ mod tests {
         assert_eq!(options.pdf_dpi, 100);
         assert_eq!(options.pdf_pages, PageImage::Jpeg);
         assert_eq!(options.inks, Inks::Keep);
+        assert_eq!(options.profiles, Profiles::Keep);
         assert!(!options.pdf_text && !options.pdf_vector_text);
         assert_eq!(SanitizeOptions::parse("").unwrap().jpeg_quality, 90);
         for json in [

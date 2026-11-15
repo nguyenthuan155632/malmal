@@ -491,6 +491,46 @@ fn obus(data: &[u8]) -> Result<Vec<(u8, &[u8])>, Error> {
     Ok(found)
 }
 
+/// The pictures an AV1 `stream` of frames of up to `pixels` shows. A large
+/// one is decoded on up to four threads, a tile to each. With a deadline
+/// the decoder runs on a thread of its own, and is not waited for past it:
+/// the answer is then [`Error::TimedOut`], though the thread runs on until
+/// the picture is done, which the limits on its size keep short.
+fn av1(
+    stream: Vec<u8>,
+    pixels: u64,
+    deadline: Deadline,
+) -> Result<Vec<filmcraft_av1::Picture>, Error> {
+    let threads = if pixels >= 1 << 20 {
+        std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
+    } else {
+        1
+    };
+    let run = move || -> Result<Vec<filmcraft_av1::Picture>, Error> {
+        let failed = |e: filmcraft_av1::Error| broken(&format!("AV1 image: {e}"));
+        let mut decoder = filmcraft_av1::Decoder::with_threads(threads);
+        let mut pictures = decoder.decode(&stream).map_err(failed)?;
+        pictures.extend(decoder.flush_result().map_err(failed)?);
+        Ok(pictures)
+    };
+    let Some(at) = deadline.0 else {
+        return run();
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("malmal-av1".into())
+        .spawn(move || {
+            let _ = sender.send(run());
+        })
+        .map_err(|e| broken(&format!("no thread for the AV1 decoder: {e}")))?;
+    match receiver.recv_timeout(at.saturating_duration_since(std::time::Instant::now())) {
+        Ok(answer) => answer,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Error::TimedOut),
+        // It stopped without an answer: it panicked.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(broken("AV1 decoder failed")),
+    }
+}
+
 /// The item decoded: an AV1 image, or a grid of them.
 fn decode(
     heif: &Heif<'_>,
@@ -519,10 +559,7 @@ fn decode(
             if pixels > limits.max_pixels || pixels * 6 > limits.max_decompressed {
                 return Err(Error::TooLarge);
             }
-            let mut decoder = filmcraft_av1::Decoder::new();
-            let failed = |e: filmcraft_av1::Error| broken(&format!("AV1 image: {e}"));
-            let mut pictures = decoder.decode(&stream).map_err(failed)?;
-            pictures.extend(decoder.flush_result().map_err(failed)?);
+            let pictures = av1(stream, pixels, deadline)?;
             deadline.check()?;
             let picture = pictures
                 .into_iter()
@@ -971,6 +1008,24 @@ fn unpremultiply(image: &mut DynamicImage) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decoder is not waited for past the deadline.
+    #[test]
+    fn av1_decoding_stops_being_waited_for_at_the_deadline() {
+        let clean = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/clean");
+        let data = std::fs::read(format!("{clean}/photo.avif")).unwrap();
+        let heif = Heif::parse(&data).unwrap();
+        let item = heif.item(heif.primary).unwrap();
+        let mut stream = heif.property(item, b"av1C").unwrap().unwrap()[4..].to_vec();
+        stream.extend_from_slice(&heif.bytes(item).unwrap());
+        let now = Deadline(Some(std::time::Instant::now()));
+        assert!(matches!(av1(stream.clone(), 1, now), Err(Error::TimedOut)));
+        let later = Deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        ));
+        assert_eq!(av1(stream.clone(), 1, later).unwrap().len(), 1);
+        assert_eq!(av1(stream, 1, Deadline(None)).unwrap().len(), 1);
+    }
 
     fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
         [&(body.len() as u32 + 8).to_be_bytes()[..], kind, body].concat()

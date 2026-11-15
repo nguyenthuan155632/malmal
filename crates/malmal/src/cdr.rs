@@ -35,12 +35,12 @@
 //! | JPEG | JPEG of the same coefficients, rotated as its Exif orientation says; where that cannot be done without loss, re-compressed at [`Options::jpeg_quality`] at most |
 //! | PNG | PNG; an animated one keeps every frame, at its own depth |
 //! | GIF | GIF of the same palettes and indices, every frame |
-//! | WebP | lossy WebP of the same coded picture, every frame; lossless WebP of a lossless one |
+//! | WebP | lossy WebP of the same coded picture, every frame, with its orientation; lossless WebP of a lossless one |
 //! | BMP | PNG |
-//! | TIFF | PNG of its one page; TIFF of every page if it has more |
+//! | TIFF | PNG of its one page, or JPEG of the coefficients of its JPEG strips or tiles, or TIFF of samples of floating point; TIFF of every page if it has more |
 //! | ICO | ICO of every image, each a PNG |
-//! | PSD, PSB | PNG of the composite image Photoshop saves with the layers |
-//! | JPEG XL | PNG; animated PNG of every frame of an animation |
+//! | PSD, PSB | PNG of the composite image Photoshop saves with the layers; a duotone in the colours of its inks |
+//! | JPEG XL | JPEG of the coefficients of one made from a JPEG; otherwise PNG, animated PNG of every frame of an animation |
 //! | AVIF | PNG of its primary image |
 //! | SVG, with the `cdr-svg` feature | SVG, filtered down to what draws a picture |
 //! | PDF, with the `cdr-pdf` feature | PDF in which every page is a picture of the page, with its text, which does not draw |
@@ -60,9 +60,20 @@
 //!   quantisers and coefficients are read and coded again at the same
 //!   probabilities, and the file is kept only if it decodes to every pixel
 //!   the original does. Its transparency is coded again without loss.
+//!   An Exif orientation is kept, as Exif of nothing else.
 //! - A GIF keeps its palettes, the indices of its pixels and how each
 //!   frame is drawn over the last; an animated PNG keeps them too, at its
 //!   own depth.
+//! - A TIFF whose strips or tiles are JPEG pictures becomes one JPEG of
+//!   their coefficients put together, kept only if it shows the page as
+//!   decoding the strips does.
+//! - A JPEG XL made from a JPEG gives back that JPEG, which is rebuilt as
+//!   any JPEG is; it is kept only if it shows what the JPEG XL does.
+//!
+//! A lossless WebP is written by an encoder of its own here (a colour
+//! table, prediction block by block, copies of what came before), and
+//! kept only where it decodes to every pixel and is smaller than what the
+//! `image` crate writes.
 //!
 //! A PNG of 256 colours or fewer is written indexed when that is smaller,
 //! and the pixel density of the original is kept. TIFF is read in every
@@ -79,6 +90,12 @@
 //! the primaries and transfer it names. CIE L*a*b* is converted from the
 //! white the file names, D50 otherwise. A profile that does not fit its
 //! image, or cannot be read, is dropped as it is.
+//!
+//! With [`Profiles::Keep`], the colours of a JPEG, PNG, TIFF, WebP or BMP
+//! under an RGB profile other than sRGB (Display P3, Adobe RGB) are kept as
+//! they are, with the profile written anew from the tags that say what its
+//! colours are, checked to give every colour of a grid of them as the
+//! original does; one that cannot be is turned into sRGB as before.
 //!
 //! With [`Inks::Keep`], a CMYK JPEG, TIFF or PSD keeps its inks instead:
 //! a JPEG its coefficients, a TIFF or PSD its samples, written as a TIFF.
@@ -127,11 +144,13 @@ mod ifd;
 mod jpeg;
 mod jxl;
 mod palette;
+mod profile;
 mod psd;
 mod strips;
 mod tif;
 mod tiff_out;
 mod vp8;
+mod vp8l;
 mod webp;
 
 use crate::detect::{self, FileType};
@@ -167,6 +186,27 @@ pub struct Options {
     pub pdf_vector_text: bool,
     /// What becomes of an image of printing inks (CMYK).
     pub inks: Inks,
+    /// What becomes of an image in colours of an RGB profile other than
+    /// sRGB, such as Display P3 or Adobe RGB.
+    pub profiles: Profiles,
+}
+
+/// What becomes of the colours of an RGB image under a profile other than
+/// sRGB: a JPEG, PNG, TIFF, WebP or BMP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Profiles {
+    /// Turned into sRGB, as far as sRGB can show them; the new file has no
+    /// profile.
+    #[default]
+    Srgb,
+    /// Kept as they are, with the profile, so that colours sRGB cannot show
+    /// are not lost: a JPEG of the same coefficients, the samples of the
+    /// others as they were. The profile is written anew from the tags that
+    /// describe its colours, which make exactly the colours the old one did
+    /// of a grid of every mix; if it cannot be, the colours are turned into
+    /// sRGB instead.
+    Keep,
 }
 
 /// What becomes of an image of printing inks: a CMYK JPEG, TIFF or PSD.
@@ -210,6 +250,7 @@ impl Default for Options {
             pdf_text: true,
             pdf_vector_text: true,
             inks: Inks::Srgb,
+            profiles: Profiles::Srgb,
         }
     }
 }
@@ -1438,7 +1479,17 @@ fn raster(
                             (_, _) => None,
                         }
                     } else {
-                        ToSrgb::new(icc).is_none().then_some(None)
+                        match icc {
+                            // Colours of another profile are kept in it, if
+                            // they are to be and it can be written anew.
+                            Some(icc) if ToSrgb::new(Some(icc.clone())).is_some() => {
+                                (coefficients.colours() && options.profiles == Profiles::Keep)
+                                    .then(|| colour::rewritten_rgb(&icc))
+                                    .flatten()
+                                    .map(Some)
+                            }
+                            _ => Some(None),
+                        }
                     };
                     if let Some(profile) = profile
                         && coefficients.orient()
@@ -1465,12 +1516,18 @@ fn raster(
                 return write(image, deadline, output);
             }
             let decoder = JpegDecoder::new(input).map_err(decode_error)?;
-            still(decoder, limits, deadline, output)
+            still(decoder, limits, deadline, output, options.profiles)
         }
         FileType::Png => {
             let mut decoder = PngDecoder::new(input).map_err(decode_error)?;
             if !decoder.is_apng().map_err(decode_error)? {
-                return still(decoder, limits, deadline, Output::Png(density));
+                return still(
+                    decoder,
+                    limits,
+                    deadline,
+                    Output::Png(density),
+                    options.profiles,
+                );
             }
             // Frame by frame as the file has them, where that can be done.
             match apng::rebuild(data, limits, deadline) {
@@ -1492,14 +1549,14 @@ fn raster(
         FileType::Webp => {
             // A lossy picture keeps what its coder coded, if that shows
             // every pixel as the original does.
-            match webp::rebuild(data, limits, deadline) {
+            match webp::rebuild(data, limits, deadline, options.profiles == Profiles::Keep) {
                 Ok(Some(rebuilt)) => return Ok(rebuilt),
                 Ok(None) | Err(Error::Decode(_) | Error::Encode(_)) => {}
                 Err(other) => return Err(other),
             }
             let mut decoder = WebPDecoder::new(input).map_err(decode_error)?;
             if !decoder.has_animation() {
-                return still(decoder, limits, deadline, Output::Webp);
+                return still(decoder, limits, deadline, Output::Webp, options.profiles);
             }
             let canvas = Canvas::of(&mut decoder, limits)?;
             animation(decoder, canvas, limits, deadline, Animated::Webp)
@@ -1520,8 +1577,15 @@ fn raster(
             limits,
             deadline,
             Output::Png(density),
+            options.profiles,
         ),
-        FileType::Tiff => tif::rebuild(data, limits, deadline, options.inks == Inks::Keep),
+        FileType::Tiff => tif::rebuild(
+            data,
+            limits,
+            deadline,
+            options.inks == Inks::Keep,
+            options.profiles == Profiles::Keep,
+        ),
         FileType::Psd => {
             match psd::composite(data, limits, deadline, options.inks == Inks::Keep)? {
                 psd::Composite::Colours(picture) => {
@@ -1541,11 +1605,22 @@ fn raster(
                 limits,
                 deadline,
                 Output::Png(density),
+                options.profiles,
             ),
             other => other,
         },
         // There is no encoder for it here; a PNG keeps every pixel.
         FileType::Jxl => {
+            // One made from a JPEG gives it back, which is rebuilt as any
+            // JPEG is: its coefficients kept, nothing else.
+            if let Some(jpeg) = jxl::original_jpeg(data, limits)
+                && detect::detect(&jpeg) == FileType::Jpeg
+            {
+                match raster(&jpeg, FileType::Jpeg, limits, options, deadline) {
+                    Err(Error::Decode(_) | Error::Encode(_)) => {}
+                    other => return other,
+                }
+            }
             if let Some(animation) = jxl::rebuild(data, limits, deadline)? {
                 return Ok(animation);
             }
@@ -1554,6 +1629,7 @@ fn raster(
                 limits,
                 deadline,
                 Output::Png(density),
+                options.profiles,
             )
         }
         // There is no AV1 encoder here; a PNG keeps every pixel.
@@ -1635,6 +1711,16 @@ impl ToSrgb {
         Self::convert(&*transform, pixels, layout)
     }
 
+    /// Floating point, which may go past black and white and comes out so.
+    fn float(&self, pixels: &mut [f32], layout: Layout) -> Option<()> {
+        let options = TransformOptions::default();
+        let transform = self
+            .profile
+            .create_transform_f32(layout, &self.srgb, layout, options)
+            .ok()?;
+        Self::convert(&*transform, pixels, layout)
+    }
+
     fn convert<T: Copy + Default>(
         transform: &dyn TransformExecutor<T>,
         pixels: &mut [T],
@@ -1677,6 +1763,8 @@ impl ToSrgb {
             DynamicImage::ImageRgba8(pixels) => self.eight(pixels, Layout::Rgba),
             DynamicImage::ImageRgb16(pixels) => self.sixteen(pixels, Layout::Rgb),
             DynamicImage::ImageRgba16(pixels) => self.sixteen(pixels, Layout::Rgba),
+            DynamicImage::ImageRgb32F(pixels) => self.float(pixels, Layout::Rgb),
+            DynamicImage::ImageRgba32F(pixels) => self.float(pixels, Layout::Rgba),
             _ => None,
         };
     }
@@ -1802,21 +1890,53 @@ impl Canvas {
 }
 
 fn still(
-    decoder: impl ImageDecoder,
+    mut decoder: impl ImageDecoder,
     limits: &Limits,
     deadline: Deadline,
     output: Output,
+    profiles: Profiles,
 ) -> Result<Rebuilt, Error> {
-    write(picture(decoder, limits)?, deadline, output)
+    // Colours of a profile other than sRGB's stay in it, if they are to
+    // and it can be written anew.
+    let kept = match profiles {
+        Profiles::Keep if decoder.color_type().has_color() => decoder
+            .icc_profile()
+            .ok()
+            .flatten()
+            .filter(|icc| ToSrgb::new(Some(icc.clone())).is_some())
+            .and_then(|icc| colour::rewritten_rgb(&icc)),
+        _ => None,
+    };
+    let Some(icc) = kept else {
+        return write(picture(decoder, limits, true)?, deadline, output);
+    };
+    let image = picture(decoder, limits, false)?;
+    let rebuilt = write(image.clone(), deadline, output.clone())?;
+    match profile::attach(rebuilt, &icc) {
+        Some(rebuilt) => Ok(rebuilt),
+        // A file that cannot carry the profile has the colours converted.
+        None => {
+            let mut image = image;
+            if let Some(colors) = ToSrgb::new(Some(icc)) {
+                colors.image(&mut image);
+            }
+            write(image, deadline, output)
+        }
+    }
 }
 
-/// The pixels of a still image, in sRGB and the right way up.
-fn picture(mut decoder: impl ImageDecoder, limits: &Limits) -> Result<DynamicImage, Error> {
+/// The pixels of a still image, the right way up, and in sRGB if
+/// `convert`.
+fn picture(
+    mut decoder: impl ImageDecoder,
+    limits: &Limits,
+    convert: bool,
+) -> Result<DynamicImage, Error> {
     let canvas = Canvas::of(&mut decoder, limits)?;
     // The orientation lives in metadata the new file will not have.
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     let mut image = DynamicImage::from_decoder(decoder).map_err(decode_error)?;
-    if let Some(colors) = &canvas.colors {
+    if convert && let Some(colors) = &canvas.colors {
         colors.image(&mut image);
     }
     image.apply_orientation(orientation);
@@ -1858,7 +1978,7 @@ fn icon(data: &[u8], limits: &Limits, deadline: Deadline) -> Result<Rebuilt, Err
         single.extend_from_slice(&22u32.to_le_bytes());
         single.extend_from_slice(image);
         let decoder = IcoDecoder::new(Cursor::new(&single[..])).map_err(decode_error)?;
-        let picture = picture(decoder, limits)?.into_rgba8();
+        let picture = picture(decoder, limits, true)?.into_rgba8();
         pixels += picture.width() as u64 * picture.height() as u64;
         if pixels > limits.max_pixels {
             return Err(Error::TooLarge);
@@ -1902,7 +2022,7 @@ fn icon(data: &[u8], limits: &Limits, deadline: Deadline) -> Result<Rebuilt, Err
 fn write(image: DynamicImage, deadline: Deadline, output: Output) -> Result<Rebuilt, Error> {
     deadline.check()?;
     let (width, height) = (image.width(), image.height());
-    let mut data = Vec::new();
+    let data;
     // The pixels are held once: an image that has to be converted gives
     // way to what it is converted to, and one that has not is not copied.
     let file_type = match output {
@@ -1922,14 +2042,7 @@ fn write(image: DynamicImage, deadline: Deadline, output: Output) -> Result<Rebu
             FileType::Png
         }
         Output::Webp => {
-            let image: DynamicImage = if image.color().has_alpha() {
-                image.into_rgba8().into()
-            } else {
-                image.into_rgb8().into()
-            };
-            image
-                .write_with_encoder(WebPEncoder::new_lossless(&mut data))
-                .map_err(encode_error)?;
+            data = webp_bitstream(&image.into_rgba8(), deadline)?;
             FileType::Webp
         }
     };
@@ -2156,7 +2269,7 @@ fn animated(
         Animated::Webp => {
             let pictures = covering(&frames, width, height)?;
             let data = match pictures[..] {
-                [(picture, _)] => webp_bitstream(picture)?,
+                [(picture, _)] => webp_bitstream(picture, deadline)?,
                 _ => animated_webp(&pictures, width, height, plays, deadline)?,
             };
             (data, FileType::Webp)
@@ -2228,8 +2341,9 @@ fn apng(
     Ok(data)
 }
 
-/// A lossless WebP file of one picture.
-fn webp_bitstream(picture: &RgbaImage) -> Result<Vec<u8>, Error> {
+/// A lossless WebP file of one picture: as [`vp8l`] writes it, if that
+/// is smaller than the `image` crate's and decodes to every pixel.
+fn webp_bitstream(picture: &RgbaImage, deadline: Deadline) -> Result<Vec<u8>, Error> {
     let mut data = Vec::new();
     WebPEncoder::new_lossless(&mut data)
         .encode(
@@ -2239,7 +2353,31 @@ fn webp_bitstream(picture: &RgbaImage) -> Result<Vec<u8>, Error> {
             ExtendedColorType::Rgba8,
         )
         .map_err(encode_error)?;
-    Ok(data)
+    let Some(stream) = vp8l::encode(
+        picture.as_raw(),
+        picture.width(),
+        picture.height(),
+        deadline,
+    )?
+    else {
+        return Ok(data);
+    };
+    if stream.len() + 20 >= data.len() {
+        return Ok(data);
+    }
+    let mut body = b"WEBP".to_vec();
+    riff_chunk(&mut body, b"VP8L", &stream)?;
+    let mut file = Vec::with_capacity(body.len() + 8);
+    riff_chunk(&mut file, b"RIFF", &body)?;
+    let decoded = WebPDecoder::new(Cursor::new(&file))
+        .ok()
+        .and_then(|decoder| DynamicImage::from_decoder(decoder).ok())
+        .map(DynamicImage::into_rgba8);
+    Ok(if decoded.as_ref() == Some(picture) {
+        file
+    } else {
+        data
+    })
 }
 
 /// Append a RIFF chunk, padded to an even length.
@@ -2294,7 +2432,7 @@ fn animated_webp(
     for (picture, shown) in pictures {
         deadline.check()?;
         transparent |= picture.pixels().any(|pixel| pixel[3] != u8::MAX);
-        let file = webp_bitstream(picture)?;
+        let file = webp_bitstream(picture, deadline)?;
         let bitstream = vp8l_chunk(&file)
             .ok_or_else(|| Error::Encode("the encoder wrote no lossless picture".into()))?;
         // At the top left corner, replacing what was there, not blended with it.
@@ -3514,6 +3652,145 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(frames(&data), frames(&rebuilt.data));
+    }
+
+    /// Strips and tiles of JPEG pictures are put together as one JPEG of
+    /// their coefficients, which shows the page as decoding them does.
+    #[test]
+    fn tiff_of_jpeg_pictures_keeps_their_coefficients() {
+        for name in ["jpeg-tiles.tif", "jpeg-rgb-strips.tif"] {
+            let data = corpus(name);
+            let rebuilt = run(&data).unwrap();
+            assert_eq!(rebuilt.file_type, FileType::Jpeg, "{name}");
+            assert_eq!((rebuilt.width, rebuilt.height), (72, 40));
+            let jpeg = image::load_from_memory(&rebuilt.data).unwrap().to_rgb8();
+            let page = image::load_from_memory(&tif::pages_for_test(&data))
+                .unwrap()
+                .to_rgb8();
+            assert!(most_apart(&jpeg, &page) <= 16, "{name}");
+        }
+    }
+
+    fn keeping_profiles(data: &[u8]) -> Rebuilt {
+        let options = Options {
+            profiles: Profiles::Keep,
+            ..Options::default()
+        };
+        rebuild(data, &Limits::default(), &options).unwrap()
+    }
+
+    /// The profile of a decoded file, and its pixels as they are.
+    fn profile_and_pixels(data: &[u8]) -> (Option<Vec<u8>>, RgbImage) {
+        let mut decoder = image::ImageReader::new(Cursor::new(data))
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        let icc = decoder.icc_profile().unwrap();
+        (icc, DynamicImage::from_decoder(decoder).unwrap().to_rgb8())
+    }
+
+    /// Colours of Display P3 and Adobe RGB stay in them, under a profile
+    /// written anew, when they are to be kept; otherwise they become sRGB.
+    #[test]
+    fn rgb_profiles_are_kept_when_asked() {
+        for name in ["p3.jpg", "adobe-rgb.png", "p3-lossy.webp"] {
+            let data = corpus(name);
+            let (icc, pixels) = profile_and_pixels(&data);
+            let icc = icc.unwrap();
+            let kept = keeping_profiles(&data);
+            assert_eq!(kept.file_type, detect::detect(&data), "{name}");
+            let (new_icc, new_pixels) = profile_and_pixels(&kept.data);
+            let new_icc = new_icc.unwrap();
+            assert_eq!(new_icc, colour::rewritten_rgb(&icc).unwrap(), "{name}");
+            assert!(!contains(&new_icc, b"CC0"), "{name}");
+            // The samples are those of the original, down to the bit.
+            assert_eq!(new_pixels, pixels, "{name}");
+
+            let converted = run(&data).unwrap();
+            let (none, converted) = profile_and_pixels(&converted.data);
+            assert!(none.is_none(), "{name}");
+            assert!(most_apart(&converted, &pixels) > 8, "{name}");
+        }
+        // A lossy WebP stays lossy.
+        let kept = keeping_profiles(&corpus("p3-lossy.webp"));
+        assert!(contains(&kept.data, b"VP8 "));
+        // A TIFF becomes a PNG, or a JPEG of the coefficients of its strips,
+        // in the profile.
+        for (name, file_type) in [("p3.tif", FileType::Png), ("p3-jpeg.tif", FileType::Jpeg)] {
+            let data = corpus(name);
+            let kept = keeping_profiles(&data);
+            assert_eq!(kept.file_type, file_type, "{name}");
+            let (icc, _) = profile_and_pixels(&kept.data);
+            let icc = ColorProfile::new_from_slice(&icc.unwrap()).unwrap();
+            assert_eq!(icc.color_space, DataColorSpace::Rgb, "{name}");
+            // Colours turned into sRGB are a PNG of them.
+            assert_eq!(run(&data).unwrap().file_type, FileType::Png, "{name}");
+        }
+    }
+
+    /// A lossy WebP turned by its Exif stays lossy, with Exif of nothing
+    /// but that.
+    #[test]
+    fn lossy_webp_keeps_its_orientation() {
+        let data = corpus("turned-lossy.webp");
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Webp);
+        assert!(contains(&rebuilt.data, b"VP8 "));
+        assert!(!contains(&rebuilt.data, b"holiday camera"));
+        let mut decoder = WebPDecoder::new(Cursor::new(&rebuilt.data)).unwrap();
+        assert_eq!(decoder.orientation().unwrap(), Orientation::Rotate90);
+        let (_, pixels) = profile_and_pixels(&data);
+        assert_eq!(
+            DynamicImage::from_decoder(decoder).unwrap().to_rgb8(),
+            pixels
+        );
+    }
+
+    /// Samples of floating point stay so, past black and white too.
+    #[test]
+    fn float_tiff_stays_float() {
+        let floats = |data: &[u8]| {
+            let mut decoder = tiff::decoder::Decoder::new(Cursor::new(data)).unwrap();
+            match decoder.read_image().unwrap() {
+                tiff::decoder::DecodingResult::F32(v) => v,
+                _ => panic!("not floating point"),
+            }
+        };
+        let data = corpus("float-hdr.tif");
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Tiff);
+        assert_eq!(floats(&rebuilt.data), floats(&data));
+        assert!(floats(&rebuilt.data).contains(&2.5));
+        // Grey comes as colours of the same values.
+        let data = corpus("float-grey.tif");
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Tiff);
+        let grey: Vec<f32> = floats(&data).into_iter().flat_map(|v| [v; 3]).collect();
+        assert_eq!(floats(&rebuilt.data), grey);
+    }
+
+    /// Made by `cjxl` from a JPEG, which it keeps the means to give back.
+    #[test]
+    fn jpeg_xl_made_from_a_jpeg_gives_it_back() {
+        let data = corpus("from-jpeg.jxl");
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Jpeg);
+        assert_eq!((rebuilt.width, rebuilt.height), (48, 32));
+        // Its metadata goes as any JPEG's does.
+        let given_back = jxl::original_jpeg(&data, &Limits::default()).unwrap();
+        assert!(contains(&given_back, b"holiday camera"));
+        assert!(!contains(&rebuilt.data, b"holiday camera"));
+        let jpeg = image::load_from_memory(&rebuilt.data).unwrap().to_rgb8();
+        let shown = DynamicImage::from_decoder(JxlDecoder::new(Cursor::new(&data)).unwrap())
+            .unwrap()
+            .to_rgb8();
+        assert!(most_apart(&jpeg, &shown) <= 8);
+
+        // `jxl-oxide` puts a JPEG with a comment together wrong: it is not
+        // given back, and the picture comes as a PNG instead.
+        let rebuilt = run(&corpus("from-jpeg-comment.jxl")).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Png);
     }
 
     #[test]

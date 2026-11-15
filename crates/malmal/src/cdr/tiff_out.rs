@@ -196,40 +196,41 @@ impl Pages {
         let size = (picture.image.width(), picture.image.height());
         let density = picture.density;
         let alpha = Some(ExtraSamples::UnassociatedAlpha);
+        let icc = picture.icc.as_deref();
         match &picture.image {
             DynamicImage::ImageLuma8(i) => {
-                self.page::<colortype::Gray8>(size, i.as_raw(), density, None, None)
+                self.page::<colortype::Gray8>(size, i.as_raw(), density, None, icc)
             }
             DynamicImage::ImageLuma16(i) => {
-                self.page::<colortype::Gray16>(size, i.as_raw(), density, None, None)
+                self.page::<colortype::Gray16>(size, i.as_raw(), density, None, icc)
             }
             DynamicImage::ImageLumaA8(i) => {
-                self.page::<colortype::Gray8>(size, i.as_raw(), density, alpha, None)
+                self.page::<colortype::Gray8>(size, i.as_raw(), density, alpha, icc)
             }
             DynamicImage::ImageLumaA16(i) => {
-                self.page::<colortype::Gray16>(size, i.as_raw(), density, alpha, None)
+                self.page::<colortype::Gray16>(size, i.as_raw(), density, alpha, icc)
             }
             DynamicImage::ImageRgb8(i) => {
-                self.page::<colortype::RGB8>(size, i.as_raw(), density, None, None)
+                self.page::<colortype::RGB8>(size, i.as_raw(), density, None, icc)
             }
             DynamicImage::ImageRgb16(i) => {
-                self.page::<colortype::RGB16>(size, i.as_raw(), density, None, None)
+                self.page::<colortype::RGB16>(size, i.as_raw(), density, None, icc)
             }
             DynamicImage::ImageRgba8(i) => {
-                self.page::<colortype::RGB8>(size, i.as_raw(), density, alpha, None)
+                self.page::<colortype::RGB8>(size, i.as_raw(), density, alpha, icc)
             }
             DynamicImage::ImageRgba16(i) => {
-                self.page::<colortype::RGB16>(size, i.as_raw(), density, alpha, None)
+                self.page::<colortype::RGB16>(size, i.as_raw(), density, alpha, icc)
             }
             DynamicImage::ImageRgb32F(i) => {
-                self.page::<colortype::RGB32Float>(size, i.as_raw(), density, None, None)
+                self.page::<colortype::RGB32Float>(size, i.as_raw(), density, None, icc)
             }
             DynamicImage::ImageRgba32F(i) => {
-                self.page::<colortype::RGB32Float>(size, i.as_raw(), density, alpha, None)
+                self.page::<colortype::RGB32Float>(size, i.as_raw(), density, alpha, icc)
             }
             other => {
                 let rgba = other.to_rgba16();
-                self.page::<colortype::RGB16>(size, rgba.as_raw(), density, alpha, None)
+                self.page::<colortype::RGB16>(size, rgba.as_raw(), density, alpha, icc)
             }
         }
     }

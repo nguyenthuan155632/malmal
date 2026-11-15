@@ -619,6 +619,17 @@ asked), a Rack middleware that scans every multipart upload, Windows.
 - [x] `Inks::Keep` / `--keep-cmyk`: inks and their profile, rewritten from its colour
       tags and checked on a 17⁴ grid of inks at 16 bits.
 
+- [x] JPEG XL made from a JPEG gives the JPEG back (`jbrd`), checked against its render.
+- [x] TIFF of JPEG strips or tiles: one JPEG of their coefficients.
+- [x] `Profiles::Keep` / `--keep-profile`: RGB profiles rewritten from their colour tags,
+      checked on a 17³ grid; JPEG, PNG, TIFF, WebP, BMP.
+- [x] Lossy WebP keeps its profile (on request) and its orientation (Exif of it alone).
+- [x] Float TIFF of one page stays float.
+- [x] Lossless WebP encoder of our own (`cdr/vp8l.rs`); WebP alpha filtered.
+- [x] PSD duotone in its inks.
+- [x] AVIF on threads for large images, not waited for past the deadline.
+- [x] Fuzz targets for WebP, AVIF, TIFF, PSD and JPEG XL.
+
 Not done: HEIC (no HEVC decoder in Rust); AVIF for HDR displays (PQ, HLG) and AVIF image
 sequences without a still image.
 

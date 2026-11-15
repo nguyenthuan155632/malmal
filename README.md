@@ -458,6 +458,7 @@ The Python and C interfaces use the default limits. Embedded files are scanned u
 |---|---|---|
 | `--jpeg-quality <N>` | 90 | Quality of rebuilt JPEG files, 1–100 |
 | `--keep-cmyk` | off | Keep the inks of a CMYK JPEG, TIFF or PSD, with their profile, rather than turn them into sRGB |
+| `--keep-profile` | off | Keep the colors of a JPEG, PNG, TIFF, WebP or BMP under an RGB profile other than sRGB, with the profile rewritten, rather than turn them into sRGB |
 | `--pdf-dpi <N>` | 150 | Resolution of rebuilt PDF pages, 36–600 |
 | `--pdf-jpeg` | off | Store a PDF page as JPEG when that is smaller |
 | `--pdf-no-text` | off | Leave out the invisible text layer of a rebuilt PDF |
@@ -618,13 +619,18 @@ In C, use `malmal_sanitize`. In every interface, if rebuilding fails, store noth
     cannot be rotated or converted that way is re-encoded at the chosen quality at most.
   - Lossy WebP keeps every symbol of its VP8 stream, coded again at the same
     probabilities, and is kept only if it decodes to exactly the same pixels; it comes out
-    the size it went in. Its alpha is coded again without loss.
+    the size it went in. Its alpha is coded again without loss, and its Exif orientation is
+    kept, as Exif of nothing else.
   - GIF keeps its palettes and pixel indices; APNG keeps its frames as they were laid out,
     at their own depth.
+  - A TIFF of JPEG strips or tiles becomes one JPEG of their coefficients; a JPEG XL made
+    from a JPEG gives back that JPEG. Both are checked against the pixels they show.
 
-  BMP, PSD (the composite image saved with the layers), JPEG XL and AVIF become PNG, a
-  JPEG XL animation an animated PNG, and a TIFF a PNG of its one page or a TIFF of all of
-  them, so store the file under the type the result reports. TIFF is read in every
+  BMP, PSD (the composite image saved with the layers; a duotone in the colors of its
+  inks), JPEG XL and AVIF become PNG, a JPEG XL animation an animated PNG, and a TIFF a
+  PNG of its one page (a TIFF if its samples are floating point) or a TIFF of all of
+  them, so store the file under the type the result reports. Lossless WebP is written by
+  an encoder of malmal's own and checked pixel for pixel. TIFF is read in every
   compression libtiff writes (CCITT fax, LZMA and Zstandard among them) and at any depth;
   AVIF is decoded by [filmcraft-av1](https://crates.io/crates/filmcraft-av1), safe Rust
   that matches libdav1d sample for sample, with its grid, alpha, crop, rotation and
@@ -635,6 +641,11 @@ In C, use `malmal_sanitize`. In every interface, if rebuilding fails, store noth
   instead: a JPEG its coefficients, a TIFF or PSD its samples, written as a TIFF. The
   profile is kept with them, rebuilt from only the tags that define its colors, copied
   byte for byte and checked to print every ink exactly as the original does.
+- **Wide-gamut RGB** (Display P3, Adobe RGB) JPEG, PNG, TIFF, WebP and BMP are converted
+  to sRGB, which clips colors sRGB cannot show. With `--keep-profile`
+  (`Profiles::Keep`, `keep_profile` in the bindings) they keep their samples (a JPEG its
+  coefficients, a lossy WebP its VP8 stream) and their profile, rebuilt the same way and
+  checked on a grid of every color mix.
 - **SVG** is filtered through an allowlist
   ([svg-hush](https://github.com/cloudflare/svg-hush)) that keeps only what draws.
   The result is scanned again and refused if it is not clean.

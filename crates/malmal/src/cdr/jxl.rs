@@ -19,6 +19,105 @@ fn decode_error(error: impl std::fmt::Display) -> Error {
     Error::Decode(error.to_string())
 }
 
+/// The JPEG file a JPEG XL made from one keeps the means to give back, or
+/// `None` if it keeps none. It is for the caller to rebuild as a JPEG: what
+/// it holds besides the picture (metadata, data after the image) goes then.
+///
+/// The JPEG is given only if it shows what the JPEG XL does, within what
+/// two decoders of the same coefficients differ by: `jxl-oxide` puts some
+/// files together wrong, and panics on others.
+pub(super) fn original_jpeg(data: &[u8], limits: &Limits) -> Option<Vec<u8>> {
+    use jxl_oxide::JpegReconstructionStatus;
+
+    let budget = usize::try_from(limits.max_decompressed).unwrap_or(usize::MAX);
+    let attempt = || {
+        let image = JxlImage::builder()
+            .alloc_tracker(AllocTracker::with_limit(budget))
+            .read(Cursor::new(data))
+            .ok()?;
+        if image.jpeg_reconstruction_status() != JpegReconstructionStatus::Available {
+            return None;
+        }
+        let pixels = u64::from(image.width()) * u64::from(image.height());
+        if pixels > limits.max_pixels {
+            return None;
+        }
+        let mut out = Capped {
+            out: Vec::new(),
+            most: budget,
+        };
+        image.reconstruct_jpeg(&mut out).ok()?;
+        shows_the_same(data, &out.out).then_some(out.out)
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt))
+        .ok()
+        .flatten()
+}
+
+/// Whether `jpeg` decodes to the picture the JPEG XL in `data` shows.
+fn shows_the_same(data: &[u8], jpeg: &[u8]) -> bool {
+    use image::ImageDecoder;
+    use image::codecs::jpeg::JpegDecoder;
+    use jxl_oxide::integration::JxlDecoder;
+
+    let shown = |decoder: Result<_, _>| -> Option<image::RgbImage> {
+        let mut decoder: Box<dyn ImageDecoder> = decoder.ok()?;
+        let orientation = decoder.orientation().ok();
+        let mut image = DynamicImage::from_decoder(decoder).ok()?;
+        if let Some(orientation) = orientation {
+            image.apply_orientation(orientation);
+        }
+        Some(image.into_rgb8())
+    };
+    let boxed = |d: Box<dyn ImageDecoder>| d;
+    let (Some(one), Some(other)) = (
+        shown(
+            JxlDecoder::new(Cursor::new(data))
+                .map(|d| boxed(Box::new(d)))
+                .map_err(|_| ()),
+        ),
+        shown(
+            JpegDecoder::new(Cursor::new(jpeg))
+                .map(|d| boxed(Box::new(d)))
+                .map_err(|_| ()),
+        ),
+    ) else {
+        return false;
+    };
+    if one.dimensions() != other.dimensions() {
+        return false;
+    }
+    let apart: Vec<u8> = one
+        .as_raw()
+        .iter()
+        .zip(other.as_raw())
+        .map(|(a, b)| a.abs_diff(*b))
+        .collect();
+    let most = apart.iter().copied().max().unwrap_or(0);
+    let mean = apart.iter().map(|&d| u64::from(d)).sum::<u64>() as f64 / apart.len().max(1) as f64;
+    most <= 16 && mean <= 2.0
+}
+
+/// Bytes written, refused past `most`.
+struct Capped {
+    out: Vec<u8>,
+    most: usize,
+}
+
+impl std::io::Write for Capped {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.out.len() + bytes.len() > self.most {
+            return Err(std::io::Error::other("too large"));
+        }
+        self.out.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The animation in `data`, or `None` if it is a still image.
 pub(super) fn rebuild(
     data: &[u8],

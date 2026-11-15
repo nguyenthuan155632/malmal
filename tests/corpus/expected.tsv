@@ -1,3 +1,4 @@
+corpus/clean/adobe-rgb.png	Clean	
 corpus/clean/animation-16bit.jxl	Clean	
 corpus/clean/animation-16bit.png	Clean	
 corpus/clean/animation.png	Clean	
@@ -11,13 +12,23 @@ corpus/clean/encrypted-empty-password.pdf	Clean	pdf.encrypted
 corpus/clean/encrypted-rc4.pdf	Clean	pdf.encrypted
 corpus/clean/fax-g3-1d.tif	Clean	
 corpus/clean/fax-g3-2d.tif	Clean	
+corpus/clean/float-grey.tif	Clean	
+corpus/clean/float-hdr.tif	Clean	
+corpus/clean/from-jpeg-comment.jxl	Clean	
+corpus/clean/from-jpeg.jxl	Clean	
 corpus/clean/icon.ico	Clean	
 corpus/clean/jbig2-image.pdf	Clean	pdf.risky_codec
+corpus/clean/jpeg-rgb-strips.tif	Clean	
+corpus/clean/jpeg-tiles.tif	Clean	
 corpus/clean/lab.tif	Clean	
 corpus/clean/layers.psd	Clean	
 corpus/clean/line.eps	Clean	
 corpus/clean/lossy-alpha.webp	Clean	
 corpus/clean/lossy-animation.webp	Clean	
+corpus/clean/p3-jpeg.tif	Clean	
+corpus/clean/p3-lossy.webp	Clean	
+corpus/clean/p3.jpg	Clean	
+corpus/clean/p3.tif	Clean	
 corpus/clean/page.pdf	Clean	
 corpus/clean/pages.tif	Clean	
 corpus/clean/palette.tif	Clean	
@@ -40,6 +51,7 @@ corpus/clean/rgb-zstd.tif	Clean
 corpus/clean/rotated-422.jpg	Clean	
 corpus/clean/square.svg	Clean	
 corpus/clean/transparent-composite.psd	Clean	
+corpus/clean/turned-lossy.webp	Clean	
 corpus/clean/web-link.pdf	Clean	pdf.uri
 corpus/clean/ycck-profile.jpg	Clean	
 corpus/malicious/elf-after-image.avif	Malicious	image.polyglot,image.trailing_data

@@ -1150,6 +1150,100 @@ impl Coefficients {
     pub(super) fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
     }
+
+    /// Pictures that are pieces of one `width` by `height`, each at the
+    /// place in it given in pixels, put together as that one picture:
+    /// red, green and blue if `rgb`, otherwise luma and chroma. `None`
+    /// unless they are coded alike, each starts on a whole MCU, and
+    /// together they cover the picture once.
+    pub(super) fn mosaic(
+        pieces: &[(u32, u32, Coefficients)],
+        width: u32,
+        height: u32,
+        rgb: bool,
+    ) -> Option<Coefficients> {
+        let first = &pieces.first()?.2;
+        let layout = |c: &Coefficients| {
+            c.components
+                .iter()
+                .map(|k| (k.id, k.h, k.v, k.quant))
+                .collect::<Vec<_>>()
+        };
+        let shape = layout(first);
+        let h_max = u32::from(first.components.iter().map(|c| c.h).max()?);
+        let v_max = u32::from(first.components.iter().map(|c| c.v).max()?);
+        let (mcu_width, mcu_height) = (8 * h_max, 8 * v_max);
+        let mcus_across = width.div_ceil(mcu_width) as usize;
+        let mcus_down = height.div_ceil(mcu_height) as usize;
+        let mut components: Vec<Component> = first
+            .components
+            .iter()
+            .map(|c| {
+                let (across, down) = (mcus_across * c.h as usize, mcus_down * c.v as usize);
+                Component {
+                    id: c.id,
+                    h: c.h,
+                    v: c.v,
+                    table: c.table,
+                    quant: c.quant,
+                    across,
+                    down,
+                    blocks: vec![[0; 64]; across * down],
+                }
+            })
+            .collect();
+        let mut covered = vec![false; mcus_across * mcus_down];
+        for (x, y, piece) in pieces {
+            if layout(piece) != shape
+                || x % mcu_width != 0
+                || y % mcu_height != 0
+                || *x >= width
+                || *y >= height
+            {
+                return None;
+            }
+            let (left, top) = ((x / mcu_width) as usize, (y / mcu_height) as usize);
+            let across = (piece.width.div_ceil(mcu_width) as usize).min(mcus_across - left);
+            let down = (piece.height.div_ceil(mcu_height) as usize).min(mcus_down - top);
+            for j in 0..down {
+                for i in 0..across {
+                    let mcu = &mut covered[(top + j) * mcus_across + left + i];
+                    if *mcu {
+                        return None;
+                    }
+                    *mcu = true;
+                    for (to, from) in components.iter_mut().zip(&piece.components) {
+                        let (h, v) = (to.h as usize, to.v as usize);
+                        for by in 0..v {
+                            for bx in 0..h {
+                                let (column, row) = (i * h + bx, j * v + by);
+                                let block = if column < from.across && row < from.down {
+                                    from.blocks[row * from.across + column]
+                                } else {
+                                    [0; 64]
+                                };
+                                let (column, row) = ((left + i) * h + bx, (top + j) * v + by);
+                                to.blocks[row * to.across + column] = block;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !covered.iter().all(|&c| c) || (rgb && components.len() != 3) {
+            return None;
+        }
+        Some(Coefficients {
+            width,
+            height,
+            components,
+            rgb,
+            adobe: None,
+            density: Density::default(),
+            orientation: 1,
+            icc: None,
+        })
+    }
 }
 
 // --- writing -------------------------------------------------------------
@@ -1340,6 +1434,11 @@ impl Coefficients {
 
     /// Write the coefficients as a baseline JPEG; `None` if they do not fit
     /// in one.
+    /// Whether there are three components of colour.
+    pub(super) fn colours(&self) -> bool {
+        self.components.len() == 3
+    }
+
     /// Whether the components are four inks, or three and black.
     pub(super) fn inks(&self) -> bool {
         self.components.len() == 4

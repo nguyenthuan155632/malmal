@@ -12,7 +12,7 @@ module Malmal
   class Scanner
     POLICIES = %i[default strict documents].freeze
     LIMITS = %i[max_size max_decompressed max_pixels max_depth scan_timeout].freeze
-    SANITIZE_OPTIONS = %i[types keep_cmyk pdf_dpi pdf_jpeg pdf_text pdf_vector_text].freeze
+    SANITIZE_OPTIONS = %i[types keep_cmyk keep_profile pdf_dpi pdf_jpeg pdf_text pdf_vector_text].freeze
     DEFAULT_MAX_MEMORY = 512 << 20
 
     # The handle is freed when the scanner is collected, unless #close
@@ -90,8 +90,8 @@ module Malmal
     # the upload. Raises Rejected, NotRebuilt or ScanError otherwise; in
     # every case the upload is not to be kept.
     #
-    # +jpeg_quality+ (1 to 100), +types+, +keep_cmyk+, +pdf_dpi+, +pdf_jpeg+, +pdf_text+
-    # and +pdf_vector_text+ are the options of the rebuild.
+    # +jpeg_quality+ (1 to 100), +types+, +keep_cmyk+, +keep_profile+, +pdf_dpi+, +pdf_jpeg+,
+    # +pdf_text+ and +pdf_vector_text+ are the options of the rebuild.
     def sanitize(data, filename: nil, content_type: nil, jpeg_quality: nil, **options)
       unknown = options.keys - SANITIZE_OPTIONS
       raise ArgumentError, "unknown option #{unknown.first.inspect}" unless unknown.empty?

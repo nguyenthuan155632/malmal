@@ -6,7 +6,8 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use malmal::{Limits, ScanHints, Scanner};
+use malmal::cdr::{Inks, Options, Profiles, rebuild};
+use malmal::{Limits, ScanHints, Scanner, Severity, Verdict};
 
 static SCANNER: LazyLock<Scanner> = LazyLock::new(|| {
     Scanner::builder()
@@ -28,4 +29,55 @@ pub fn scan_with_prefix(prefix: &[u8], data: &[u8]) {
     // A file the scanner could not finish must never come back clean.
     let hit_limit = report.findings.iter().any(|f| f.code.starts_with("limit."));
     assert!(!(hit_limit && report.verdict == malmal::Verdict::Clean));
+}
+
+/// What the rebuild targets are here to find; a panic would be caught on
+/// the way.
+fn fail(what: std::fmt::Arguments<'_>) -> ! {
+    eprintln!("{what}");
+    std::process::abort()
+}
+
+/// Rebuild `data` and check what comes out: a file the scanner finds
+/// nothing in, apart from what the pixels themselves spell (that is for the
+/// scan `sanitize` makes of the rebuilt file, which this leaves out to
+/// reach further), and of the type it says it is. Inks are kept as inks
+/// when `keep_inks`.
+pub fn rebuild_checked(data: &[u8], keep_inks: bool) {
+    // `rebuild` catches a panic in a codec and answers with an error. The
+    // fuzzer's own hook would stop at the first one, long before anything
+    // that gets past that is found.
+    static QUIET: std::sync::Once = std::sync::Once::new();
+    QUIET.call_once(|| std::panic::set_hook(Box::new(|_| {})));
+
+    let limits = Limits {
+        max_pixels: 1 << 20,
+        max_decompressed: 64 << 20,
+        ..Limits::default()
+    };
+    let mut options = Options::default();
+    if keep_inks {
+        options.inks = Inks::Keep;
+        options.profiles = Profiles::Keep;
+    }
+    if let Ok(image) = rebuild(data, &limits, &options) {
+        let report = Scanner::builder()
+            .build()
+            .scan_bytes(&image.data, ScanHints::default());
+        let in_pixels = |code: &str| code == "image.polyglot" || code.starts_with("payload.");
+        let clean = report.verdict == Verdict::Clean
+            || report
+                .findings
+                .iter()
+                .all(|finding| in_pixels(finding.code) || finding.severity == Severity::Info);
+        if !clean {
+            fail(format_args!("rebuilt file is not clean: {:?}", report.findings));
+        }
+        if report.detected_type != image.file_type {
+            fail(format_args!(
+                "rebuilt as {:?}, detected as {:?}",
+                image.file_type, report.detected_type
+            ));
+        }
+    }
 }

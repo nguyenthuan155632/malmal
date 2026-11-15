@@ -22,7 +22,7 @@ use tiff::tags::Tag;
 
 use super::ifd::{Entry, Form, SHORT};
 use super::tiff_out::{InkSamples, Kept, Pages};
-use super::{Deadline, Error, Rebuilt, ToSrgb, colour, palette};
+use super::{Deadline, Error, Rebuilt, ToSrgb, colour, palette, profile};
 use crate::detect::FileType;
 use crate::limits::Limits;
 
@@ -30,6 +30,9 @@ use crate::limits::Limits;
 pub(super) struct Picture {
     pub(super) image: DynamicImage,
     pub(super) density: Option<png::PixelDimensions>,
+    /// The profile the colours are in, written anew, if they are not in
+    /// sRGB.
+    pub(super) icc: Option<Vec<u8>>,
 }
 
 /// A page as colours, or as the inks it was.
@@ -76,14 +79,195 @@ enum Samples {
     F32(Vec<f32>),
 }
 
-/// The TIFF in `data` rebuilt: its one page of colours as a PNG, or its
-/// pages as a TIFF, inks as inks if `keep_inks`. Reduced copies of a page
-/// and transparency masks are left out.
+/// The TIFF in `data` rebuilt: its one page of colours as a PNG, or as a
+/// JPEG of the coefficients its strips or tiles hold if it is compressed
+/// that way, or its pages as a TIFF, inks as inks if `keep_inks`. Reduced
+/// copies of a page and transparency masks are left out. Colours of an RGB
+/// profile other than sRGB's are kept in it if `keep_profile`.
 pub(super) fn rebuild(
     data: &[u8],
     limits: &Limits,
     deadline: Deadline,
     keep_inks: bool,
+    keep_profile: bool,
+) -> Result<Rebuilt, Error> {
+    let rebuilt = pages(data, limits, deadline, keep_inks, keep_profile)?;
+    if rebuilt.file_type == FileType::Png
+        && let Some(jpeg) = as_jpeg(data, limits, deadline, &rebuilt, keep_profile)
+    {
+        return Ok(jpeg);
+    }
+    Ok(rebuilt)
+}
+
+/// The one page of the TIFF in `data`, whose pixels `shown` holds, as a
+/// JPEG of the coefficients of its strips or tiles put together, if they
+/// are JPEG pictures of 8-bit grey, YCbCr or RGB without transparency, in
+/// sRGB, that go together without decoding, and the JPEG shows the page as
+/// `shown` does.
+fn as_jpeg(
+    data: &[u8],
+    limits: &Limits,
+    deadline: Deadline,
+    shown: &Rebuilt,
+    keep_profile: bool,
+) -> Option<Rebuilt> {
+    let mut decoder = Decoder::new(Cursor::new(data)).ok()?;
+    let tag = |decoder: &mut Decoder<_>, tag| decoder.find_tag_unsigned::<u32>(tag).ok().flatten();
+    let photometric = tag(&mut decoder, Tag::PhotometricInterpretation)?;
+    let spp = tag(&mut decoder, Tag::SamplesPerPixel).unwrap_or(1);
+    let bits = decoder
+        .find_tag_unsigned_vec::<u16>(Tag::BitsPerSample)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| vec![1]);
+    let fits = tag(&mut decoder, Tag::Compression) == Some(7)
+        && matches!((photometric, spp), (1, 1) | (2 | 6, 3))
+        && bits.iter().all(|&b| b == 8)
+        && tag(&mut decoder, Tag::PlanarConfiguration).is_none_or(|p| p == 1)
+        && decoder.find_tag(Tag::ExtraSamples).ok().flatten().is_none();
+    if !fits {
+        return None;
+    }
+    // Colours of another profile are kept in it, written anew, or not at
+    // all: the page's pixels are then converted.
+    let mut profile = None;
+    if let Ok(icc) = decoder.get_tag_u8_vec(Tag::IccProfile)
+        && ToSrgb::new(Some(icc.clone())).is_some()
+    {
+        if !keep_profile || spp != 3 {
+            return None;
+        }
+        profile = Some(colour::rewritten_rgb(&icc)?);
+    }
+    let (width, height) = decoder.dimensions().ok()?;
+    if u64::from(width) * u64::from(height) > limits.max_pixels {
+        return None;
+    }
+    let orientation = tag(&mut decoder, Tag::Orientation).unwrap_or(1);
+    let density = jfif_density(&mut decoder);
+    let tables = decoder.get_tag_u8_vec(Tag::JPEGTables).ok();
+    let tiled = decoder.find_tag(Tag::TileOffsets).ok().flatten().is_some();
+    let (offsets, counts, chunk_width, chunk_height) = if tiled {
+        (
+            decoder.get_tag_u64_vec(Tag::TileOffsets).ok()?,
+            decoder.get_tag_u64_vec(Tag::TileByteCounts).ok()?,
+            tag(&mut decoder, Tag::TileWidth)?,
+            tag(&mut decoder, Tag::TileLength)?,
+        )
+    } else {
+        (
+            decoder.get_tag_u64_vec(Tag::StripOffsets).ok()?,
+            decoder.get_tag_u64_vec(Tag::StripByteCounts).ok()?,
+            width,
+            tag(&mut decoder, Tag::RowsPerStrip).map_or(height, |r| r.min(height)),
+        )
+    };
+    if offsets.len() != counts.len() || chunk_width == 0 || chunk_height == 0 {
+        return None;
+    }
+    let across = width.div_ceil(chunk_width);
+    let mut pieces = Vec::with_capacity(offsets.len());
+    for (index, (&offset, &count)) in offsets.iter().zip(&counts).enumerate() {
+        deadline.check().ok()?;
+        let start = usize::try_from(offset).ok()?;
+        let chunk = data.get(start..start.checked_add(usize::try_from(count).ok()?)?)?;
+        // A strip or tile may leave its tables to the page's.
+        let stream = match &tables {
+            Some(tables)
+                if tables.starts_with(&[0xFF, 0xD8]) && chunk.starts_with(&[0xFF, 0xD8]) =>
+            {
+                let tables = tables.strip_suffix(&[0xFF, 0xD9]).unwrap_or(tables);
+                [tables, &chunk[2..]].concat()
+            }
+            _ => chunk.to_vec(),
+        };
+        let piece = super::jpeg::read(&stream, limits, deadline).ok()?;
+        let index = u32::try_from(index).ok()?;
+        let (x, y) = (
+            (index % across).checked_mul(chunk_width)?,
+            (index / across).checked_mul(chunk_height)?,
+        );
+        pieces.push((x, y, piece));
+    }
+    let mut whole = super::jpeg::Coefficients::mosaic(&pieces, width, height, photometric == 2)?;
+    drop(pieces);
+    whole.density = density;
+    whole.orientation = u8::try_from(orientation).ok()?;
+    if !whole.orient() {
+        return None;
+    }
+    let jpeg = whole.write(profile.as_deref())?;
+    deadline.check().ok()?;
+
+    // It has to show what the pixels of the page are.
+    let png = image::load_from_memory(&shown.data).ok()?.into_rgb8();
+    let decoder = image::codecs::jpeg::JpegDecoder::new(Cursor::new(&jpeg)).ok()?;
+    let shows = DynamicImage::from_decoder(decoder).ok()?.into_rgb8();
+    if png.dimensions() != shows.dimensions() {
+        return None;
+    }
+    let (mut most, mut total) = (0u8, 0u64);
+    for (a, b) in png.as_raw().iter().zip(shows.as_raw()) {
+        let apart = a.abs_diff(*b);
+        most = most.max(apart);
+        total += u64::from(apart);
+    }
+    if most > 16 || total as f64 > 2.0 * png.as_raw().len() as f64 {
+        return None;
+    }
+    let (width, height) = shows.dimensions();
+    Some(Rebuilt {
+        data: jpeg,
+        file_type: FileType::Jpeg,
+        width,
+        height,
+        frames: 1,
+    })
+}
+
+/// The pages of `data` rebuilt from their pixels, for comparing.
+#[cfg(test)]
+pub(super) fn pages_for_test(data: &[u8]) -> Vec<u8> {
+    pages(data, &Limits::default(), Deadline(None), false, false)
+        .unwrap()
+        .data
+}
+
+/// The resolution of a page, as a JPEG states it.
+fn jfif_density<R: std::io::Read + std::io::Seek>(
+    decoder: &mut Decoder<R>,
+) -> super::jpeg::Density {
+    let mut value = |tag| match decoder.find_tag(tag).ok()?? {
+        Value::Rational(n, d) if d > 0 => Some(f64::from(n) / f64::from(d)),
+        _ => None,
+    };
+    let (x, y) = (value(Tag::XResolution), value(Tag::YResolution));
+    let unit = decoder
+        .find_tag_unsigned::<u16>(Tag::ResolutionUnit)
+        .ok()
+        .flatten()
+        .unwrap_or(2);
+    let round = |v: f64| (v.round() >= 1.0 && v <= f64::from(u16::MAX)).then(|| v.round() as u16);
+    // TIFF counts inches as 2 and centimetres as 3, JFIF as 1 and 2.
+    match (x.and_then(round), y.and_then(round), unit) {
+        (Some(x), Some(y), 2 | 3) => super::jpeg::Density {
+            unit: (unit - 1) as u8,
+            x,
+            y,
+        },
+        _ => super::jpeg::Density::default(),
+    }
+}
+
+/// The pages of the TIFF in `data` rebuilt, as [`rebuild`] says, but
+/// always from their pixels.
+fn pages(
+    data: &[u8],
+    limits: &Limits,
+    deadline: Deadline,
+    keep_inks: bool,
+    keep_profile: bool,
 ) -> Result<Rebuilt, Error> {
     let form = Form::of(data).ok_or_else(|| Error::Decode("not a TIFF file".into()))?;
     let pages = form.pages(data);
@@ -107,7 +291,15 @@ pub(super) fn rebuild(
         }
         form.point_to(&mut work, page);
         let (reading, repack) = prepare(&mut work, form, data, &entries, limits)?;
-        let page = read(&work, reading, repack, limits, deadline, keep_inks)?;
+        let page = read(
+            &work,
+            reading,
+            repack,
+            limits,
+            deadline,
+            keep_inks,
+            keep_profile,
+        )?;
         let (width, height) = match &page {
             Page::Colours(picture) => (picture.image.width(), picture.image.height()),
             Page::Inks(kept) => (kept.width, kept.height),
@@ -141,16 +333,31 @@ pub(super) fn rebuild(
     let Some(Page::Colours(picture)) = pictures.pop() else {
         return Err(Error::Decode("TIFF without an image".into()));
     };
+    // Samples of floating point stay so, in a TIFF: a PNG would clip
+    // them to black and white, and to 16 bits.
+    if matches!(
+        picture.image,
+        DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_)
+    ) {
+        let mut pages = Pages::new(limits)?;
+        pages.add(&picture, deadline)?;
+        return pages.finish();
+    }
     let (width, height) = (picture.image.width(), picture.image.height());
     let data = palette::smallest(&picture.image, picture.density)
         .ok_or_else(|| Error::Encode("no PNG holds these pixels".into()))?;
-    Ok(Rebuilt {
+    let rebuilt = Rebuilt {
         data,
         file_type: FileType::Png,
         width,
         height,
         frames: 1,
-    })
+    };
+    match &picture.icc {
+        Some(icc) => profile::attach(rebuilt, icc)
+            .ok_or_else(|| Error::Encode("the PNG cannot carry the profile".into())),
+        None => Ok(rebuilt),
+    }
 }
 
 /// Change the entries of a page in `work` so that the `tiff` crate reads
@@ -270,6 +477,7 @@ fn read(
     limits: &Limits,
     deadline: Deadline,
     keep_inks: bool,
+    keep_profile: bool,
 ) -> Result<Page, Error> {
     let mut tiff_limits = TiffLimits::default();
     let budget = usize::try_from(limits.max_decompressed).unwrap_or(usize::MAX);
@@ -473,16 +681,27 @@ fn read(
     })?;
     deadline.check()?;
     // Inks have been turned into colours already; a profile of another
-    // kind applies to the colours as they are.
+    // kind applies to the colours as they are, unless they are kept in it.
+    let mut kept = None;
     if !matches!(colour_type, ColorType::CMYK(_) | ColorType::CMYKA(_))
-        && let Some(colors) = ToSrgb::new(icc)
+        && let Some(colors) = ToSrgb::new(icc.clone())
     {
-        colors.image(&mut image);
+        kept = icc
+            .as_deref()
+            .filter(|_| keep_profile && image.color().has_color())
+            .and_then(colour::rewritten_rgb);
+        if kept.is_none() {
+            colors.image(&mut image);
+        }
     }
     if let Some(orientation) = orientation {
         image.apply_orientation(orientation);
     }
-    Ok(Page::Colours(Picture { image, density }))
+    Ok(Page::Colours(Picture {
+        image,
+        density,
+        icc: kept,
+    }))
 }
 
 fn unsupported(what: &str) -> Error {
@@ -704,12 +923,14 @@ fn build(b: Build<'_>) -> Result<DynamicImage, Error> {
             height,
             gather(&v, pixels, b.spp, b.planar, 1)?,
         )?),
+        // There is no grey of floating point here; colours of it keep
+        // every value, beyond black and white too.
         (ColorType::Gray(32), Samples::F32(v), _) => {
-            let grey = gather(&v, pixels, b.spp, b.planar, 1)?
+            let grey: Vec<f32> = gather(&v, pixels, b.spp, b.planar, 1)?
                 .into_iter()
-                .map(|s| (s.clamp(0.0, 1.0) * 65535.0).round() as u16)
+                .flat_map(|s| [s; 3])
                 .collect();
-            DynamicImage::from(sized::<Luma<u16>>(width, height, grey)?)
+            DynamicImage::from(sized::<Rgb<f32>>(width, height, grey)?)
         }
         (ColorType::RGB(8), Samples::U8(v), Reading::CieLab)
         | (ColorType::RGBA(8), Samples::U8(v), Reading::CieLab) => {

@@ -172,6 +172,39 @@ const COLOUR_TAGS: [&[u8; 4]; 10] = [
     b"A2B0", b"A2B1", b"A2B2", b"B2A0", b"B2A1", b"B2A2", b"wtpt", b"bkpt", b"chad", b"gamt",
 ];
 
+/// Tags of a profile of a screen's colours that say what they are.
+const RGB_TAGS: [&[u8; 4]; 16] = [
+    b"rXYZ", b"gXYZ", b"bXYZ", b"rTRC", b"gTRC", b"bTRC", b"A2B0", b"A2B1", b"A2B2", b"B2A0",
+    b"B2A1", b"B2A2", b"wtpt", b"bkpt", b"chad", b"cicp",
+];
+
+/// A grid of every mix of 17 amounts of each of `channels` samples, 16
+/// bits each.
+fn grid(channels: u32) -> Vec<u16> {
+    (0..17u32.pow(channels))
+        .flat_map(|i| {
+            (0..channels)
+                .rev()
+                .map(move |c| (i / 17u32.pow(c) % 17 * 65535 / 16) as u16)
+        })
+        .collect()
+}
+
+/// The colours `profile` gives each pixel of `grid`, in sRGB.
+fn through(profile: &ColorProfile, grid: &[u16], layout: Layout) -> Option<Vec<u16>> {
+    let transform = profile
+        .create_transform_16bit(
+            layout,
+            &ColorProfile::new_srgb(),
+            Layout::Rgb,
+            TransformOptions::default(),
+        )
+        .ok()?;
+    let mut colours = vec![0u16; grid.len() / layout.channels() * 3];
+    transform.transform(grid, &mut colours).ok()?;
+    Some(colours)
+}
+
 /// A CMYK profile written anew: its header, the tags that describe its
 /// colours byte for byte, and a description and copyright of its own.
 /// Nothing else of the file is kept: no text, no private tags, nothing
@@ -179,6 +212,33 @@ const COLOUR_TAGS: [&[u8; 4]; 10] = [
 /// same colours as the old of every mix of a grid of ink amounts.
 pub(super) fn rewritten_cmyk(icc: &[u8]) -> Option<Vec<u8>> {
     let original = cmyk_profile(Some(icc))?;
+    let out = rewritten(icc, &COLOUR_TAGS, "CMYK")?;
+    let again = cmyk_profile(Some(&out))?;
+    let grid = grid(4);
+    (through(&original, &grid, Layout::Rgba)? == through(&again, &grid, Layout::Rgba)?)
+        .then_some(out)
+}
+
+/// An RGB profile written anew as [`rewritten_cmyk`] writes one of inks,
+/// from the tags that say what its colours are. `None` unless the new
+/// profile makes the same colours as the old of every mix of a grid of
+/// amounts of red, green and blue.
+pub(super) fn rewritten_rgb(icc: &[u8]) -> Option<Vec<u8>> {
+    let rgb = |icc: &[u8]| {
+        ColorProfile::new_from_slice(icc)
+            .ok()
+            .filter(|p| p.color_space == DataColorSpace::Rgb)
+    };
+    let original = rgb(icc)?;
+    let out = rewritten(icc, &RGB_TAGS, "RGB")?;
+    let again = rgb(&out)?;
+    let grid = grid(3);
+    (through(&original, &grid, Layout::Rgb)? == through(&again, &grid, Layout::Rgb)?).then_some(out)
+}
+
+/// The header of profile `icc`, the tags of it named in `tags` byte for
+/// byte, and a description `name` and a copyright of its own.
+fn rewritten(icc: &[u8], tags_kept: &[&[u8; 4]], name: &str) -> Option<Vec<u8>> {
     let be32 = |at: usize| Some(u32::from_be_bytes(icc.get(at..at + 4)?.try_into().ok()?));
     let count = be32(128)? as usize;
     if count > 256 {
@@ -189,7 +249,7 @@ pub(super) fn rewritten_cmyk(icc: &[u8]) -> Option<Vec<u8>> {
     for index in 0..count {
         let at = 132 + index * 12;
         let signature: [u8; 4] = icc.get(at..at + 4)?.try_into().ok()?;
-        if !COLOUR_TAGS.contains(&&signature) {
+        if !tags_kept.contains(&&signature) {
             continue;
         }
         let (offset, size) = (be32(at + 4)? as usize, be32(at + 8)? as usize);
@@ -228,9 +288,9 @@ pub(super) fn rewritten_cmyk(icc: &[u8]) -> Option<Vec<u8>> {
             tag.extend_from_slice(&utf16);
             tag
         };
-        (unicode("CMYK"), unicode("No copyright"))
+        (unicode(name), unicode("No copyright"))
     } else {
-        (text(b"desc", "CMYK"), text(b"text", "No copyright"))
+        (text(b"desc", name), text(b"text", "No copyright"))
     };
 
     let mut blocks: Vec<(Vec<[u8; 4]>, Vec<u8>)> = Vec::new();
@@ -272,23 +332,7 @@ pub(super) fn rewritten_cmyk(icc: &[u8]) -> Option<Vec<u8>> {
     let size = out.len() as u32;
     out[..4].copy_from_slice(&size.to_be_bytes());
 
-    let again = cmyk_profile(Some(&out))?;
-    let srgb = ColorProfile::new_srgb();
-    let options = TransformOptions::default();
-    let grid: Vec<u16> = (0..17u32 * 17 * 17 * 17)
-        .flat_map(|i| {
-            [i / 4913, i / 289 % 17, i / 17 % 17, i % 17].map(|v| (v * 65535 / 16) as u16)
-        })
-        .collect();
-    let through = |profile: &ColorProfile| {
-        let transform = profile
-            .create_transform_16bit(Layout::Rgba, &srgb, Layout::Rgb, options)
-            .ok()?;
-        let mut colours = vec![0u16; grid.len() / 4 * 3];
-        transform.transform(&grid, &mut colours).ok()?;
-        Some(colours)
-    };
-    (through(&original)? == through(&again)?).then_some(out)
+    Some(out)
 }
 
 #[cfg(test)]

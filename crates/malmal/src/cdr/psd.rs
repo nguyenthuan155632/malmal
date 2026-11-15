@@ -787,10 +787,144 @@ pub(super) fn composite(
     {
         colors.image(&mut image);
     }
+    // A duotone is grey printed in up to four inks, each through its own
+    // curve; it is shown in the colours they make.
+    if mode == 8
+        && let Some(inks) = Duotone::of(colour_mode)
+    {
+        image = inks.apply(&image);
+    }
     Ok(Composite::Colours(Picture {
         image,
         density: found.density,
     }))
+}
+
+/// The inks of a duotone, from its colour mode data: as Photoshop writes
+/// it (and a duotone options file), a version, how many inks, four colours
+/// of ten bytes, four names of 64, four curves of 13 points and an override
+/// flag, a dot gain and the colours of the overprints.
+struct Duotone {
+    /// The colour of each ink, and how much of it each amount of the grey
+    /// prints, at 1024 steps.
+    inks: Vec<([f32; 3], Vec<f32>)>,
+}
+
+impl Duotone {
+    const STEPS: usize = 1024;
+
+    fn of(data: &[u8]) -> Option<Self> {
+        let be16 = |at: usize| Some(u16::from_be_bytes([*data.get(at)?, *data.get(at + 1)?]));
+        if be16(0)? != 1 {
+            return None;
+        }
+        let count = be16(2)? as usize;
+        if !(1..=4).contains(&count) {
+            return None;
+        }
+        // The amount of grey each point of a curve stands for, in percent.
+        const AT: [f32; 13] = [
+            0.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 95.0, 100.0,
+        ];
+        let mut inks = Vec::new();
+        for ink in 0..count {
+            let spec = 4 + ink * 10;
+            let c = [
+                be16(spec + 2)?,
+                be16(spec + 4)?,
+                be16(spec + 6)?,
+                be16(spec + 8)?,
+            ];
+            let colour = Ink::of(be16(spec)?, c, 100).colour;
+            let curve = 4 + 40 + 256 + ink * 28;
+            // The points that are set, in tenths of a percent of ink.
+            let mut points: Vec<(f32, f32)> = (0..13)
+                .filter_map(|i| {
+                    let value = be16(curve + i * 2)? as i16;
+                    // A point that is not set is -1.
+                    (0..=1000)
+                        .contains(&value)
+                        .then(|| (AT[i] / 100.0, value as f32 / 1000.0))
+                })
+                .collect();
+            if points.is_empty() {
+                points = vec![(0.0, 0.0), (1.0, 1.0)];
+            }
+            if points[0].0 > 0.0 {
+                points.insert(0, (0.0, 0.0));
+            }
+            if points[points.len() - 1].0 < 1.0 {
+                points.push((1.0, 1.0));
+            }
+            let amounts = (0..Self::STEPS)
+                .map(|step| {
+                    let x = step as f32 / (Self::STEPS - 1) as f32;
+                    let after = points
+                        .iter()
+                        .position(|p| p.0 >= x)
+                        .unwrap_or(points.len() - 1);
+                    if after == 0 {
+                        return points[0].1;
+                    }
+                    let (a, b) = (points[after - 1], points[after]);
+                    let t = if b.0 > a.0 {
+                        (x - a.0) / (b.0 - a.0)
+                    } else {
+                        1.0
+                    };
+                    a.1 + (b.1 - a.1) * t
+                })
+                .collect();
+            inks.push((colour, amounts));
+        }
+        Some(Self { inks })
+    }
+
+    /// The colour of grey `level`, 0 for black (all ink) to 1 for white.
+    fn colour(&self, level: f32) -> [f32; 3] {
+        let step = ((1.0 - level.clamp(0.0, 1.0)) * (Self::STEPS - 1) as f32).round() as usize;
+        let mut out = [1.0f32; 3];
+        for (colour, amounts) in &self.inks {
+            let amount = amounts[step];
+            for (o, c) in out.iter_mut().zip(colour) {
+                *o *= 1.0 - amount * (1.0 - c);
+            }
+        }
+        out
+    }
+
+    /// Grey, with or without transparency, in the colours of the inks, at
+    /// the depth it was.
+    fn apply(&self, image: &DynamicImage) -> DynamicImage {
+        let (width, height) = (image.width(), image.height());
+        let unit = |v: f32| (v * 65535.0).round() as u16;
+        let out = if image.color().has_alpha() {
+            let rgba = image
+                .to_luma_alpha16()
+                .pixels()
+                .flat_map(|p| {
+                    let [r, g, b] = self.colour(p[0] as f32 / 65535.0);
+                    [unit(r), unit(g), unit(b), p[1]]
+                })
+                .collect();
+            ImageBuffer::<Rgba<u16>, _>::from_raw(width, height, rgba).map(DynamicImage::from)
+        } else {
+            let rgb = image
+                .to_luma16()
+                .pixels()
+                .flat_map(|p| self.colour(p[0] as f32 / 65535.0).map(unit))
+                .collect();
+            ImageBuffer::<Rgb<u16>, _>::from_raw(width, height, rgb).map(DynamicImage::from)
+        };
+        let Some(out) = out else {
+            return image.clone();
+        };
+        match image {
+            DynamicImage::ImageLuma8(_) => out.into_rgb8().into(),
+            DynamicImage::ImageLumaA8(_) => out.into_rgba8().into(),
+            _ => out,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -833,6 +967,60 @@ mod tests {
             _ => out.extend_from_slice(&miniz_oxide::deflate::compress_to_vec_zlib(&all, 6)),
         }
         out
+    }
+
+    /// A duotone of black and red: no ink is white, all of both is black,
+    /// half of each is half of each.
+    #[test]
+    fn duotone_is_shown_in_its_inks() {
+        let mut spec = vec![0, 1, 0, 2];
+        // Black and red, as RGB of 16 bits.
+        for colour in [[0u16, 0, 0], [65535, 0, 0]] {
+            spec.extend_from_slice(&0u16.to_be_bytes());
+            for c in colour {
+                spec.extend_from_slice(&c.to_be_bytes());
+            }
+            spec.extend_from_slice(&[0, 0]);
+        }
+        spec.resize(4 + 40 + 256, 0);
+        for _ in 0..4 {
+            // A straight curve: 0 and 100 percent, the rest not set.
+            for i in 0..13 {
+                let value: i16 = match i {
+                    0 => 0,
+                    12 => 1000,
+                    _ => -1,
+                };
+                spec.extend_from_slice(&value.to_be_bytes());
+            }
+            spec.extend_from_slice(&[0, 0]);
+        }
+        spec.resize(524, 0);
+        let plain = psd((3, 1), (8, 8), &[vec![255, 0, 128]], 0, &[]);
+        let mut data = plain[..26].to_vec();
+        data.extend_from_slice(&(spec.len() as u32).to_be_bytes());
+        data.extend_from_slice(&spec);
+        data.extend_from_slice(&plain[30..]);
+        let Composite::Colours(picture) =
+            composite(&data, &Limits::default(), Deadline(None), false).unwrap()
+        else {
+            panic!("not colours");
+        };
+        let rgb = picture.image.to_rgb8();
+        assert_eq!(rgb.get_pixel(0, 0).0, [255, 255, 255]);
+        assert_eq!(rgb.get_pixel(1, 0).0, [0, 0, 0]);
+        let [r, g, b] = rgb.get_pixel(2, 0).0;
+        assert!(
+            r.abs_diff(128) <= 2 && g.abs_diff(64) <= 2 && b.abs_diff(64) <= 2,
+            "{r} {g} {b}"
+        );
+        // Without the specification it is grey.
+        let Composite::Colours(grey) =
+            composite(&plain, &Limits::default(), Deadline(None), false).unwrap()
+        else {
+            panic!("not colours");
+        };
+        assert!(!grey.image.color().has_color());
     }
 
     #[test]
