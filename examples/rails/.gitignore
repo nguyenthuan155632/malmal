@@ -1,0 +1,6 @@
+token
+storage/*
+!storage/.keep
+Gemfile.lock
+tmp/
+log/

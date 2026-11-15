@@ -1,9 +1,10 @@
 name: Release
 
-# Pushing the tag v<version> builds the binaries and the Python wheels,
-# attaches them to a GitHub release, pushes the container image and
-# publishes the crates when the CARGO_REGISTRY_TOKEN secret is set, and the
-# wheels when the PYPI_PUBLISH variable is "true".
+# Pushing the tag v<version> builds the binaries, the Python wheels and the
+# Ruby gems, attaches them to a GitHub release, pushes the container image
+# and publishes the crates when the CARGO_REGISTRY_TOKEN secret is set, the
+# wheels when the PYPI_PUBLISH variable is "true", and the gems when the
+# RUBYGEMS_PUBLISH variable is "true".
 on:
   push:
     tags: ["v*"]
@@ -95,8 +96,85 @@ jobs:
           name: wheels
           path: bindings/python/dist/*.whl
 
+  # A malmal gem for each platform, carrying the library built for it.
+  gems:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            platform: x86_64-linux-gnu
+            runner: ubuntu-latest
+            test: native
+          - target: aarch64-unknown-linux-gnu
+            platform: aarch64-linux-gnu
+            runner: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            platform: x86_64-linux-musl
+            runner: ubuntu-latest
+            test: alpine
+          - target: aarch64-unknown-linux-musl
+            platform: aarch64-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-apple-darwin
+            platform: arm64-darwin
+            runner: macos-latest
+            test: native
+          - target: x86_64-apple-darwin
+            platform: x86_64-darwin
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          ruby-version: "3.4"
+      - name: The tag must be the version of the gems
+        run: grep -q "VERSION = \"${GITHUB_REF_NAME#v}\"" bindings/ruby/malmal/lib/malmal/version.rb
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        if: runner.os == 'Linux'
+        with:
+          python-version: "3.x"
+      - run: pip install cargo-zigbuild ziglang
+        if: runner.os == 'Linux'
+      - run: sh bindings/ruby/build_gem.sh ${{ matrix.target }}
+      - name: Test the gem as installed
+        if: matrix.test == 'native'
+        working-directory: bindings/ruby/malmal
+        run: |
+          gem install ../pkg/malmal-*-${{ matrix.platform }}.gem minitest
+          MALMAL_TEST_INSTALLED=1 ruby -Itest test/scanner_test.rb
+      - name: Test the gem as installed on Alpine
+        if: matrix.test == 'alpine'
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -e MALMAL_TEST_INSTALLED=1 -w /src/bindings/ruby/malmal \
+            ruby:3.4-alpine sh -ec 'gem install /src/bindings/ruby/pkg/malmal-*-x86_64-linux-musl.gem minitest
+              ruby -Itest test/scanner_test.rb'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gem-${{ matrix.platform }}
+          path: bindings/ruby/pkg/*.gem
+
+  # The malmal gem without a library, and malmal-rails.
+  ruby-gems:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          ruby-version: "3.4"
+      - run: sh bindings/ruby/build_gem.sh ruby
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gem-ruby
+          path: bindings/ruby/pkg/*.gem
+
   github:
-    needs: [build, wheels]
+    needs: [build, wheels, gems, ruby-gems]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -109,6 +187,10 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: wheels
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: gem-*
+          merge-multiple: true
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -117,7 +199,7 @@ jobs:
           awk -v version="${GITHUB_REF_NAME#v}" '
             /^## / { printing = ($2 == version); next }
             printing' CHANGELOG.md > notes.md
-          gh release create "$GITHUB_REF_NAME" malmal-*.tar.gz* malmal-*.whl \
+          gh release create "$GITHUB_REF_NAME" malmal-*.tar.gz* malmal-*.whl malmal-*.gem \
             --title "$GITHUB_REF_NAME" --notes-file notes.md
 
   image:
@@ -178,9 +260,11 @@ jobs:
           cargo publish --locked -p malmal-ffi
           cargo publish --locked -p malmal-cli
 
+  # crates.io, then PyPI, then RubyGems: each waits for the one before, and
+  # goes ahead when that one was skipped.
   pypi:
-    needs: wheels
-    if: vars.PYPI_PUBLISH == 'true'
+    needs: [wheels, crates]
+    if: ${{ !failure() && !cancelled() && vars.PYPI_PUBLISH == 'true' }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -192,3 +276,27 @@ jobs:
           name: wheels
           path: dist
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+
+  rubygems:
+    needs: [gems, ruby-gems, pypi]
+    if: ${{ !failure() && !cancelled() && vars.RUBYGEMS_PUBLISH == 'true' }}
+    runs-on: ubuntu-latest
+    environment: rubygems
+    permissions:
+      # RubyGems takes the workflow's identity in place of an API key.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: gem-*
+          merge-multiple: true
+          path: pkg
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          ruby-version: "3.4"
+      - uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
+      - name: Push, the platform gems first and malmal-rails last
+        run: |
+          for gem in pkg/malmal-[0-9]*-*.gem pkg/malmal-[0-9]*[0-9].gem pkg/malmal-rails-*.gem; do
+            gem push "$gem"
+          done

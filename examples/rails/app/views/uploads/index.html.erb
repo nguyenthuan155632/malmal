@@ -1,0 +1,25 @@
+<h1>Upload demo</h1>
+
+<h2>Document</h2>
+<p>Scanned with the <code>documents</code> policy and kept as it was if it is clean (PDF, JPEG, PNG, GIF or WebP).</p>
+<%= form_with url: documents_path, multipart: true do |form| %>
+  <%= form.file_field :file %>
+  <%= form.submit "Upload" %>
+<% end %>
+
+<h2>Avatar</h2>
+<p>Written anew from its pixels (JPEG, PNG, GIF or WebP).</p>
+<%= form_with url: avatars_path, multipart: true do |form| %>
+  <%= form.file_field :avatar %>
+  <%= form.submit "Upload" %>
+<% end %>
+
+<h2>Stored</h2>
+<ul>
+  <% (@documents.map(&:file) + @profiles.map(&:avatar)).select(&:attached?).each do |attachment| %>
+    <li>
+      <%= attachment.filename %>, <%= number_to_human_size(attachment.byte_size) %>,
+      scan: <code><%= attachment.blob.metadata.dig("malmal", "verdict") || "pending" %></code>
+    </li>
+  <% end %>
+</ul>

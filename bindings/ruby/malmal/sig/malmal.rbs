@@ -1,0 +1,101 @@
+module Malmal
+  VERSION: String
+  SEVERITIES: Array[Symbol]
+
+  type input = String | IO | StringIO
+  type verdict = :clean | :suspicious | :malicious
+
+  class Error < StandardError
+  end
+
+  class ScanError < Error
+  end
+
+  class SanitizeError < Error
+  end
+
+  class Rejected < SanitizeError
+    attr_reader report: Report
+    def initialize: (Report report) -> void
+  end
+
+  class NotRebuilt < SanitizeError
+  end
+
+  class LoadError < Error
+  end
+
+  class Finding
+    attr_accessor code: String
+    attr_accessor severity: Symbol
+    attr_accessor message: String
+    attr_accessor offset: Integer?
+    def self.from_h: (Hash[String, untyped] fields) -> Finding
+    def initialize: (?code: String, ?severity: Symbol, ?message: String, ?offset: Integer?) -> void
+    def to_h: () -> Hash[Symbol, untyped]
+  end
+
+  class Report
+    attr_reader verdict: verdict
+    attr_reader detected_type: Symbol
+    attr_reader declared_types: Array[Symbol]
+    attr_reader size: Integer
+    attr_reader sha256: String
+    attr_reader findings: Array[Finding]
+    def self.from_h: (Hash[String, untyped] fields) -> Report
+    def initialize: (verdict: verdict, detected_type: Symbol, ?declared_types: Array[Symbol],
+                     ?size: Integer, ?sha256: String, ?findings: Array[Finding]) -> void
+    def clean?: () -> bool
+    def suspicious?: () -> bool
+    def malicious?: () -> bool
+    def codes: () -> Array[String]
+    def to_h: () -> Hash[Symbol, untyped]
+  end
+
+  class Sanitized
+    CONTENT_TYPES: Hash[Symbol, String]
+    EXTENSIONS: Hash[Symbol, String]
+    attr_reader data: String
+    attr_reader file_type: Symbol
+    attr_reader width: Integer
+    attr_reader height: Integer
+    attr_reader frames: Integer
+    attr_reader report: Report
+    def initialize: (data: String, file_type: Symbol | String, report: Report, ?width: Integer, ?height: Integer,
+                     ?frames: Integer) -> void
+    def content_type: () -> String
+    def extension: () -> String
+  end
+
+  class Scanner
+    POLICIES: Array[Symbol]
+    LIMITS: Array[Symbol]
+    SANITIZE_OPTIONS: Array[Symbol]
+    DEFAULT_MAX_MEMORY: Integer
+
+    attr_reader options: Hash[Symbol, untyped]
+
+    def initialize: (?policy: Symbol | String, ?allow: Array[String] | String, ?types: Array[Symbol | String]?,
+                     ?hashlist: String?, ?pdf_passwords: Array[String], ?max_memory: Integer?,
+                     ?without_hash: bool, ?wait: Numeric?, ?max_size: Integer, ?max_decompressed: Integer,
+                     ?max_pixels: Integer, ?max_depth: Integer, ?scan_timeout: Numeric) -> void
+    def scan: (input data, ?filename: String?, ?content_type: String?) -> Report
+    def sanitize: (input data, ?filename: String?, ?content_type: String?, ?jpeg_quality: Integer?,
+                   ?types: Array[Symbol | String], ?pdf_dpi: Integer, ?pdf_jpeg: bool, ?pdf_text: bool,
+                   ?pdf_vector_text: bool) -> Sanitized
+    def overdue: () -> Integer
+    def library_version: () -> String
+    def close: () -> void
+    def closed?: () -> bool
+  end
+
+  class Client
+    attr_reader url: URI::Generic
+
+    def initialize: (String | URI::Generic url, ?token: String?, ?open_timeout: Numeric,
+                     ?read_timeout: Numeric) -> void
+    def scan: (input data, ?filename: String?, ?content_type: String?) -> Report
+    def sanitize: (input data, ?filename: String?, ?content_type: String?, ?types: Array[Symbol | String]?) -> Sanitized
+    def healthy?: () -> bool
+  end
+end

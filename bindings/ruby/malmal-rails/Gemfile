@@ -1,0 +1,11 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+gemspec
+gem "malmal", path: "../malmal"
+gem "minitest", "~> 5.25"
+gem "rails", "~> 8.1.0"
+gem "rake", "~> 13.2"
+gem "rubocop", "~> 1.69", require: false
+gem "sqlite3", ">= 1.7"

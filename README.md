@@ -24,7 +24,7 @@ protocol, ICAP), a C library and a Python package.
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Usage](#usage): [command line](#command-line), [Rust](#rust), [Python](#python),
-  [C](#c), [daemon](#daemon)
+  [Ruby and Rails](#ruby-and-rails), [C](#c), [daemon](#daemon)
 - [Configuration](#configuration)
 - [Rebuilding files](#rebuilding-files)
 - [Deployment](#deployment)
@@ -81,6 +81,13 @@ cargo add malmal
 
 **Python package:** wheels for x86-64 and ARM64 Linux are attached to each release. See
 [bindings/python/README.md](bindings/python/README.md).
+
+**Ruby gems:** `malmal`, with the library inside for Linux (glibc and musl) and macOS, and
+`malmal-rails`:
+
+```bash
+bundle add malmal-rails       # or bundle add malmal, outside Rails
+```
 
 **From source:**
 
@@ -244,6 +251,37 @@ scanner = malmal.Scanner(
 `Report` has `verdict`, `clean`, `detected_type`, `declared_types`, `size`, `sha256` and
 `findings`. `Sanitized` has `data`, `file_type`, `width`, `height`, `frames` and `report`.
 A `Scanner` is also a context manager.
+
+### Ruby and Rails
+
+The `malmal` gem calls the same library through `ffi`, and releases the GVL while it
+scans. One scanner is shared by every thread:
+
+```ruby
+SCANNER = Malmal::Scanner.new(policy: :documents, types: %i[jpeg png pdf], wait: 30)
+report = SCANNER.scan(upload, filename: "a.pdf", content_type: "application/pdf")
+reject(report.codes) unless report.clean?
+```
+
+In Rails, `malmal-rails` validates Active Storage attachments before they are stored,
+rebuilds the ones you name, and scans every stored blob:
+
+```ruby
+class Document < ApplicationRecord
+  has_one_attached :file
+  validates :file, malmal: true                         # :malmal_malicious, with the codes
+end
+
+class User < ApplicationRecord
+  has_one_attached :avatar
+  sanitizes_attachment :avatar, types: %i[jpeg png webp]  # only the rebuilt file is kept
+end
+```
+
+Both read `config.malmal`, which can also point at a running `malmald`. See
+[bindings/ruby/malmal](bindings/ruby/malmal/README.md),
+[bindings/ruby/malmal-rails](bindings/ruby/malmal-rails/README.md), and the application in
+[examples/rails](examples/rails).
 
 ### C
 

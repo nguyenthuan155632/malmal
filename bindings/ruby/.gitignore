@@ -1,0 +1,7 @@
+# Libraries do not pin their dependencies; CI resolves them for each Ruby and Rails.
+Gemfile.lock
+*.gemfile.lock
+# Built gems and the library copied in to build a platform gem.
+pkg/
+*.gem
+malmal/lib/malmal/libmalmal_ffi.*

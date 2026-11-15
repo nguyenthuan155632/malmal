@@ -1,0 +1,35 @@
+AllCops:
+  TargetRubyVersion: 3.2
+  NewCops: enable
+  SuggestExtensions: false
+  Exclude:
+    - "vendor/**/*"
+    - "gemfiles/**/*"
+
+Style/Documentation:
+  Enabled: false
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+Layout/LineLength:
+  Max: 120
+Metrics/AbcSize:
+  Enabled: false
+Metrics/MethodLength:
+  Max: 30
+Metrics/ClassLength:
+  Max: 250
+Metrics/ParameterLists:
+  Enabled: false
+Metrics/CyclomaticComplexity:
+  Max: 16
+Metrics/PerceivedComplexity:
+  Max: 16
+Metrics/BlockLength:
+  Exclude:
+    - "test/**/*"
+    - "*.gemspec"
+Style/StringLiteralsInInterpolation:
+  EnforcedStyle: double_quotes
+Naming/FileName:
+  Exclude:
+    - "lib/malmal-rails.rb"

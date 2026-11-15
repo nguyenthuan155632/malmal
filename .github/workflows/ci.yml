@@ -51,6 +51,71 @@ jobs:
           MALMAL_LIBRARY: ${{ github.workspace }}/target/release/libmalmal_ffi.so
           PYTHONPATH: bindings/python
 
+  # The malmal gem on every Ruby it supports, against the library and the
+  # daemon built from this checkout.
+  ruby:
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ["3.2", "3.3", "3.4", "4.0"]
+        os: [ubuntu-latest]
+        include:
+          - ruby: "3.4"
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: bindings/ruby/malmal
+    env:
+      MALMAL_LIBRARY: ${{ github.workspace }}/target/release/${{ matrix.os == 'macos-latest' && 'libmalmal_ffi.dylib' || 'libmalmal_ffi.so' }}
+      MALMALD: ${{ github.workspace }}/target/release/malmald
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo build --release --locked -p malmal-ffi -p malmal-cli
+        working-directory: .
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+          working-directory: bindings/ruby/malmal
+      - run: bundle exec rake test
+      - run: bundle exec rubocop
+        if: matrix.ruby == '3.4' && matrix.os == 'ubuntu-latest'
+
+  # malmal-rails on every Rails it supports.
+  rails:
+    strategy:
+      fail-fast: false
+      matrix:
+        rails: ["7_1", "7_2", "8_0", "8_1"]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bindings/ruby/malmal-rails
+    env:
+      BUNDLE_GEMFILE: ${{ github.workspace }}/bindings/ruby/malmal-rails/gemfiles/rails_${{ matrix.rails }}.gemfile
+      MALMAL_LIBRARY: ${{ github.workspace }}/target/release/libmalmal_ffi.so
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo build --release --locked -p malmal-ffi
+        working-directory: .
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+          working-directory: bindings/ruby/malmal-rails
+      - run: bundle exec rake test
+      - run: BUNDLE_GEMFILE=Gemfile bundle install && BUNDLE_GEMFILE=Gemfile bundle exec rubocop
+        if: matrix.rails == '8_1'
+
   # The feature that is off by default: rebuilding PDF files.
   pdf:
     runs-on: ubuntu-latest
