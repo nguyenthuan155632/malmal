@@ -522,6 +522,31 @@ fn sanitize_rebuilds_clean_images_only() {
 
 #[cfg(feature = "cdr")]
 #[test]
+fn sanitize_keeps_cmyk_when_asked() {
+    let dir = scratch("keep-cmyk");
+    let input = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/corpus/clean/cmyk-profile.tif"
+    );
+    let output = dir.join("out");
+    let rebuilt = |flags: &[&str]| {
+        let status = Command::new(MALMAL)
+            .arg("sanitize")
+            .args(flags)
+            .arg(input)
+            .arg(&output)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(0));
+        fs::read(&output).unwrap()
+    };
+    assert!(rebuilt(&[]).starts_with(b"\x89PNG"));
+    let kept = rebuilt(&["--keep-cmyk"]);
+    assert!(kept.starts_with(b"II*\0") || kept.starts_with(b"MM\0*"));
+}
+
+#[cfg(feature = "cdr")]
+#[test]
 fn daemon_rebuilds_over_http() {
     use std::io::Read;
     use std::net::TcpStream;

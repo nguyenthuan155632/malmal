@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use malmal::cdr::{Options, PageImage};
+use malmal::cdr::{Inks, Options, PageImage};
 use malmal::{FileType, HashList, Limits, Policy, Scanner};
 use serde::Deserialize;
 
@@ -149,6 +149,9 @@ pub struct SanitizeOptions {
     jpeg_quality: Option<u8>,
     /// The types to rebuild; every type this build can when absent.
     types: Option<Vec<String>>,
+    /// Keep the inks of a CMYK image as inks.
+    #[serde(default)]
+    keep_cmyk: bool,
     pdf_dpi: Option<u16>,
     /// Keep a page as JPEG where that is smaller.
     #[serde(default)]
@@ -186,6 +189,9 @@ impl SanitizeOptions {
                 return Err("pdf_dpi has to be from 36 to 600".into());
             }
             options.pdf_dpi = dpi;
+        }
+        if parsed.keep_cmyk {
+            options.inks = Inks::Keep;
         }
         if parsed.pdf_jpeg {
             options.pdf_pages = PageImage::Jpeg;
@@ -260,13 +266,14 @@ mod tests {
     fn sanitize_options() {
         let options = SanitizeOptions::parse(
             r#"{"jpeg_quality": 70, "types": ["png"], "pdf_dpi": 100, "pdf_jpeg": true,
-                "pdf_text": false, "pdf_vector_text": false}"#,
+                "keep_cmyk": true, "pdf_text": false, "pdf_vector_text": false}"#,
         )
         .unwrap();
         assert_eq!(options.jpeg_quality, 70);
         assert_eq!(options.types, Some(vec![FileType::Png]));
         assert_eq!(options.pdf_dpi, 100);
         assert_eq!(options.pdf_pages, PageImage::Jpeg);
+        assert_eq!(options.inks, Inks::Keep);
         assert!(!options.pdf_text && !options.pdf_vector_text);
         assert_eq!(SanitizeOptions::parse("").unwrap().jpeg_quality, 90);
         for json in [

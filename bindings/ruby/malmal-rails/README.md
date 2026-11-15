@@ -59,7 +59,7 @@ extension of its type, which is not always the type of the upload (a BMP becomes
 A file that is not clean is refused as the validator does; one that cannot be rebuilt
 adds `:malmal_not_rebuilt`, or is kept as it was with `on_not_rebuilt: :keep`, which is
 best paired with the validator. The options are those of `Malmal::Scanner#sanitize`:
-`types`, `jpeg_quality`, `pdf_dpi`, `pdf_jpeg`, `pdf_text`, `pdf_vector_text`.
+`types`, `jpeg_quality`, `keep_cmyk`, `pdf_dpi`, `pdf_jpeg`, `pdf_text`, `pdf_vector_text`.
 
 ## Stored blobs
 

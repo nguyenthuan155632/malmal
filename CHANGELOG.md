@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- A rebuilt JPEG keeps the quantised coefficients of the original, with Huffman tables
+  of its own: its pixels do not change and it is about the size it was. Exif rotations
+  are done on the coefficients where the image is whole blocks. Where a JPEG has to be
+  encoded again (a colour profile or inks to convert, a rotation that cuts through
+  blocks) it is encoded at 4:4:4 with no coarser a quantisation than it had.
+- An ICO is rebuilt as an ICO with every image, not as a PNG of the largest.
+- A PNG of 256 colours or fewer is written indexed when that is smaller, and rebuilt
+  images keep their pixel density (PNG, BMP, TIFF, PSD, JPEG).
+- TIFF: palette, CIE L*a*b* (with its white point), planar, CMYK through its profile,
+  and associated alpha are read as they look.
+- A lossy WebP stays lossy: every symbol of its VP8 stream is coded again at the same
+  probabilities, so it decodes to the same pixels and is about the size it was, where it
+  used to come out as a lossless WebP many times larger. Its alpha is coded again
+  without loss, and animations keep every frame as it was placed and blended. The file
+  is kept only if it decodes to exactly the pixels the original does.
+- A GIF keeps its palettes and the indices of its pixels, frame by frame, instead of
+  being quantised again from full colour; an animated PNG keeps its frames as they were
+  laid out, at 16 bits when it has them.
+- A TIFF of several pages is rebuilt as a TIFF of all of them (Deflate), not as a PNG
+  of the first. CCITT fax (Modified Huffman, T.4 one- and two-dimensional), LZMA,
+  Zstandard and WebP compression are read, and samples of any depth from 1 to 64 bits,
+  integer or floating point.
+- An animated JPEG XL is rebuilt as an animated PNG of every frame, with its delays.
+- PSD: composites compressed with ZIP, with or without prediction, and multichannel
+  documents, drawn in the colours of their inks.
+
+### Added
+
+- PSD and PSB files are rebuilt as a PNG of their composite image, with transparency
+  where Photoshop says there is any.
+- AVIF files are rebuilt as a PNG of their primary image, decoded by `filmcraft-av1`
+  (safe Rust, the same samples as libdav1d): grids of tiles, an alpha image, clean
+  aperture, rotation and mirroring, and colours brought into sRGB from an ICC profile or
+  the primaries and transfer the file names. Images for high dynamic range displays
+  are refused.
+- `Options::inks` (`Inks::Keep`), `malmal sanitize --keep-cmyk` and `keep_cmyk` in the C,
+  Python and Ruby interfaces: a CMYK JPEG, TIFF or PSD keeps its inks, a JPEG its
+  coefficients and a TIFF or PSD its samples (written as a TIFF), with its colour
+  profile rebuilt from the tags that define its colours, copied byte for byte and
+  checked to print every ink as the original does.
+
 ## 0.4.2
 
 ### Added

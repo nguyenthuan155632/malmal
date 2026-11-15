@@ -86,9 +86,9 @@ else
 end
 ```
 
-The type can change: a BMP, TIFF or ICO comes out as a PNG. `Malmal::Sanitized` has
+The type can change: a BMP, TIFF or PSD comes out as a PNG. `Malmal::Sanitized` has
 `data`, `file_type`, `content_type`, `extension`, `width`, `height`, `frames` and
-`report`. `sanitize` also takes `types`, `pdf_dpi`, `pdf_jpeg`, `pdf_text` and
+`report`. `sanitize` also takes `types`, `keep_cmyk`, `pdf_dpi`, `pdf_jpeg`, `pdf_text` and
 `pdf_vector_text`; PDFs are rebuilt only by a library built with `cdr-pdf`. Both
 exceptions are a `Malmal::SanitizeError`.
 
