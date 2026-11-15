@@ -301,8 +301,12 @@ malmald --http 127.0.0.1:8080 --socket /run/malmal.sock --require-sandbox
 | `--clamd <ADDR>` | ClamAV `clamd` protocol | Software that already calls ClamAV |
 | `--icap <ADDR>` | ICAP | Proxies such as Squid |
 
-`ADDR` is `host:port` or the path of a Unix socket. The daemon has no authentication and no
-TLS: bind it to loopback or a Unix socket, and let only your upload service reach it.
+`ADDR` is `host:port` or the path of a Unix socket. The daemon has no TLS: bind it to
+loopback or a Unix socket, and let only your upload service reach it. On HTTP,
+`--token-file <FILE>` makes every request but `GET /healthz` carry
+`Authorization: Bearer <token>`, the first line of `FILE` (16 characters or more); without
+it the answer is `401`. The ClamAV and ICAP protocols carry no token. At start-up the
+daemon warns about every endpoint that is not on loopback and that anyone can use.
 
 **HTTP.** The request body is the file itself, not a multipart form. Any status other than
 `200` means the file was not scanned.
@@ -370,7 +374,8 @@ Status codes, metrics and protocol details are in
 
 | Option | Default | Rust | Python | C |
 |---|---|---|---|---|
-| `--policy default\|strict` | `default` | `Policy::strict()` | `strict=True` | `strict` |
+| `--policy default\|strict\|documents` | `default` | `Policy::strict()`, `Policy::documents()` | `strict=True` | `strict` |
+| `--token-file <FILE>` (`malmald`) | none | | | |
 | `--types <LIST>` | all types | `Policy::with_allowed_types` | | |
 | `--allow <CODES>` | none | `Policy::allow` | `allow=` | `allow` |
 | `--hashlist <FILE>` | none | `ScannerBuilder::hashlist` | `hashlist=` | `hashlist` |
@@ -385,6 +390,10 @@ Status codes, metrics and protocol details are in
 | `--yara <PATH>` | none | `ScannerBuilder::yara` | | |
 | `--require-sandbox` | off | | | |
 | `--no-sandbox` | off | | | |
+
+`documents` is the default policy with forms (`pdf.xfa`) and attachments (`pdf.embedded_file`)
+allowed; what is found inside them still counts. From Python and C, pass those two codes
+to `allow`.
 
 The Python and C interfaces use the default limits. Embedded files are scanned up to
 `Limits::max_depth` (4) levels deep.
@@ -633,7 +642,7 @@ Results on [CIC-Evasive-PDFMal2022](https://www.unb.ca/cic/datasets/pdfmal-2022.
 | Configuration | Malicious rejected | Clean accepted |
 |---|---:|---:|
 | Default policy | 99.07% | 87.32% |
-| `--allow 'pdf.xfa\|pdf.embedded_file'` | 99.06% | 92.38% |
+| `--policy documents` | 99.06% | 92.38% |
 | `--allow 'pdf.xfa\|pdf.embedded_file\|pdf.javascript'` | 80.15% | 97.11% |
 
 Every clean file that is rejected carries active content or an attachment: JavaScript
@@ -679,10 +688,11 @@ goes to the SHA-256 hash; `--no-hash` skips it when you do not need it.
 - **Rebuilt images keep their pixels**, and anything encoded in them. Rebuilt files are
   scanned again for that reason; if you call `malmal::cdr::rebuild` directly, scan the
   result yourself.
-- **The library cannot interrupt a step that does not finish.** The time limit is checked
-  between steps; only the command-line tools enforce `--hard-timeout`. Use the daemon if
-  you need that guarantee.
-- **The daemon has no authentication or TLS.**
+- **The library cannot stop a step that does not finish.** The time limit is checked
+  between steps. `Scanner::scan_within` answers in time anyway, with `limit.time`, but
+  leaves the scan running on its thread (at most `MAX_OVERDUE` of them); only the
+  command-line tools end such a scan, with `--hard-timeout`.
+- **The daemon has no TLS**, and authenticates HTTP requests only, with `--token-file`.
 - **Slow clients are let go, not refused.** A request that arrives at `--min-rate` or
   faster keeps its connection and the part of `--file-budget` it has sent, however long it
   takes; enough such clients fill `--connections` or the budget, and the others wait. They

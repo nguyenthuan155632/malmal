@@ -208,6 +208,37 @@ let scanner = malmal::Scanner::builder()
 Each is tried as the user password and as the owner password. A document none of them
 opens is `pdf.encrypted` at Medium, as before.
 
+### A time limit that holds
+
+`Limits::max_duration` is checked between the steps of a scan, so a step that does not end
+(a bug in a parser) holds `scan_bytes` with it. `scan_within` answers in time whatever the
+file does:
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+
+let data: Arc<[u8]> = Arc::from(body);
+let report = scanner.scan_within(data, hints, Duration::from_secs(60));
+```
+
+The scan runs on a thread of its own. When it has not ended after the wait, the report has
+`limit.time` and is never clean; the scan goes on in the background, since a thread cannot
+be stopped from outside. At most `malmal::MAX_OVERDUE` (4) such scans are left running for
+a scanner and its clones; past that, every file is refused at once with `limit.time` until
+one of them ends. `Scanner::overdue()` counts them: export it to your metrics, and restart
+the service when it is above zero. Choose the wait well above `max_duration`, which ends
+nearly every slow scan by itself. The daemon does not need this: it ends itself with
+`--hard-timeout` instead.
+
+### Policies for documents
+
+`Policy::documents()` (`--policy documents`) is the default policy with XFA forms
+(`pdf.xfa`) and attachments (`pdf.embedded_file`) allowed, for services that take
+documents from people; what the forms and attachments contain still counts. On
+CIC-Evasive-PDFMal2022 it accepts 92.4% of the clean files (87.3% by default) and refuses
+99.1% of the malicious ones.
+
 ## As a daemon
 
 `malmald` serves any combination of four endpoints. An address is `host:port`, or the path
@@ -217,8 +248,22 @@ of a Unix socket.
 malmald --socket /run/malmal.sock --http 127.0.0.1:8080 --clamd 127.0.0.1:3310 --icap 127.0.0.1:1344 --require-sandbox
 ```
 
-It has no authentication and no TLS. Bind it to the loopback interface or a Unix socket, and
-let only the upload service reach it.
+It has no TLS. Bind it to the loopback interface or a Unix socket, and let only the upload
+service reach it. Where the HTTP endpoint has to be reachable from other hosts, give it a
+token:
+
+```bash
+head -c 32 /dev/urandom | base64 > /etc/malmal/token
+malmald --http 10.0.0.5:8080 --token-file /etc/malmal/token
+curl -H "Authorization: Bearer $(cat /etc/malmal/token)" --data-binary @upload.pdf \
+  http://10.0.0.5:8080/scan
+```
+
+Every request but `GET /healthz` then needs the header, and is answered `401` before its
+body is read without it. The token is the first line of the file, at least 16 characters.
+The ClamAV and ICAP protocols have no place for a token; keep them on loopback, a Unix
+socket or a private network. At start-up the daemon warns about each endpoint that is not on
+loopback and that anyone who reaches it can use.
 
 ### HTTP
 
@@ -554,4 +599,5 @@ docker run --rm -p 127.0.0.1:3310:3310 ghcr.io/nguyenthuan155632/malmal --clamd 
 ```
 
 Publish the port to the upload service only; inside the container the daemon listens on
-every interface and has no authentication.
+every interface, and without `--token-file` anyone who reaches the port can use it (the
+daemon says so when it starts).

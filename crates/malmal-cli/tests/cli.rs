@@ -862,6 +862,77 @@ fn daemon_spools_large_files() {
 }
 
 #[test]
+fn daemon_requires_the_token_it_is_given() {
+    use std::io::Read;
+    use std::net::TcpStream;
+
+    let dir = scratch("token");
+    let token_file = dir.join("token");
+    fs::write(&token_file, "short\n").unwrap();
+    let output = Command::new(MALMALD)
+        .args(["--http", "127.0.0.1:0", "--token-file"])
+        .arg(&token_file)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("at least 16 characters"));
+
+    fs::write(
+        &token_file,
+        "  s3cret-token-of-32-characters!!  \nignored\n",
+    )
+    .unwrap();
+    let path = token_file.to_str().unwrap();
+    let (_daemon, address) =
+        daemon_on_tcp_with("--http", &["--timeout", "5", "--token-file", path]);
+    let exchange = |authorization: &str| {
+        let mut stream = TcpStream::connect(&address).unwrap();
+        let request = format!(
+            "POST /scan HTTP/1.1\r\n{authorization}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            ELF.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(ELF).unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).unwrap();
+        reply
+    };
+    let reply = exchange("");
+    assert!(
+        reply.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "{reply}"
+    );
+    let reply = exchange("Authorization: Bearer s3cret-token-of-32-characters!!\r\n");
+    assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+    assert!(reply.contains(r#""verdict":"malicious""#), "{reply}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn daemon_warns_about_endpoints_anyone_can_reach() {
+    let mut child = Command::new(MALMALD)
+        .args(["--http", "0.0.0.0:0", "--clamd", "0.0.0.0:0"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut lines = Vec::new();
+    for _ in 0..3 {
+        let mut line = String::new();
+        stderr.read_line(&mut line).unwrap();
+        lines.push(line);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        lines[0].contains("(http) is not on loopback and has no --token-file"),
+        "{lines:?}"
+    );
+    assert!(lines[1].contains("(clamd) is not on loopback"), "{lines:?}");
+    assert!(lines[2].starts_with("malmald: listening on "), "{lines:?}");
+}
+
+#[test]
 fn daemon_refuses_a_spool_it_cannot_open() {
     let output = Command::new(MALMALD)
         .args(["--http", "127.0.0.1:0", "--spool-dir", "/nonexistent/spool"])

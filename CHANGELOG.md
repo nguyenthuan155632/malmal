@@ -4,6 +4,20 @@
 
 ### Added
 
+- `Policy::documents()` and `--policy documents`: the default policy with XFA forms and
+  attachments allowed, for services that take documents from people. What they contain
+  still counts. On CIC-Evasive-PDFMal2022 it accepts 92.38% of the clean files, against
+  87.32%, and refuses 99.06% of the malicious ones. `Policy::named` looks a policy up by
+  name.
+- `malmald --token-file <FILE>`: HTTP requests other than `GET /healthz` have to carry
+  `Authorization: Bearer <token>`, or are answered `401` before their body is read. The
+  daemon also warns at start-up about each endpoint that is not on loopback and that
+  anyone can use.
+- `Scanner::scan_within`: a scan that answers within a given time, even when a step of it
+  does not end. The scan runs on a thread of its own; when it is late, the report has
+  `limit.time` and the scan is left running, at most `MAX_OVERDUE` (4) of them, past which
+  files are refused at once. `Scanner::overdue` counts them.
+
 - `--max-memory` (512 MiB) for `malmal` and `malmald`, and `ScannerBuilder::memory_limit`
   with `MemoryLimit` in the library: a scan that holds more than that beyond what its
   thread held when it began is stopped with `limit.memory`. The tools count what each
@@ -49,6 +63,15 @@
   page left in the drawing; poppler draws none of them further from the original than
   the drawing alone. The other 31 are scans and come out as before. Rebuilding took 51%
   longer.
+
+### Changed
+
+- The crates declare `rust-version = "1.95"`, the oldest Rust that builds them with every
+  feature (`yara-x` needs it); CI builds with it.
+- The features `zenavif`, `avif-decode`, `svg-hush` and `hayro` of `malmal` are gone. The
+  first two did nothing; the others only pulled in a dependency that `cdr-svg` and
+  `cdr-pdf` use.
+- The GitHub Actions the workflows use are pinned to commits.
 
 ### Fixed
 

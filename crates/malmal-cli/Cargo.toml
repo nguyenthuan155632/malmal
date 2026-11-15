@@ -3,6 +3,7 @@ name = "malmal-cli"
 description = "Command-line scanner and daemon for the malmal upload scanner"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true

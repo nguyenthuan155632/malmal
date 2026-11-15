@@ -146,6 +146,7 @@ mod ps;
 /// The result of a scan.
 pub mod report;
 mod svg;
+mod within;
 mod work;
 #[cfg(feature = "yara")]
 mod yara;
@@ -160,6 +161,7 @@ use limits::Budget;
 pub use limits::{Limits, MemoryLimit};
 pub use policy::{AllowError, Policy};
 pub use report::{Finding, Report, Severity, Verdict};
+pub use within::MAX_OVERDUE;
 #[cfg(feature = "yara")]
 #[cfg_attr(docsrs, doc(cfg(feature = "yara")))]
 pub use yara::{YaraError, YaraRules};
@@ -187,6 +189,8 @@ pub struct Scanner {
     memory: Option<MemoryLimit>,
     #[cfg(feature = "yara")]
     yara: Option<YaraRules>,
+    /// Scans [`Scanner::scan_within`] stopped waiting for, shared by clones.
+    overdue: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Passwords are kept out of `Debug` output, which ends up in logs.

@@ -51,6 +51,30 @@ impl Policy {
         }
     }
 
+    /// Like the default, but forms (`pdf.xfa`) and attachments
+    /// (`pdf.embedded_file`) do not count against a PDF: for services that
+    /// take documents from people, where both are common in clean files.
+    /// What is found inside an attachment or a form (JavaScript, an
+    /// executable, another PDF's actions) still counts.
+    ///
+    /// On CIC-Evasive-PDFMal2022 it accepts 92.4 % of the clean files
+    /// (87.3 % with the default) and still refuses 99.1 % of the malicious.
+    pub fn documents() -> Self {
+        Self::default()
+            .with_override("pdf.xfa", Severity::Info)
+            .with_override("pdf.embedded_file", Severity::Info)
+    }
+
+    /// The policy with this name: `default`, `strict` or `documents`.
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "default" => Some(Self::default()),
+            "strict" => Some(Self::strict()),
+            "documents" => Some(Self::documents()),
+            _ => None,
+        }
+    }
+
     /// Replace the severity of every finding with this code.
     pub fn with_override(mut self, code: impl Into<String>, severity: Severity) -> Self {
         self.overrides.insert(code.into(), severity);
@@ -174,6 +198,26 @@ mod tests {
             Policy::strict().apply(&mut [finding(Severity::Low)]),
             Verdict::Suspicious
         );
+    }
+
+    #[test]
+    fn documents_lets_forms_and_attachments_through() {
+        let policy = Policy::named("documents").unwrap();
+        let mut findings = [
+            Finding::new("pdf.xfa", Severity::Medium, "form"),
+            Finding::new("pdf.embedded_file", Severity::Medium, "attachment"),
+        ];
+        assert_eq!(policy.apply(&mut findings), Verdict::Clean);
+        let mut findings = [
+            Finding::new("pdf.embedded_file", Severity::Medium, "attachment"),
+            Finding::new("pdf.javascript", Severity::High, "embedded file: script"),
+        ];
+        assert_eq!(policy.apply(&mut findings), Verdict::Malicious);
+        assert_eq!(
+            Policy::documents().apply(&mut [Finding::new("pdf.launch", Severity::High, "")]),
+            Verdict::Malicious
+        );
+        assert!(Policy::named("lenient").is_none());
     }
 
     #[test]
