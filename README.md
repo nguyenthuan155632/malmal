@@ -174,6 +174,9 @@ if report.verdict != Verdict::Clean {
 - `scan_reader` takes any `impl Read` and stops reading at the size limit.
 - A scan is CPU-bound and can run up to the time limit. In async code, run it on a
   blocking thread (`tokio::task::spawn_blocking`).
+- The time limit is checked between steps. `scan_within(Arc<[u8]>, hints, wait)` answers
+  within `wait` even if a step never ends, with `limit.time`; see
+  [docs/integration.md](docs/integration.md#a-time-limit-that-holds).
 
 A configured scanner:
 
@@ -634,6 +637,14 @@ docker run --rm -p 127.0.0.1:3310:3310 ghcr.io/nguyenthuan155632/malmal \
   --clamd 0.0.0.0:3310 --max-size 20000000
 ```
 
+To reach the HTTP endpoint from other hosts, give it a token (the file has to be readable
+by user 65534, whom the image runs as):
+
+```bash
+docker run --rm -p 8080:8080 -v /etc/malmal/token:/token:ro ghcr.io/nguyenthuan155632/malmal \
+  --http 0.0.0.0:8080 --token-file /token
+```
+
 ## Accuracy and performance
 
 Results on [CIC-Evasive-PDFMal2022](https://www.unb.ca/cic/datasets/pdfmal-2022.html)
@@ -705,6 +716,8 @@ goes to the SHA-256 hash; `--no-hash` skips it when you do not need it.
 - **macOS** has no sandbox, and the test suite is not run there.
 
 ## Development
+
+Building needs Rust 1.95 or later (`rust-version`); fuzzing needs nightly.
 
 ```bash
 cargo test --workspace
