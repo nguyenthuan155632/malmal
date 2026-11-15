@@ -1,0 +1,10 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+gemspec path: ".."
+gem "malmal", path: "../../malmal"
+gem "rails", "~> 8.0.0"
+gem "minitest", "~> 5.25"
+gem "rake", "~> 13.2"
+gem "sqlite3", ">= 1.7"

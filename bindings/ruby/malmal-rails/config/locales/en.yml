@@ -1,0 +1,7 @@
+en:
+  errors:
+    messages:
+      malmal_suspicious: "could not be accepted: %{filename} looks suspicious"
+      malmal_malicious: "could not be accepted: %{filename} looks malicious"
+      malmal_error: "could not be checked; try again"
+      malmal_not_rebuilt: "could not be accepted: %{filename} is not a file that can be rebuilt"
