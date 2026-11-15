@@ -5,6 +5,7 @@ members = ["crates/malmal", "crates/malmal-cli", "crates/malmal-ffi"]
 [workspace.package]
 version = "0.3.0"
 edition = "2024"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nguyenthuan155632/malmal"
 authors = ["nguyenthuan155632 <nguyenthuan155632@gmail.com>"]

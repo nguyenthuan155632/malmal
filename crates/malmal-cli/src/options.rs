@@ -11,7 +11,8 @@ use crate::watchdog::Watchdog;
 // The literals start on the quote's own line: a `"\` continuation would strip
 // the leading spaces of the first line and misalign it from the rest.
 #[cfg(not(feature = "yara"))]
-pub const HELP: &str = "  --policy <NAME>      default or strict [default: default]
+pub const HELP: &str = "  --policy <NAME>      default, strict, or documents (forms and attachments
+                       in PDFs do not count) [default: default]
   --types <LIST>       Accepted file types, comma-separated
                        [default: jpeg,png,gif,webp,bmp,tiff,psd,heif,avif,jxl,ico,
                        svg,pdf,postscript]
@@ -39,7 +40,8 @@ pub const HELP: &str = "  --policy <NAME>      default or strict [default: defau
   --require-sandbox    Exit with an error if the sandbox cannot be applied";
 
 #[cfg(feature = "yara")]
-pub const HELP: &str = "  --policy <NAME>      default or strict [default: default]
+pub const HELP: &str = "  --policy <NAME>      default, strict, or documents (forms and attachments
+                       in PDFs do not count) [default: default]
   --types <LIST>       Accepted file types, comma-separated
                        [default: jpeg,png,gif,webp,bmp,tiff,psd,heif,avif,jxl,ico,
                        svg,pdf,postscript]
@@ -147,12 +149,12 @@ impl Common {
     ) -> Result<bool, String> {
         match arg {
             "--policy" => {
-                self.policy = match rest.next().as_deref() {
-                    Some("default") => Policy::default(),
-                    Some("strict") => Policy::strict(),
-                    Some(other) => return Err(format!("unknown policy {other:?}")),
-                    None => return Err("--policy needs a value".into()),
-                }
+                let name = rest.next().ok_or("--policy needs a value")?;
+                self.policy = Policy::named(&name).ok_or_else(|| {
+                    format!(
+                        "unknown policy {name:?}; the policies are default, strict and documents"
+                    )
+                })?;
             }
             "--types" => {
                 let list = rest.next().ok_or("--types needs a value")?;

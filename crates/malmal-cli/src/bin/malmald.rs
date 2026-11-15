@@ -45,7 +45,11 @@ Options:
                        connection is dropped; 0 for any rate [default: 1024]
   --spool-dir <DIR>    Keep files of 1 MiB and more in unnamed files in DIR
                        while they are scanned, and not in memory; DIR must
-                       be on a disk [default: every file in memory]";
+                       be on a disk [default: every file in memory]
+  --token-file <FILE>  Require `Authorization: Bearer <token>` on HTTP requests
+                       other than GET /healthz; the token is the first line of
+                       FILE, at least 16 characters. The ClamAV and ICAP
+                       protocols carry no token";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Protocol {
@@ -74,6 +78,7 @@ struct Args {
     timeout: Duration,
     min_rate: u64,
     spool_dir: Option<PathBuf>,
+    token_file: Option<PathBuf>,
     common: Common,
 }
 
@@ -92,6 +97,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut file_budget = None;
     let mut min_rate = 1024;
     let mut spool_dir = None;
+    let mut token_file = None;
     let mut common = Common::default();
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
@@ -136,6 +142,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     .map_err(|_| "--min-rate needs a number of bytes")?
             }
             "--spool-dir" => spool_dir = Some(PathBuf::from(value("--spool-dir")?)),
+            "--token-file" => token_file = Some(PathBuf::from(value("--token-file")?)),
             other => {
                 if !common.parse(other, &mut args)? {
                     return Err(format!("unknown option {other:?}"));
@@ -160,6 +167,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         timeout: Duration::from_secs(timeout),
         min_rate,
         spool_dir,
+        token_file,
         common,
     })
 }
@@ -319,6 +327,39 @@ impl Pace for Paced<'_> {
     }
 }
 
+/// The first line of a token file, without the spaces around it.
+fn read_token(path: &Path) -> Result<String, String> {
+    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let token = text.lines().next().unwrap_or("").trim();
+    if token.len() < 16 || token.contains(char::is_whitespace) {
+        return Err(format!(
+            "{}: the token has to be at least 16 characters, without spaces",
+            path.display()
+        ));
+    }
+    Ok(token.to_string())
+}
+
+/// A warning for an endpoint that anyone who can reach the host may use.
+fn exposure(protocol: Protocol, bound: &str, token: bool) -> Option<String> {
+    let address: std::net::SocketAddr = bound.parse().ok()?;
+    if address.ip().is_loopback() {
+        return None;
+    }
+    match protocol {
+        Protocol::Http if token => None,
+        Protocol::Http => Some(format!(
+            "{bound} (http) is not on loopback and has no --token-file; \
+             anyone who can reach it can use it"
+        )),
+        _ => Some(format!(
+            "{bound} ({}) is not on loopback, and its protocol has no authentication; \
+             publish it to the upload service only",
+            protocol.name()
+        )),
+    }
+}
+
 /// Serve one connection to its end.
 fn serve(stream: &Stream, protocol: Protocol, service: &Service, timeout: Duration, min_rate: u64) {
     if stream.set_timeout(timeout).is_err() {
@@ -396,6 +437,18 @@ fn main() -> ExitCode {
             }
         }
     }
+    let token = match args.token_file.as_deref().map(read_token).transpose() {
+        Ok(token) => token,
+        Err(message) => {
+            eprintln!("malmald: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for (protocol, _, bound) in &listeners {
+        if let Some(warning) = exposure(*protocol, bound, token.is_some()) {
+            eprintln!("malmald: warning: {warning}");
+        }
+    }
     let scanner = match args.common.scanner() {
         Ok(scanner) => scanner,
         Err(message) => {
@@ -445,6 +498,10 @@ fn main() -> ExitCode {
     let service = Service::new(scanner).watched_by(watchdog);
     let service = match spool {
         Some(spool) => service.spooling_to(spool),
+        None => service,
+    };
+    let service = match token {
+        Some(token) => service.requiring_token(token),
         None => service,
     };
     let reserve = Reserve::new(args.file_budget, args.timeout);

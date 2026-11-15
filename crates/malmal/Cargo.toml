@@ -3,6 +3,7 @@ name = "malmal"
 description = "Upload scanner for images, SVG, PDF and PostScript files"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
@@ -59,13 +60,9 @@ cdr = [
     "dep:zune-core",
     "dep:zune-jpeg",
 ]
-svg-hush = ["dep:svg-hush"]
 
 # With `cdr`, also filtering SVG files down to what draws a picture.
 cdr-svg = ["cdr", "dep:svg-hush"]
-zenavif = []
-avif-decode = []
-hayro = ["dep:hayro"]
 
 # With `cdr`, also rendering each page of a PDF and writing a new one that
 # holds nothing but the pictures of the pages.

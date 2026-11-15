@@ -188,6 +188,8 @@ pub struct Service {
     spool: Option<Arc<Spool>>,
     /// What the bodies held at once may come to; without it, any amount.
     reserve: Option<Arc<Reserve>>,
+    /// The bearer token HTTP requests have to carry; without it, none.
+    token: Option<Vec<u8>>,
 }
 
 impl Service {
@@ -199,7 +201,36 @@ impl Service {
             turns: None,
             spool: None,
             reserve: None,
+            token: None,
         }
+    }
+
+    /// Answer HTTP requests other than `GET /healthz` only when they carry
+    /// `Authorization: Bearer <token>`.
+    pub fn requiring_token(mut self, token: impl Into<Vec<u8>>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+
+    /// Whether an `Authorization` header (or its absence) lets a request in.
+    /// The comparison takes as long whichever byte differs.
+    pub(crate) fn authorized(&self, authorization: Option<&str>) -> bool {
+        let Some(token) = &self.token else {
+            return true;
+        };
+        let Some(given) = authorization.and_then(|value| {
+            let (scheme, rest) = value.split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+        }) else {
+            return false;
+        };
+        let given = given.as_bytes();
+        given.len() == token.len()
+            && given
+                .iter()
+                .zip(token)
+                .fold(0u8, |differ, (a, b)| differ | (a ^ b))
+                == 0
     }
 
     /// Hold no more of request bodies at once than `reserve` has room for,
@@ -493,6 +524,10 @@ pub(crate) fn percent_decode(text: &str) -> String {
 /// - `GET /metrics`: counters in the Prometheus text format.
 /// - `GET /healthz`: `200 ok`.
 ///
+/// With [`Service::requiring_token`], every request but `GET /healthz` has
+/// to carry `Authorization: Bearer <token>`, or is answered `401` before its
+/// body is read.
+///
 /// Any other status means the file was not scanned, and closes the
 /// connection. From `/sanitize`, anything but `200` means there is no file
 /// to keep.
@@ -545,6 +580,21 @@ pub fn http(
         let keep_alive = version == "HTTP/1.1"
             && !header("connection").is_some_and(|value| value.eq_ignore_ascii_case("close"));
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
+
+        // A body may follow that is not read, so the connection ends.
+        if path != "/healthz" && !service.authorized(header("authorization")) {
+            service.metrics.reject();
+            let body = b"{\"ok\":false,\"error\":\"a valid bearer token is required\"}\n";
+            write!(
+                writer,
+                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            )?;
+            writer.write_all(body)?;
+            return writer.flush();
+        }
 
         let response = match (method, path) {
             ("GET", "/healthz") => Response::text("200 OK", "ok\n"),
@@ -898,6 +948,48 @@ mod tests {
 
         // `Connection: close` ends the exchange before the last request.
         assert_eq!(replies[3], ("HTTP/1.1 200 OK".into(), "ok\n".into()));
+    }
+
+    #[test]
+    fn http_asks_for_the_token_before_reading_the_body() {
+        let service = service().requiring_token("0123456789abcdef");
+        let scan = |authorization: &str| {
+            let head = format!(
+                "POST /scan HTTP/1.1\r\n{authorization}Content-Length: {}\r\n\r\n",
+                GIF.len()
+            );
+            run(Http, &service, &http_request(&head, GIF))
+        };
+        for wrong in [
+            "",
+            "Authorization: Bearer 0123456789abcdeX\r\n",
+            "Authorization: Bearer 0123456789abcdef0\r\n",
+            "Authorization: Basic 0123456789abcdef\r\n",
+        ] {
+            let output = scan(wrong);
+            let replies = responses(&output);
+            assert_eq!(replies.len(), 1, "{wrong:?}");
+            assert_eq!(replies[0].0, "HTTP/1.1 401 Unauthorized", "{wrong:?}");
+            assert!(String::from_utf8_lossy(&output).contains("WWW-Authenticate: Bearer\r\n"));
+        }
+        let replies = responses(&scan("authorization: bearer  0123456789abcdef\r\n"));
+        assert_eq!(replies[0].0, "HTTP/1.1 200 OK");
+        assert!(
+            replies[0].1.contains(r#""verdict":"clean""#),
+            "{}",
+            replies[0].1
+        );
+
+        let get = |path: &str| {
+            let request = format!("GET {path} HTTP/1.1\r\n\r\n");
+            responses(&run(Http, &service, request.as_bytes()))[0]
+                .0
+                .clone()
+        };
+        assert_eq!(get("/healthz"), "HTTP/1.1 200 OK");
+        assert_eq!(get("/metrics"), "HTTP/1.1 401 Unauthorized");
+        assert!(service.authorized(Some("Bearer 0123456789abcdef")));
+        assert!(Service::new(Scanner::builder().build()).authorized(None));
     }
 
     #[test]

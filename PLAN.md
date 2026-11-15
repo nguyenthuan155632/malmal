@@ -35,13 +35,14 @@ malmal/
 │   │       ├── payload.rs     # shared string scanner (php, script, PE/ELF/ZIP headers)
 │   │       ├── image/         # jpeg.rs png.rs gif.rs webp.rs bmp.rs tiff.rs meta.rs
 │   │       ├── svg.rs
-│   │       ├── pdf/           # lexer.rs object.rs xref.rs filters.rs analyze.rs
-│   │       ├── ps/            # lexer.rs analyze.rs (PostScript, EPS, legacy AI)
+│   │       ├── pdf/           # parser.rs filters.rs crypt.rs content.rs deep.rs mod.rs
+│   │       ├── ps.rs          # PostScript, EPS, legacy AI
+│   │       ├── cdr.rs         # rebuilding files (CDR), behind the "cdr" features
+│   │       ├── within.rs      # Scanner::scan_within, a time limit the caller can count on
 │   │       ├── hashlist.rs    # SHA-256 blocklist
 │   │       └── yara.rs        # behind the "yara" feature
-│   ├── malmal-cli/            # the `malmal` binary
-│   ├── malmal-ffi/            # cdylib + staticlib, malmal.h header
-│   └── malmal-daemon/         # the `malmald` binary, Unix socket
+│   ├── malmal-cli/            # the `malmal` and `malmald` binaries (HTTP, Unix socket, clamd, ICAP)
+│   └── malmal-ffi/            # cdylib + staticlib, malmal.h header
 ├── fuzz/                      # cargo-fuzz, one target per parser
 ├── tests/corpus/{clean,malicious}/
 └── rules/                     # default YARA rules
@@ -461,9 +462,26 @@ Taken from a comparison with quelda (github.com/tranhuucanh/quelda), a PDF scann
       (median); none drawn by poppler further from the original than the picture alone.
 - [ ] Not done: reading object streams, attachments, XFA and metadata in blocks;
       recursion through patterns, soft masks and glyphs; embedded fonts and colour
-      profiles; presets and locked rules; the content masking that no structure shows
+      profiles; locked rules; the content masking that no structure shows
       (unknown operators, inner and outer documents, page trees with too few leaves);
       checking links against a list of known bad sites.
+
+### M14 — Review follow-ups
+
+- [x] Features that did nothing (`zenavif`, `avif-decode`) or only pulled in a dependency
+      (`svg-hush`, `hayro`) removed from `malmal`.
+- [x] GitHub Actions pinned to commits; `rust-version = "1.95"` (what `yara-x` needs),
+      built in CI.
+- [x] `Policy::documents()` / `--policy documents`: forms and attachments allowed, what
+      they hold still counted. CIC: 92.38 % of the clean accepted, 99.06 % of the
+      malicious refused.
+- [x] `malmald --token-file`: a bearer token on HTTP (all but `/healthz`), `401` before
+      the body is read; a warning at start-up for each endpoint off loopback that anyone
+      can use. ClamAV and ICAP have no place for a token.
+- [x] `Scanner::scan_within`: the scan on a thread of its own, `limit.time` when it is
+      late, at most `MAX_OVERDUE` scans left running, then every file refused at once.
+- [ ] Not done: a token for ICAP and clamd; `scan_within` in the C and Python interfaces;
+      TLS.
 
 ## Order and dependencies
 
@@ -484,5 +502,5 @@ M3 and M4 are independent. M5 needs M4 because modern AI files are PDFs. M6 need
 ## Out of scope (recorded for later)
 
 - Office (DOCX/XLSX macros), archives (recursive ZIP/RAR), video.
-- Rebuilding PDF and SVG (CDR for documents): a different problem from pixels.
+- A rebuilt PDF that keeps its links and forms (see M11).
 - Bindings beyond C and Python; wheels for macOS and Windows.
