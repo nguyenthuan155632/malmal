@@ -260,9 +260,11 @@ jobs:
           cargo publish --locked -p malmal-ffi
           cargo publish --locked -p malmal-cli
 
+  # crates.io, then PyPI, then RubyGems: each waits for the one before, and
+  # goes ahead when that one was skipped.
   pypi:
-    needs: wheels
-    if: vars.PYPI_PUBLISH == 'true'
+    needs: [wheels, crates]
+    if: ${{ !failure() && !cancelled() && vars.PYPI_PUBLISH == 'true' }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -276,8 +278,8 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
 
   rubygems:
-    needs: [gems, ruby-gems]
-    if: vars.RUBYGEMS_PUBLISH == 'true'
+    needs: [gems, ruby-gems, pypi]
+    if: ${{ !failure() && !cancelled() && vars.RUBYGEMS_PUBLISH == 'true' }}
     runs-on: ubuntu-latest
     environment: rubygems
     permissions:

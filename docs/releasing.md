@@ -25,7 +25,9 @@ Each archive holds `bin/malmal`, `bin/malmald`, `lib/libmalmal_ffi.a`,
 `include/malmal.h`, the README, the changelog and both licenses. The released binaries
 are built with the default features: no `yara`, no `cdr-pdf`.
 
-Without the secret or the variables, `crates`, `pypi` and `rubygems` are skipped and the rest of the
+The three publish in that order: `pypi` waits for `crates`, and `rubygems` for `pypi`,
+each going ahead when the one before was skipped. Without the secret or the variables,
+`crates`, `pypi` and `rubygems` are skipped and the rest of the
 release still happens.
 
 ## One-time setup
