@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.2
+
+### Added
+
+- `malmald --https`, `--icaps` and `--clamd-tls`: HTTP, ICAP and the ClamAV protocol over
+  TLS, with `--tls-cert` and `--tls-key` (PEM). `--tls-client-ca` makes their clients
+  present a certificate signed by a CA in the file, which authenticates the ClamAV
+  protocol from other hosts. TLS is the `tls` feature of `malmal-cli`, on by default;
+  building it for musl needs a musl C compiler (`musl-gcc`) for `ring`.
+- `malmald --token-file` covers ICAP too: `REQMOD` and `RESPMOD` have to carry
+  `Authorization: Bearer <token>` (Squid: `adaptation_meta`), or are answered `401`
+  before their body is read. `OPTIONS` needs no token.
+- YARA rules can import the `pe` and `elf` modules.
+
+### Changed
+
+- The `yara` feature builds for musl, into a static binary, given a musl C compiler
+  (`CC_x86_64_unknown_linux_musl=musl-gcc`); CI builds it and runs it on a bare Debian.
+- The start-up warning now names ICAP endpoints without a token, and leaves out TLS
+  endpoints that ask for client certificates.
+
 ## 0.4.1
 
 ### Fixed

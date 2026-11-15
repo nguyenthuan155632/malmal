@@ -249,9 +249,9 @@ of a Unix socket.
 malmald --socket /run/malmal.sock --http 127.0.0.1:8080 --clamd 127.0.0.1:3310 --icap 127.0.0.1:1344 --require-sandbox
 ```
 
-It has no TLS. Bind it to the loopback interface or a Unix socket, and let only the upload
-service reach it. Where the HTTP endpoint has to be reachable from other hosts, give it a
-token:
+Bind the plain endpoints to the loopback interface or a Unix socket, and let only the
+upload service reach them. Where the HTTP endpoint has to be reachable from other hosts,
+give it a token, and TLS so that the token does not cross the network in clear:
 
 ```bash
 head -c 32 /dev/urandom | base64 > /etc/malmal/token
@@ -262,9 +262,32 @@ curl -H "Authorization: Bearer $(cat /etc/malmal/token)" --data-binary @upload.p
 
 Every request but `GET /healthz` then needs the header, and is answered `401` before its
 body is read without it. The token is the first line of the file, at least 16 characters.
-The ClamAV and ICAP protocols have no place for a token; keep them on loopback, a Unix
-socket or a private network. At start-up the daemon warns about each endpoint that is not on
-loopback and that anyone who reaches it can use.
+ICAP takes the same token on `REQMOD` and `RESPMOD` (see [ICAP](#icap)); `OPTIONS` needs
+none.
+
+The same three protocols are served over TLS by `--https`, `--icaps` and `--clamd-tls`,
+with a PEM certificate chain and key:
+
+```bash
+malmald --https 10.0.0.5:8443 --token-file /etc/malmal/token \
+  --tls-cert /etc/malmal/cert.pem --tls-key /etc/malmal/key.pem
+curl --cacert ca.pem -H "Authorization: Bearer $(cat /etc/malmal/token)" \
+  --data-binary @upload.pdf https://10.0.0.5:8443/scan
+```
+
+`--tls-client-ca <FILE>` makes the clients of every TLS endpoint present a certificate
+signed by a CA in `FILE`; the handshake fails without one. The ClamAV protocol has no place
+for a token, so from another host this is how it is authenticated, with a TLS proxy such as
+`stunnel` in front of a client that speaks plain `clamd`:
+
+```bash
+malmald --clamd-tls 10.0.0.5:3310 --tls-cert cert.pem --tls-key key.pem --tls-client-ca clients.pem
+```
+
+On the same host, a Unix socket does it: every endpoint takes a path, and the socket is
+created with mode `0660`. The certificates are read once at start-up, before the sandbox
+closes the file system; a renewed certificate needs a restart. At start-up the daemon warns
+about each endpoint that is not on loopback and that anyone who reaches it can use.
 
 ### HTTP
 
@@ -362,6 +385,16 @@ adaptation_access malmal_resp allow downloads
 
 `bypass=off` is what keeps this fail-closed: with it, Squid refuses the request when the
 daemon cannot be reached.
+
+With `--token-file`, Squid sends the token as an ICAP header; over the network, use
+`--icaps` and an `icaps://` service as well:
+
+```
+icap_service malmal_req reqmod_precache icaps://10.0.0.5:11344/scan bypass=off tls-cafile=/etc/squid/malmal-ca.pem
+adaptation_meta Authorization "Bearer <token>"
+```
+
+A request without the token is answered `401 Unauthorized`, and its body is not read.
 
 What is judged is a file, not an HTTP message:
 

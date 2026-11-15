@@ -38,9 +38,14 @@ yara-x = { version = "1.23.0", default-features = false, optional = true, featur
     "exact-atoms",
     "fast-regexp",
     "hash-module",
+    "elf-module",
     "math-module",
+    "pe-module",
     "string-module",
 ] }
+# The `pe` module of `yara-x` 1.23 uses `rsa::Pkcs1v15Sign`, which `rsa`
+# 0.10.0 puts behind a feature `yara-x` does not turn on.
+rsa = { version = "0.10.0", default-features = false, features = ["pkcs1v15"], optional = true }
 jxl-oxide = { version = "0.12", default-features = false, features = ["image"], optional = true }
 svg-hush = { version = "0.9", optional = true }
 hayro = { version = "0.9", optional = true }
@@ -48,7 +53,7 @@ hayro = { version = "0.9", optional = true }
 [features]
 # YARA rule matching. Off by default: it adds a WebAssembly runtime and
 # several megabytes to the binary.
-yara = ["dep:yara-x"]
+yara = ["dep:yara-x", "dep:rsa"]
 # Rebuilding raster images from their pixels (`malmal::cdr`). Off by
 # default: it adds the decoders and encoders of the `image` crate, which
 # already depends on the others.

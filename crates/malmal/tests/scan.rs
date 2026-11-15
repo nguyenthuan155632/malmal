@@ -589,3 +589,35 @@ fn yara_rules_add_findings() {
 
     assert!(malmal::YaraRules::compile(["rule broken {"]).is_err());
 }
+
+/// Rules can use the `pe` and `elf` modules, which look at the structure
+/// of an executable rather than its bytes.
+#[cfg(feature = "yara")]
+#[test]
+fn yara_rules_can_use_the_executable_modules() {
+    let rules = malmal::YaraRules::compile([
+        r#"import "elf" rule elf_executable { condition: elf.type == elf.ET_EXEC }"#,
+        r#"import "pe" rule pe_file { condition: pe.is_pe }"#,
+    ])
+    .unwrap();
+    let scanner = Scanner::builder().yara(rules).build();
+    let mut elf = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0".to_vec();
+    // e_type = ET_EXEC, then the rest of a 64-byte header.
+    elf.extend_from_slice(&[2, 0, 0x3e, 0]);
+    elf.resize(64, 0);
+    let report = scanner.scan_bytes(&elf, ScanHints::default());
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.code == "yara.match" && f.message.contains("elf_executable")),
+        "{:?}",
+        report.findings
+    );
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.message.contains("pe_file"))
+    );
+}

@@ -11,4 +11,6 @@ pub mod memory;
 pub mod options;
 pub mod sandbox;
 pub mod serve;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod watchdog;

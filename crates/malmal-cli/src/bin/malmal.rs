@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "cdr")]
 use std::fs::File;
 use std::io;
 use std::path::Path;

@@ -188,7 +188,7 @@ pub struct Service {
     spool: Option<Arc<Spool>>,
     /// What the bodies held at once may come to; without it, any amount.
     reserve: Option<Arc<Reserve>>,
-    /// The bearer token HTTP requests have to carry; without it, none.
+    /// The bearer token HTTP and ICAP requests have to carry; without it, none.
     token: Option<Vec<u8>>,
 }
 
@@ -205,8 +205,10 @@ impl Service {
         }
     }
 
-    /// Answer HTTP requests other than `GET /healthz` only when they carry
-    /// `Authorization: Bearer <token>`.
+    /// Answer HTTP requests other than `GET /healthz`, and ICAP requests
+    /// other than `OPTIONS`, only when they carry
+    /// `Authorization: Bearer <token>`. The ClamAV protocol has no place for
+    /// it, and the JSON protocol is on a Unix socket only.
     pub fn requiring_token(mut self, token: impl Into<Vec<u8>>) -> Self {
         self.token = Some(token.into());
         self

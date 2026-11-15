@@ -92,7 +92,9 @@ bundle add malmal-rails       # or bundle add malmal, outside Rails
 **From source:**
 
 ```bash
-cargo build --release --workspace --target x86_64-unknown-linux-musl
+sudo apt-get install musl-tools   # a C compiler for musl, for `ring` and, with YARA, `wasmtime`
+CC_x86_64_unknown_linux_musl=musl-gcc \
+  cargo build --release --workspace --target x86_64-unknown-linux-musl
 ```
 
 The sandbox is available on Linux only. On macOS, build without `--target`, and do not
@@ -341,13 +343,23 @@ malmald --http 127.0.0.1:8080 --socket /run/malmal.sock --require-sandbox
 | `--socket <PATH>` | JSON over a Unix socket | Local services; no HTTP overhead |
 | `--clamd <ADDR>` | ClamAV `clamd` protocol | Software that already calls ClamAV |
 | `--icap <ADDR>` | ICAP | Proxies such as Squid |
+| `--https`, `--clamd-tls`, `--icaps <ADDR>` | The same three over TLS | Endpoints other hosts reach |
 
-`ADDR` is `host:port` or the path of a Unix socket. The daemon has no TLS: bind it to
-loopback or a Unix socket, and let only your upload service reach it. On HTTP,
-`--token-file <FILE>` makes every request but `GET /healthz` carry
-`Authorization: Bearer <token>`, the first line of `FILE` (16 characters or more); without
-it the answer is `401`. The ClamAV and ICAP protocols carry no token. At start-up the
-daemon warns about every endpoint that is not on loopback and that anyone can use.
+`ADDR` is `host:port` or the path of a Unix socket (a TLS endpoint takes `host:port`
+only). Bind the plain endpoints to loopback or a Unix socket, and let only your upload
+service reach them.
+
+- `--token-file <FILE>` makes every HTTP request but `GET /healthz`, and every ICAP
+  `REQMOD` and `RESPMOD`, carry `Authorization: Bearer <token>`, the first line of `FILE`
+  (16 characters or more); without it the answer is `401`. Squid sends it with
+  `adaptation_meta Authorization "Bearer <token>"`.
+- `--tls-cert <FILE>` and `--tls-key <FILE>` (PEM) serve the TLS endpoints;
+  `--tls-client-ca <FILE>` also makes their clients present a certificate signed by one
+  of the CAs in `FILE`. That is the way to authenticate the ClamAV protocol, which has no
+  place for a token, from another host; on the same host, a Unix socket (mode `0660`) is.
+
+At start-up the daemon warns about every endpoint that is not on loopback and that anyone
+who reaches it can use.
 
 **HTTP.** The request body is the file itself, not a multipart form. Any status other than
 `200` means the file was not scanned.
@@ -417,6 +429,7 @@ Status codes, metrics and protocol details are in
 |---|---|---|---|---|
 | `--policy default\|strict\|documents` | `default` | `Policy::strict()`, `Policy::documents()` | `strict=True` | `strict` |
 | `--token-file <FILE>` (`malmald`) | none | | | |
+| `--tls-cert`, `--tls-key`, `--tls-client-ca <FILE>` (`malmald`) | none | | | |
 | `--types <LIST>` | all types | `Policy::with_allowed_types` | | |
 | `--allow <CODES>` | none | `Policy::allow` | `allow=` | `allow` |
 | `--hashlist <FILE>` | none | `ScannerBuilder::hashlist` | `hashlist=` | `hashlist` |
@@ -553,8 +566,9 @@ malmal scan --hashlist blocklist.txt upload.png
 ```
 
 YARA rules are matched against every file and every file embedded in a PDF. They need a
-build with the `yara` feature, which makes the binary about 16 MB and cannot be built
-for musl:
+build with the `yara` feature, which makes the binary about 16 MB; for a static musl
+binary, build it as above with `--features yara`. Rules can import the `hash`, `math`,
+`string`, `pe` and `elf` modules:
 
 ```bash
 cargo install malmal-cli --features yara
@@ -741,7 +755,9 @@ goes to the SHA-256 hash; `--no-hash` skips it when you do not need it.
   between steps. `Scanner::scan_within` answers in time anyway, with `limit.time`, but
   leaves the scan running on its thread (at most `MAX_OVERDUE` of them); only the
   command-line tools end such a scan, with `--hard-timeout`.
-- **The daemon has no TLS**, and authenticates HTTP requests only, with `--token-file`.
+- **The ClamAV protocol has no token.** From other hosts, authenticate it with
+  `--clamd-tls` and `--tls-client-ca`. TLS certificates are read at start-up; a renewed
+  certificate needs a restart.
 - **Slow clients are let go, not refused.** A request that arrives at `--min-rate` or
   faster keeps its connection and the part of `--file-budget` it has sent, however long it
   takes; enough such clients fill `--connections` or the budget, and the others wait. They

@@ -6,7 +6,7 @@
 # then open http://127.0.0.1:3000.
 services:
   malmald:
-    image: ghcr.io/nguyenthuan155632/malmal:0.4.1
+    image: ghcr.io/nguyenthuan155632/malmal:0.4.2
     # The scanning options of config/initializers/malmal.rb, as flags.
     command: ["--http", "0.0.0.0:8080", "--token-file", "/run/secrets/token",
               "--policy", "documents", "--types", "pdf,jpeg,png,gif,webp", "--max-size", "20971520"]

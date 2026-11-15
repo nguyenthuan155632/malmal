@@ -396,6 +396,11 @@ fn block(writer: impl Write, reason: &Blocked) -> io::Result<()> {
 
 /// Serve `OPTIONS`, `REQMOD` and `RESPMOD` on one connection, which may
 /// carry any number of requests. The service path is not looked at.
+///
+/// With [`Service::requiring_token`], `REQMOD` and `RESPMOD` have to carry
+/// `Authorization: Bearer <token>` among their ICAP headers (Squid sends it
+/// with `adaptation_meta`), or are answered `401` before their body is read
+/// and the connection is closed. `OPTIONS` needs no token.
 pub fn icap(
     reader: &mut (impl BufRead + Pace),
     mut writer: impl Write,
@@ -454,6 +459,10 @@ pub fn icap(
             "RESPMOD" => false,
             _ => return refuse(writer, "405 Method Not Allowed"),
         };
+        // A body may follow that is not read, so the connection ends.
+        if !service.authorized(header("authorization")) {
+            return refuse(writer, "401 Unauthorized");
+        }
         let Some(encapsulated) = header("encapsulated").and_then(Encapsulated::parse) else {
             return refuse(writer, "400 Bad Request");
         };
@@ -605,6 +614,30 @@ mod tests {
         for line in ["Methods: REQMOD, RESPMOD", "Allow: 204", "ISTag: \"malmal-"] {
             assert!(reply.contains(line), "{reply}");
         }
+    }
+
+    #[test]
+    fn asks_for_the_token_before_reading_the_body() {
+        let service = service().requiring_token("0123456789abcdef");
+        let options = run(&service, b"OPTIONS icap://localhost/scan ICAP/1.0\r\n\r\n");
+        assert!(options.starts_with("ICAP/1.0 200 OK\r\n"), "{options}");
+        for wrong in ["", "Authorization: Bearer 0123456789abcdeX\r\n"] {
+            let mut input = upload(wrong, "image/gif", GIF);
+            input.extend(upload(ALLOW, "image/gif", GIF));
+            let reply = run(&service, &input);
+            assert!(
+                reply.starts_with("ICAP/1.0 401 Unauthorized\r\n"),
+                "{reply}"
+            );
+            // Nothing after the refusal is answered.
+            assert_eq!(reply.matches("ICAP/1.0").count(), 1, "{reply}");
+        }
+        let right = format!("{ALLOW}Authorization: Bearer 0123456789abcdef\r\n");
+        let reply = run(&service, &upload(&right, "image/gif", GIF));
+        assert!(
+            reply.starts_with("ICAP/1.0 204 No Modifications\r\n"),
+            "{reply}"
+        );
     }
 
     #[test]

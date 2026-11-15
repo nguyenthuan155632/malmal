@@ -23,16 +23,25 @@ use malmal_cli::sandbox;
 use malmal_cli::serve::{self, Pace, Service, Slots};
 
 const USAGE: &str = "\
-Usage: malmald (--socket <PATH> | --http <ADDR> | --clamd <ADDR> | --icap <ADDR>)...
-               [OPTIONS]
+Usage: malmald (--socket <PATH> | --http <ADDR> | --clamd <ADDR> | --icap <ADDR> |
+                --https <ADDR> | --clamd-tls <ADDR> | --icaps <ADDR>)... [OPTIONS]
 
-An ADDR is host:port, or the path of a Unix socket.
+An ADDR is host:port, or the path of a Unix socket; a TLS endpoint takes
+host:port only.
 
 Options:
   --socket <PATH>      Unix socket for the JSON protocol (created with mode 0660)
   --http <ADDR>        HTTP: POST /scan, GET /metrics, GET /healthz
   --clamd <ADDR>       ClamAV daemon protocol (PING, VERSION, INSTREAM)
   --icap <ADDR>        ICAP for proxies (OPTIONS, REQMOD, RESPMOD)
+  --https <ADDR>, --clamd-tls <ADDR>, --icaps <ADDR>
+                       The same three protocols over TLS; they need
+                       --tls-cert and --tls-key
+  --tls-cert <FILE>    The server's certificate chain, PEM
+  --tls-key <FILE>     Its private key, PEM
+  --tls-client-ca <FILE>
+                       Accept on the TLS endpoints only clients with a
+                       certificate signed by a CA in FILE (PEM)
   --workers <N>        Files scanned at once [default: 4]
   --connections <N>    Connections kept open at once [default: 256]
   --file-budget <BYTES>
@@ -47,9 +56,10 @@ Options:
                        while they are scanned, and not in memory; DIR must
                        be on a disk [default: every file in memory]
   --token-file <FILE>  Require `Authorization: Bearer <token>` on HTTP requests
-                       other than GET /healthz; the token is the first line of
-                       FILE, at least 16 characters. The ClamAV and ICAP
-                       protocols carry no token";
+                       other than GET /healthz, and on ICAP REQMOD and RESPMOD;
+                       the token is the first line of FILE, at least 16
+                       characters. The ClamAV protocol carries no token: give
+                       it --clamd-tls with --tls-client-ca, or a Unix socket";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Protocol {
@@ -70,8 +80,22 @@ impl Protocol {
     }
 }
 
+/// Where a daemon listens, and whether over TLS.
+struct Endpoint {
+    protocol: Protocol,
+    address: String,
+    tls: bool,
+}
+
+#[cfg(feature = "tls")]
+type TlsConfig = malmal_cli::tls::Config;
+/// Without the `tls` feature, there is never a configuration.
+#[cfg(not(feature = "tls"))]
+#[derive(Clone)]
+enum TlsConfig {}
+
 struct Args {
-    endpoints: Vec<(Protocol, String)>,
+    endpoints: Vec<Endpoint>,
     workers: usize,
     connections: usize,
     file_budget: u64,
@@ -79,6 +103,9 @@ struct Args {
     min_rate: u64,
     spool_dir: Option<PathBuf>,
     token_file: Option<PathBuf>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    tls_client_ca: Option<PathBuf>,
     common: Common,
 }
 
@@ -98,14 +125,32 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut min_rate = 1024;
     let mut spool_dir = None;
     let mut token_file = None;
+    let (mut tls_cert, mut tls_key, mut tls_client_ca) = (None, None, None);
     let mut common = Common::default();
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
         match arg.as_str() {
-            "--socket" => endpoints.push((Protocol::Json, value("--socket")?)),
-            "--http" => endpoints.push((Protocol::Http, value("--http")?)),
-            "--clamd" => endpoints.push((Protocol::Clamd, value("--clamd")?)),
-            "--icap" => endpoints.push((Protocol::Icap, value("--icap")?)),
+            "--socket" | "--http" | "--clamd" | "--icap" | "--https" | "--clamd-tls"
+            | "--icaps" => {
+                let (protocol, tls) = match arg.as_str() {
+                    "--socket" => (Protocol::Json, false),
+                    "--http" => (Protocol::Http, false),
+                    "--clamd" => (Protocol::Clamd, false),
+                    "--icap" => (Protocol::Icap, false),
+                    "--https" => (Protocol::Http, true),
+                    "--clamd-tls" => (Protocol::Clamd, true),
+                    _ => (Protocol::Icap, true),
+                };
+                let address = value(&arg)?;
+                if tls && address.contains('/') {
+                    return Err(format!("{arg} needs host:port, not a Unix socket"));
+                }
+                endpoints.push(Endpoint {
+                    protocol,
+                    address,
+                    tls,
+                });
+            }
             "--workers" => {
                 workers = value("--workers")?
                     .parse()
@@ -143,6 +188,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             }
             "--spool-dir" => spool_dir = Some(PathBuf::from(value("--spool-dir")?)),
             "--token-file" => token_file = Some(PathBuf::from(value("--token-file")?)),
+            "--tls-cert" => tls_cert = Some(PathBuf::from(value("--tls-cert")?)),
+            "--tls-key" => tls_key = Some(PathBuf::from(value("--tls-key")?)),
+            "--tls-client-ca" => tls_client_ca = Some(PathBuf::from(value("--tls-client-ca")?)),
             other => {
                 if !common.parse(other, &mut args)? {
                     return Err(format!("unknown option {other:?}"));
@@ -151,7 +199,25 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         }
     }
     if endpoints.is_empty() {
-        return Err("one of --socket, --http, --clamd or --icap is required".into());
+        return Err(
+            "one of --socket, --http, --clamd, --icap, --https, --clamd-tls or --icaps \
+             is required"
+                .into(),
+        );
+    }
+    let tls = endpoints.iter().any(|endpoint| endpoint.tls);
+    if tls && (tls_cert.is_none() || tls_key.is_none()) {
+        return Err("--https, --clamd-tls and --icaps need --tls-cert and --tls-key".into());
+    }
+    if !tls && (tls_cert.is_some() || tls_key.is_some() || tls_client_ca.is_some()) {
+        return Err(
+            "--tls-cert, --tls-key and --tls-client-ca are for --https, --clamd-tls \
+             and --icaps"
+                .into(),
+        );
+    }
+    if tls && cfg!(not(feature = "tls")) {
+        return Err("this malmald was built without the tls feature".into());
     }
     let max_size = common.limits.max_file_size;
     let file_budget = file_budget.unwrap_or(max_size.saturating_mul(workers as u64));
@@ -168,6 +234,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         min_rate,
         spool_dir,
         token_file,
+        tls_cert,
+        tls_key,
+        tls_client_ca,
         common,
     })
 }
@@ -180,6 +249,8 @@ enum Listener {
 enum Stream {
     Unix(UnixStream),
     Tcp(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(Box<malmal_cli::tls::Stream>),
 }
 
 impl Listener {
@@ -202,10 +273,19 @@ impl Listener {
         Ok((Self::Unix(listener), address.to_string()))
     }
 
-    fn accept(&self) -> io::Result<Stream> {
-        Ok(match self {
-            Self::Unix(listener) => Stream::Unix(listener.accept()?.0),
-            Self::Tcp(listener) => Stream::Tcp(listener.accept()?.0),
+    /// With `tls`, a TCP connection is wrapped; its handshake is left to
+    /// the thread that serves it.
+    fn accept(&self, tls: Option<&TlsConfig>) -> io::Result<Stream> {
+        Ok(match (self, tls) {
+            (Self::Unix(listener), _) => Stream::Unix(listener.accept()?.0),
+            (Self::Tcp(listener), None) => Stream::Tcp(listener.accept()?.0),
+            #[cfg(feature = "tls")]
+            (Self::Tcp(listener), Some(config)) => {
+                let stream = malmal_cli::tls::Stream::new(config, listener.accept()?.0)?;
+                Stream::Tls(Box::new(stream))
+            }
+            #[cfg(not(feature = "tls"))]
+            (Self::Tcp(_), Some(never)) => match *never {},
         })
     }
 }
@@ -217,14 +297,29 @@ impl Stream {
                 stream.set_read_timeout(Some(timeout))?;
                 stream.set_write_timeout(Some(timeout))
             }
-            Self::Tcp(stream) => {
-                // Replies are small and written whole; do not wait to batch them.
-                stream.set_nodelay(true)?;
-                stream.set_read_timeout(Some(timeout))?;
-                stream.set_write_timeout(Some(timeout))
+            Self::Tcp(stream) => tcp_timeout(stream, timeout),
+            #[cfg(feature = "tls")]
+            Self::Tls(stream) => {
+                tcp_timeout(&stream.socket(), timeout)?;
+                stream.handshake(timeout)
             }
         }
     }
+
+    /// End the connection; over TLS, with `close_notify`.
+    fn close(&self) {
+        #[cfg(feature = "tls")]
+        if let Self::Tls(stream) = self {
+            stream.close();
+        }
+    }
+}
+
+fn tcp_timeout(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
+    // Replies are small and written whole; do not wait to batch them.
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))
 }
 
 impl Read for &Stream {
@@ -232,6 +327,8 @@ impl Read for &Stream {
         match self {
             Stream::Unix(stream) => (&*stream).read(buffer),
             Stream::Tcp(stream) => (&*stream).read(buffer),
+            #[cfg(feature = "tls")]
+            Stream::Tls(stream) => (&**stream).read(buffer),
         }
     }
 }
@@ -241,6 +338,8 @@ impl Write for &Stream {
         match self {
             Stream::Unix(stream) => (&*stream).write(buffer),
             Stream::Tcp(stream) => (&*stream).write(buffer),
+            #[cfg(feature = "tls")]
+            Stream::Tls(stream) => (&**stream).write(buffer),
         }
     }
 
@@ -248,6 +347,8 @@ impl Write for &Stream {
         match self {
             Stream::Unix(stream) => (&*stream).flush(),
             Stream::Tcp(stream) => (&*stream).flush(),
+            #[cfg(feature = "tls")]
+            Stream::Tls(stream) => (&**stream).flush(),
         }
     }
 }
@@ -327,6 +428,28 @@ impl Pace for Paced<'_> {
     }
 }
 
+/// The configuration of the TLS endpoints, read before the sandbox closes
+/// the file system; none without them.
+#[cfg(feature = "tls")]
+fn tls_config(args: &Args) -> Result<Option<TlsConfig>, String> {
+    let (Some(certificate), Some(key)) = (&args.tls_cert, &args.tls_key) else {
+        return Ok(None);
+    };
+    let files = malmal_cli::tls::Files {
+        certificate,
+        key,
+        client_ca: args.tls_client_ca.as_deref(),
+    };
+    malmal_cli::tls::server_config(&files).map(Some)
+}
+
+/// `parse_args` refuses the TLS options in this build.
+#[cfg(not(feature = "tls"))]
+fn tls_config(args: &Args) -> Result<Option<TlsConfig>, String> {
+    let _ = (&args.tls_cert, &args.tls_key);
+    Ok(None)
+}
+
 /// The first line of a token file, without the spaces around it.
 fn read_token(path: &Path) -> Result<String, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -340,22 +463,25 @@ fn read_token(path: &Path) -> Result<String, String> {
     Ok(token.to_string())
 }
 
-/// A warning for an endpoint that anyone who can reach the host may use.
-fn exposure(protocol: Protocol, bound: &str, token: bool) -> Option<String> {
+/// A warning for an endpoint that anyone who can reach the host may use:
+/// one that is not on loopback, asks for no client certificate and, for
+/// HTTP and ICAP, has no token.
+fn exposure(endpoint: &Endpoint, bound: &str, token: bool, client_ca: bool) -> Option<String> {
     let address: std::net::SocketAddr = bound.parse().ok()?;
-    if address.ip().is_loopback() {
+    if address.ip().is_loopback() || (endpoint.tls && client_ca) {
         return None;
     }
-    match protocol {
-        Protocol::Http if token => None,
-        Protocol::Http => Some(format!(
-            "{bound} (http) is not on loopback and has no --token-file; \
+    let name = endpoint.protocol.name();
+    match endpoint.protocol {
+        Protocol::Http | Protocol::Icap if token => None,
+        Protocol::Http | Protocol::Icap => Some(format!(
+            "{bound} ({name}) is not on loopback and has no --token-file; \
              anyone who can reach it can use it"
         )),
         _ => Some(format!(
-            "{bound} ({}) is not on loopback, and its protocol has no authentication; \
-             publish it to the upload service only",
-            protocol.name()
+            "{bound} ({name}) is not on loopback, and its protocol has no token; \
+             publish it to the upload service only, or use --clamd-tls with \
+             --tls-client-ca"
         )),
     }
 }
@@ -365,6 +491,17 @@ fn serve(stream: &Stream, protocol: Protocol, service: &Service, timeout: Durati
     if stream.set_timeout(timeout).is_err() {
         return;
     }
+    serve_requests(stream, protocol, service, timeout, min_rate);
+    stream.close();
+}
+
+fn serve_requests(
+    stream: &Stream,
+    protocol: Protocol,
+    service: &Service,
+    timeout: Duration,
+    min_rate: u64,
+) {
     let clock = Clock {
         grace: timeout,
         min_rate,
@@ -393,6 +530,7 @@ fn serve(stream: &Stream, protocol: Protocol, service: &Service, timeout: Durati
 fn accept(
     listener: Listener,
     protocol: Protocol,
+    tls: Option<TlsConfig>,
     service: Arc<Service>,
     connections: Arc<Slots>,
     timeout: Duration,
@@ -400,7 +538,7 @@ fn accept(
 ) {
     loop {
         let place = connections.take();
-        let Ok(stream) = listener.accept() else {
+        let Ok(stream) = listener.accept(tls.as_ref()) else {
             // Out of descriptors, most likely; they come back as connections end.
             thread::sleep(Duration::from_millis(50));
             continue;
@@ -428,15 +566,22 @@ fn main() -> ExitCode {
         }
     };
     let mut listeners = Vec::new();
-    for (protocol, address) in &args.endpoints {
-        match Listener::bind(*protocol, address) {
-            Ok((listener, bound)) => listeners.push((*protocol, listener, bound)),
+    for endpoint in &args.endpoints {
+        match Listener::bind(endpoint.protocol, &endpoint.address) {
+            Ok((listener, bound)) => listeners.push((endpoint, listener, bound)),
             Err(error) => {
-                eprintln!("malmald: {address}: {error}");
+                eprintln!("malmald: {}: {error}", endpoint.address);
                 return ExitCode::FAILURE;
             }
         }
     }
+    let tls = match tls_config(&args) {
+        Ok(tls) => tls,
+        Err(message) => {
+            eprintln!("malmald: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
     let token = match args.token_file.as_deref().map(read_token).transpose() {
         Ok(token) => token,
         Err(message) => {
@@ -444,8 +589,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    for (protocol, _, bound) in &listeners {
-        if let Some(warning) = exposure(*protocol, bound, token.is_some()) {
+    let client_ca = args.tls_client_ca.is_some();
+    for (endpoint, _, bound) in &listeners {
+        if let Some(warning) = exposure(endpoint, bound, token.is_some(), client_ca) {
             eprintln!("malmald: warning: {warning}");
         }
     }
@@ -479,7 +625,10 @@ fn main() -> ExitCode {
         Ok(status) => {
             let endpoints: Vec<String> = listeners
                 .iter()
-                .map(|(protocol, _, bound)| format!("{bound} ({})", protocol.name()))
+                .map(|(endpoint, _, bound)| {
+                    let tls = if endpoint.tls { ", tls" } else { "" };
+                    format!("{bound} ({}{tls})", endpoint.protocol.name())
+                })
                 .collect();
             eprintln!(
                 "malmald: listening on {} (sandbox: file system {}, system calls {})",
@@ -508,11 +657,20 @@ fn main() -> ExitCode {
     let service = Arc::new(service.at_once(args.workers).holding(reserve));
     let connections = Slots::new(args.connections);
     let mut handles = Vec::new();
-    for (protocol, listener, _) in listeners {
+    for (endpoint, listener, _) in listeners {
         let (service, connections) = (Arc::clone(&service), Arc::clone(&connections));
         let (timeout, min_rate) = (args.timeout, args.min_rate);
+        let (protocol, tls) = (endpoint.protocol, tls.clone().filter(|_| endpoint.tls));
         handles.push(thread::spawn(move || {
-            accept(listener, protocol, service, connections, timeout, min_rate)
+            accept(
+                listener,
+                protocol,
+                tls,
+                service,
+                connections,
+                timeout,
+                min_rate,
+            )
         }));
     }
     for handle in handles {

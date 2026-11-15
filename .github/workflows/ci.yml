@@ -24,8 +24,13 @@ jobs:
       - run: cargo test --workspace
       - name: Known-good files must come back clean
         run: cargo run --release -p malmal --example survey -- --expect-clean tests/corpus/clean
+      # `ring` (TLS in the daemon) and `wasmtime` (YARA) compile C code.
+      - name: Install a musl C compiler
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build static binaries
         run: cargo build --release --workspace --target x86_64-unknown-linux-musl
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
       - name: Binaries must not link dynamically
         run: |
           for binary in malmal malmald; do
@@ -136,8 +141,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test -p malmal -p malmal-cli --features malmal/yara,malmal-cli/yara
+      - name: Install a musl C compiler
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: The YARA build is static too
+        run: |
+          cargo build --release -p malmal-cli --features yara --target x86_64-unknown-linux-musl
+          release=target/x86_64-unknown-linux-musl/release
+          file $release/malmal | grep -E 'static(ally|-pie) linked'
+          mkdir rules && echo 'rule Marker { strings: $a = "MALMAL-YARA-MARKER" condition: $a }' > rules/marker.yar
+          printf 'GIF89a MALMAL-YARA-MARKER' > marker.gif
+          docker run --rm -v "$PWD:/w:ro" debian:stable-slim /w/$release/malmal scan --yara /w/rules /w/marker.gif \
+            | grep 'yara.match'
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
 
   fuzz:
     runs-on: ubuntu-latest

@@ -212,13 +212,17 @@ A milestone is done when `cargo test` is green, `cargo clippy -- -D warnings` is
 
 ### M6 — YARA and packaging
 
-> **Status: done, except YARA on musl.** The stated risk came true: `yara-x` does not build
-> for musl (the `wasmtime` build script fails), so the YARA build exists only dynamically
-> linked against glibc; the `pe`/`elf` modules also had to be disabled because they failed to
-> compile. Differs from the description below: `malmal.h` is hand-written instead of generated
+> **Status: done.** YARA builds for musl into a static binary: the `wasmtime` build script
+> that failed did so for want of a musl C compiler, not because of musl; with `musl-tools`
+> and `CC_x86_64_unknown_linux_musl=musl-gcc`, CI builds it and runs a rule on a bare
+> `debian:stable-slim`. The `pe`/`elf` modules failed to compile because `yara-x` 1.23 uses
+> `rsa::Pkcs1v15Sign`, which `rsa` 0.10.0 puts behind its `pkcs1v15` feature; `malmal`
+> turns that feature on, and both modules are on. Differs from the description below: `malmal.h` is hand-written instead of generated
 > by `cbindgen`; the daemon lives in the `malmal-cli` crate (the `malmald` binary) instead of
-> its own crate; seccomp is a denylist, not an allowlist; the memory limit is a 4 GB
-> `RLIMIT_AS`, and there is no `RLIMIT_CPU`.
+> its own crate; seccomp is a denylist, not an allowlist (an allowlist breaks with each libc
+> and allocator that adds a call); the memory limit is a 4 GB `RLIMIT_AS`, and there is no
+> `RLIMIT_CPU`, which counts a daemon's whole life and would end it after enough scans: time
+> is bounded per scan by `--hard-timeout` instead.
 > Verified on a bare Debian 13: the CLI, the daemon and the C example all run with
 > `--require-sandbox`.
 - `yara.rs` behind the `yara` feature: load a rule directory, each match becomes `yara.match`. Check early that `yara-x` builds with musl — this is the project's largest technical risk; if it does not, the YARA build will be a partly static glibc build.
@@ -480,8 +484,16 @@ Taken from a comparison with quelda (github.com/tranhuucanh/quelda), a PDF scann
       can use. ClamAV and ICAP have no place for a token.
 - [x] `Scanner::scan_within`: the scan on a thread of its own, `limit.time` when it is
       late, at most `MAX_OVERDUE` scans left running, then every file refused at once.
-- [ ] Not done: a token for ICAP and clamd; `scan_within` in the C and Python interfaces;
-      TLS.
+- [x] The token on ICAP too: `REQMOD` and `RESPMOD` carry `Authorization: Bearer`
+      (Squid: `adaptation_meta`), `401` before the body is read; `OPTIONS` needs none.
+      The ClamAV protocol has no place for one; it is authenticated by client
+      certificates (`--clamd-tls` with `--tls-client-ca`) or a Unix socket.
+- [x] `scan_within` in the C and Python interfaces: the `wait` option of
+      `malmal_scanner_new_json` and `Scanner(wait=)` (M15, step 1).
+- [x] TLS: `--https`, `--icaps`, `--clamd-tls` with `--tls-cert`/`--tls-key`, and
+      `--tls-client-ca` for client certificates; `rustls` on `ring`, the `tls` feature,
+      on by default. The handshake is bounded by `--timeout`; the certificates are read
+      before the sandbox, so a renewed one needs a restart.
 
 ### M15 — Ruby gem and Rails integration
 

@@ -53,7 +53,7 @@ A wheel from the [releases](https://github.com/nguyenthuan155632/malmal/releases
 the library, for x86-64 and ARM64 Linux with glibc 2.17 or newer:
 
 ```bash
-pip install malmal-0.4.1-py3-none-manylinux2014_x86_64.whl
+pip install malmal-0.4.2-py3-none-manylinux2014_x86_64.whl
 ```
 
 Such a wheel is built with `bindings/python/build_wheel.sh x86_64` (or `aarch64`), which

@@ -45,7 +45,13 @@ jobs:
             | jq -r '.packages[] | select(.name == "malmal") | .version')
           test "v$version" = "$GITHUB_REF_NAME"
       - run: cargo test --workspace --locked
+      # `ring`, for TLS in the daemon, compiles C code.
+      - name: Install a musl C compiler
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --locked --workspace --target ${{ matrix.target }}
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
       - name: Binaries must not link dynamically
         run: |
           for binary in malmal malmald; do

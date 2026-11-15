@@ -5,6 +5,8 @@
 #   docker run --rm -v "$PWD:/files:ro" --entrypoint /usr/local/bin/malmal malmal scan /files/upload.pdf
 
 FROM rust:1-alpine AS build
+# `ring`, for TLS in the daemon, compiles C against the musl headers.
+RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p malmal-cli
@@ -15,5 +17,6 @@ COPY --from=build /src/target/release/malmal /src/target/release/malmald /usr/lo
 USER 65534:65534
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/malmald"]
-# The daemon has no authentication: publish the port to the upload service only.
+# Without --token-file or --tls-client-ca anyone who reaches the port can use
+# the daemon: publish it to the upload service only.
 CMD ["--http", "0.0.0.0:8080"]

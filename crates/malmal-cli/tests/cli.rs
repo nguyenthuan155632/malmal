@@ -911,13 +911,20 @@ fn daemon_requires_the_token_it_is_given() {
 #[test]
 fn daemon_warns_about_endpoints_anyone_can_reach() {
     let mut child = Command::new(MALMALD)
-        .args(["--http", "0.0.0.0:0", "--clamd", "0.0.0.0:0"])
+        .args([
+            "--http",
+            "0.0.0.0:0",
+            "--clamd",
+            "0.0.0.0:0",
+            "--icap",
+            "0.0.0.0:0",
+        ])
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut stderr = BufReader::new(child.stderr.take().unwrap());
     let mut lines = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         let mut line = String::new();
         stderr.read_line(&mut line).unwrap();
         lines.push(line);
@@ -929,7 +936,196 @@ fn daemon_warns_about_endpoints_anyone_can_reach() {
         "{lines:?}"
     );
     assert!(lines[1].contains("(clamd) is not on loopback"), "{lines:?}");
-    assert!(lines[2].starts_with("malmald: listening on "), "{lines:?}");
+    assert!(
+        lines[2].contains("(icap) is not on loopback and has no --token-file"),
+        "{lines:?}"
+    );
+    assert!(lines[3].starts_with("malmald: listening on "), "{lines:?}");
+}
+
+/// The certificates in `tests/tls`, made with `openssl` to last a century:
+/// a CA, a server certificate for 127.0.0.1 and a client certificate it
+/// signed, and a client certificate it did not.
+fn tls_file(name: &str) -> String {
+    format!("{}/tests/tls/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
+#[cfg(feature = "tls")]
+/// A client that trusts the test CA and presents the certificate `client`.
+fn tls_client(client: Option<&str>) -> std::sync::Arc<rustls::ClientConfig> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_file(tls_file("ca.pem")).unwrap())
+        .unwrap();
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots);
+    let config = match client {
+        Some(name) => builder
+            .with_client_auth_cert(
+                vec![CertificateDer::from_pem_file(tls_file(&format!("{name}.pem"))).unwrap()],
+                PrivateKeyDer::from_pem_file(tls_file(&format!("{name}.key"))).unwrap(),
+            )
+            .unwrap(),
+        None => builder.with_no_client_auth(),
+    };
+    std::sync::Arc::new(config)
+}
+
+#[cfg(feature = "tls")]
+/// Send `request` over TLS and read the reply to the end.
+fn tls_exchange(address: &str, client: Option<&str>, request: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let socket = std::net::TcpStream::connect(address)?;
+    socket.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let server = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+    let connection = rustls::ClientConnection::new(tls_client(client), server).unwrap();
+    let mut stream = rustls::StreamOwned::new(connection, socket);
+    stream.write_all(request)?;
+    stream.flush()?;
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply)?;
+    Ok(reply)
+}
+
+#[cfg(feature = "tls")]
+/// Every address in the banner, in the order of the options.
+fn banner_addresses(child: &mut Child) -> Vec<String> {
+    let mut banner = String::new();
+    BufReader::new(child.stderr.take().unwrap())
+        .read_line(&mut banner)
+        .unwrap();
+    let endpoints = banner
+        .strip_prefix("malmald: listening on ")
+        .and_then(|rest| rest.split(" (sandbox").next())
+        .unwrap_or_else(|| panic!("unexpected banner {banner:?}"));
+    endpoints
+        .split("), ")
+        .map(|endpoint| endpoint.split(' ').next().unwrap().to_string())
+        .collect()
+}
+
+#[cfg(feature = "tls")]
+#[test]
+fn daemon_serves_tls() {
+    let (cert, key) = (tls_file("server.pem"), tls_file("server.key"));
+    let token = scratch("tls-token").join("token");
+    fs::write(&token, "s3cret-token-of-32-characters!!\n").unwrap();
+    let mut child = Command::new(MALMALD)
+        .args(["--https", "127.0.0.1:0", "--icaps", "127.0.0.1:0"])
+        .args(["--http", "127.0.0.1:0", "--timeout", "5"])
+        .args(["--tls-cert", &cert, "--tls-key", &key, "--token-file"])
+        .arg(&token)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let addresses = banner_addresses(&mut child);
+    let _daemon = Daemon(child);
+
+    let mut request = format!(
+        "POST /scan HTTP/1.1\r\nAuthorization: Bearer s3cret-token-of-32-characters!!\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        ELF.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(ELF);
+    let reply = String::from_utf8(tls_exchange(&addresses[0], None, &request).unwrap()).unwrap();
+    assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+    assert!(reply.contains(r#""verdict":"malicious""#), "{reply}");
+
+    let options = b"OPTIONS icap://localhost/scan ICAP/1.0\r\n\r\n";
+    let reply = tls_exchange(&addresses[1], None, options).unwrap();
+    assert!(reply.starts_with(b"ICAP/1.0 200 OK\r\n"));
+    let reqmod = b"REQMOD icap://localhost/scan ICAP/1.0\r\nEncapsulated: null-body=0\r\n\r\n";
+    let reply = tls_exchange(&addresses[1], None, reqmod).unwrap();
+    assert!(reply.starts_with(b"ICAP/1.0 401 Unauthorized\r\n"));
+
+    // The plain endpoint stays plain, and TLS spoken to it is not answered.
+    use std::io::Read;
+    let mut plain = std::net::TcpStream::connect(&addresses[2]).unwrap();
+    plain
+        .write_all(b"GET /healthz HTTP/1.1\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut reply = String::new();
+    plain.read_to_string(&mut reply).unwrap();
+    assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+    assert!(tls_exchange(&addresses[2], None, b"GET /healthz HTTP/1.1\r\n\r\n").is_err());
+}
+
+#[cfg(feature = "tls")]
+#[test]
+fn daemon_asks_tls_clients_for_a_certificate() {
+    let mut child = Command::new(MALMALD)
+        .args(["--clamd-tls", "0.0.0.0:0", "--timeout", "5"])
+        .args(["--tls-cert", &tls_file("server.pem")])
+        .args(["--tls-key", &tls_file("server.key")])
+        .args(["--tls-client-ca", &tls_file("ca.pem")])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // With client certificates the endpoint is not open to anyone, so the
+    // first line is the banner and not a warning.
+    let addresses = banner_addresses(&mut child);
+    let _daemon = Daemon(child);
+    let port = addresses[0].rsplit(':').next().unwrap();
+    let address = format!("127.0.0.1:{port}");
+
+    let mut instream = b"zINSTREAM\0".to_vec();
+    instream.extend_from_slice(&(ELF.len() as u32).to_be_bytes());
+    instream.extend_from_slice(ELF);
+    instream.extend_from_slice(&[0; 4]);
+    let reply = tls_exchange(&address, Some("client"), &instream).unwrap();
+    assert_eq!(reply, b"stream: Malmal.Malicious.type.executable FOUND\0");
+
+    for client in [None, Some("stranger")] {
+        let reply = tls_exchange(&address, client, &instream);
+        assert!(reply.is_err(), "{client:?}: {reply:?}");
+    }
+}
+
+#[test]
+fn daemon_refuses_tls_options_that_do_not_fit() {
+    let (cert, key) = (tls_file("server.pem"), tls_file("server.key"));
+    let cases: [&[&str]; 5] = [
+        &["--https", "127.0.0.1:0"],
+        &["--https", "127.0.0.1:0", "--tls-cert", &cert],
+        &[
+            "--http",
+            "127.0.0.1:0",
+            "--tls-cert",
+            &cert,
+            "--tls-key",
+            &key,
+        ],
+        &[
+            "--icaps",
+            "/tmp/malmal.sock",
+            "--tls-cert",
+            &cert,
+            "--tls-key",
+            &key,
+        ],
+        &[
+            "--https",
+            "127.0.0.1:0",
+            "--tls-cert",
+            &key,
+            "--tls-key",
+            &key,
+        ],
+    ];
+    for args in cases {
+        let output = Command::new(MALMALD).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(text.starts_with("malmald: "), "{args:?}: {text}");
+    }
 }
 
 #[test]
@@ -949,7 +1145,7 @@ fn daemon_needs_an_endpoint() {
     assert_eq!(output.status.code(), Some(1));
     let text = String::from_utf8(output.stderr).unwrap();
     assert!(
-        text.contains("--socket, --http, --clamd or --icap"),
+        text.contains("--socket, --http, --clamd, --icap, --https, --clamd-tls or --icaps"),
         "{text}"
     );
 }
