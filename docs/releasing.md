@@ -76,6 +76,11 @@ The workflow pushes with RubyGems' trusted publishing too, so no API key is stor
 
 As with the crates, check that neither name is already taken before the first release.
 
+The first push of a gem that does not exist yet has to name the account that will own it:
+the `rubygems` job passes `owner` (the account's ID, shown on its Pending Trusted
+Publishers page) when it exchanges the workflow's OIDC token for a key. Change `OWNER` in
+`release.yml` if another account is to own the gems.
+
 ### Container image
 
 Nothing to set up: the workflow pushes with its own token. The first image is private on
@@ -160,6 +165,13 @@ settings → Change visibility.
    - `docker run --rm ghcr.io/<owner>/malmal:0.3.0 --help` runs.
 
 ## When something fails
+
+If only `rubygems` failed or was skipped, push the gems attached to the release without
+building anything again:
+
+```bash
+gh workflow run release.yml -f tag=v0.4.0
+```
 
 The tag must equal the version in `Cargo.toml`, `pyproject.toml` and `version.rb`; the
 first step of `build`, `wheels` and `gems` fails otherwise.

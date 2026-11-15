@@ -5,15 +5,24 @@ name: Release
 # and publishes the crates when the CARGO_REGISTRY_TOKEN secret is set, the
 # wheels when the PYPI_PUBLISH variable is "true", and the gems when the
 # RUBYGEMS_PUBLISH variable is "true".
+#
+# Run by hand with a tag, it only pushes the gems attached to that release to
+# RubyGems, for when the rubygems job could not.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release whose gems to push to RubyGems, such as v0.4.0
+        required: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
+    if: github.event_name == 'push'
     strategy:
       matrix:
         include:
@@ -64,6 +73,7 @@ jobs:
           path: image
 
   wheels:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -98,6 +108,7 @@ jobs:
 
   # A malmal gem for each platform, carrying the library built for it.
   gems:
+    if: github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
@@ -161,6 +172,7 @@ jobs:
 
   # The malmal gem without a library, and malmal-rails.
   ruby-gems:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -264,7 +276,7 @@ jobs:
   # goes ahead when that one was skipped.
   pypi:
     needs: [wheels, crates]
-    if: ${{ !failure() && !cancelled() && vars.PYPI_PUBLISH == 'true' }}
+    if: ${{ github.event_name == 'push' && !failure() && !cancelled() && vars.PYPI_PUBLISH == 'true' }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -287,14 +299,36 @@ jobs:
       id-token: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: github.event_name == 'push'
         with:
           pattern: gem-*
           merge-multiple: true
           path: pkg
+      - name: Download the gems of the release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'malmal-*.gem' --dir pkg
       - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
         with:
           ruby-version: "3.4"
-      - uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
+      # The workflow's OIDC token for an API key that can push for 15 minutes.
+      # A gem that does not exist yet is created only for the account named
+      # as its owner, which rubygems/configure-rubygems-credentials cannot pass.
+      - name: Exchange the workflow's identity for a RubyGems key
+        env:
+          OWNER: "256103"
+        run: |
+          jwt=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=rubygems.org" | jq -r .value)
+          answer=$(jq -n --arg jwt "$jwt" --arg owner "$OWNER" '{jwt: $jwt, owner: $owner}' \
+            | curl -sS -X POST -H "Content-Type: application/json" --data @- \
+              https://rubygems.org/api/v1/oidc/trusted_publisher/exchange_token)
+          key=$(printf '%s' "$answer" | jq -r '.rubygems_api_key // empty')
+          if [ -z "$key" ]; then echo "RubyGems did not give a key: $answer" >&2; exit 1; fi
+          echo "::add-mask::$key"
+          echo "GEM_HOST_API_KEY=$key" >> "$GITHUB_ENV"
       - name: Push, the platform gems first and malmal-rails last
         run: |
           for gem in pkg/malmal-[0-9]*-*.gem pkg/malmal-[0-9]*[0-9].gem pkg/malmal-rails-*.gem; do
