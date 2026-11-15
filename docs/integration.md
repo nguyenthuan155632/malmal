@@ -7,7 +7,8 @@ error or no answer at all, means the file is not accepted.
 - [In a Rust service](#in-a-rust-service): link the crate.
 - [As a daemon](#as-a-daemon): any language, over a Unix socket, HTTP, the ClamAV protocol
   or ICAP.
-- [From C](#from-c) and [from Python](#from-python): link or load the library.
+- [From C](#from-c), [from Python](#from-python) and [from Ruby and Rails](#from-ruby-and-rails):
+  link or load the library.
 
 ## In a Rust service
 
@@ -584,6 +585,42 @@ else:
 Both exceptions are a `malmal.SanitizeError`. The wheels attached to a release carry the
 library for x86-64 and ARM64 Linux; building one, or using the package from a checkout, is
 described in `bindings/python/README.md`.
+
+## From Ruby and Rails
+
+The `malmal` gem loads the library with `ffi`; its platform gems carry it, for Linux with
+glibc or musl and for macOS. A scan releases the GVL, so one scanner serves every thread of
+a Puma worker:
+
+```ruby
+SCANNER = Malmal::Scanner.new(policy: :documents, wait: 30)
+report = SCANNER.scan(params[:file], filename: params[:file].original_filename)
+head :unprocessable_entity unless report.clean?
+```
+
+`Malmal::Client.new(url, token:)` answers the same calls from a running `malmald`, for the
+sandbox and `--hard-timeout`.
+
+In Rails, `malmal-rails` builds that scanner from `config.malmal` and puts it in front of
+Active Storage:
+
+```ruby
+class Document < ApplicationRecord
+  has_one_attached :file
+  validates :file, malmal: { policy: :documents }
+end
+```
+
+The validator scans what is being attached before it is uploaded, a blob already stored
+too (a direct upload), and adds `:malmal_suspicious`, `:malmal_malicious` or
+`:malmal_error` with the finding codes in `errors.details`. Direct uploads are stored
+before any validation, so every blob is also scanned when Active Storage analyzes it: the
+verdict goes to `blob.metadata["malmal"]`, and with `config.malmal.purge_unclean` a blob
+that is not clean is purged. `sanitizes_attachment :avatar` stores a rebuilt file in place
+of the upload. Scans are `scan.malmal` events of `ActiveSupport::Notifications`.
+
+[examples/rails](../examples/rails) is a small application with all of it, which runs in
+the process or beside `malmald`.
 
 ## In a container
 

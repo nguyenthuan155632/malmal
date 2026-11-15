@@ -12,6 +12,27 @@
   `pdf_jpeg`, `pdf_text`, `pdf_vector_text`). The older constructors stay.
 - Python: `Scanner(policy=, types=, limits=, without_hash=, wait=)`, `Scanner.overdue`,
   `Scanner.library_version`, and the rebuild options as keywords of `sanitize`.
+- Ruby: the `malmal` gem, on the `ffi` gem over `libmalmal_ffi`, which a scan runs with
+  the GVL released. `Malmal::Scanner` takes every option of the JSON constructor and
+  returns `Malmal::Report`; `#sanitize` returns `Malmal::Sanitized` or raises
+  `Malmal::Rejected` or `Malmal::NotRebuilt`. `Malmal::Client` does the same with a
+  running `malmald`, over HTTP with its token. Platform gems carry the library for
+  `x86_64-linux-gnu` and `aarch64-linux-gnu` (glibc 2.17), `x86_64-linux-musl` and
+  `aarch64-linux-musl`, `arm64-darwin` and `x86_64-darwin`; the `ruby` gem uses the library
+  at `MALMAL_LIBRARY`. Ruby 3.2 to 4.0, with RBS signatures.
+- Rails: the `malmal-rails` gem, for Rails 7.1 to 8.1. `config.malmal` builds one scanner
+  for the application, or a client of `malmald`. `validates :file, malmal: true` scans
+  Active Storage attachments before they are stored, signed ids of direct uploads too, and
+  adds `:malmal_suspicious`, `:malmal_malicious` or `:malmal_error` with the finding codes.
+  Every stored blob is scanned when it is analyzed, the verdict kept in
+  `blob.metadata["malmal"]`, and purged if it is not clean with
+  `config.malmal.purge_unclean`. `sanitizes_attachment` stores a rebuilt file in place of
+  the upload. Scans and rebuilds are `scan.malmal` and `sanitize.malmal` events; `bin/rails
+  generate malmal:install` writes the initializer. `examples/rails` is an application that
+  uses it, in the process or beside `malmald`.
+- The release workflow builds the gems, tests the installed ones on Linux (glibc and musl)
+  and macOS, attaches them to the release, and pushes them to RubyGems with trusted
+  publishing when the `RUBYGEMS_PUBLISH` variable is `true`.
 
 - `Policy::documents()` and `--policy documents`: the default policy with XFA forms and
   attachments allowed, for services that take documents from people. What they contain

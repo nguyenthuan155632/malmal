@@ -1,7 +1,7 @@
 <h1>Upload demo</h1>
 
 <h2>Document</h2>
-<p>Scanned with the <code>documents</code> policy and kept as it was if it is clean (PDF, JPEG or PNG).</p>
+<p>Scanned with the <code>documents</code> policy and kept as it was if it is clean (PDF, JPEG, PNG, GIF or WebP).</p>
 <%= form_with url: documents_path, multipart: true do |form| %>
   <%= form.file_field :file %>
   <%= form.submit "Upload" %>
