@@ -20,7 +20,7 @@ name = "malmald"
 path = "src/bin/malmald.rs"
 
 [dependencies]
-malmal = { path = "../malmal", version = "0.4.0" }
+malmal = { path = "../malmal", version = "0.4.1" }
 memchr = "2.8.3"
 memmap2 = "0.9"
 serde.workspace = true
