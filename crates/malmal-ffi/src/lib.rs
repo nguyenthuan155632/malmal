@@ -4,18 +4,19 @@
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use malmal::cdr::{Error, Options};
 use malmal::{HashList, MemoryLimit, Policy, ScanHints, Scanner};
 
 pub mod memory;
+mod options;
+
+use options::{DEFAULT_MAX_MEMORY, SanitizeOptions, ScannerOptions};
 
 #[global_allocator]
 static ALLOCATOR: memory::Counting = memory::Counting;
-
-/// What one scan may hold unless `malmal_scanner_set_max_memory` says
-/// otherwise: the default of the commands' `--max-memory`.
-const DEFAULT_MAX_MEMORY: u64 = 512 << 20;
 
 const MALMAL_CLEAN: c_int = 0;
 const MALMAL_ERROR: c_int = 3;
@@ -23,7 +24,84 @@ const MALMAL_NOT_REBUILT: c_int = 4;
 
 /// Opaque to C.
 #[allow(non_camel_case_types)]
-pub struct malmal_scanner(Scanner);
+pub struct malmal_scanner {
+    scanner: Scanner,
+    /// When set, `malmal_scan` answers within it (`Scanner::scan_within`).
+    wait: Option<Duration>,
+}
+
+impl malmal_scanner {
+    fn boxed(scanner: Scanner, wait: Option<Duration>) -> *mut Self {
+        Box::into_raw(Box::new(Self { scanner, wait }))
+    }
+}
+
+/// The version of this library, as a static NUL-terminated string.
+#[unsafe(no_mangle)]
+pub extern "C" fn malmal_version() -> *const c_char {
+    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr().cast()
+}
+
+/// Write `message` to `error`, if there is somewhere to write it.
+///
+/// # Safety
+/// `error` must be null or writable.
+unsafe fn report_error(error: *mut *mut c_char, message: &str) {
+    if !error.is_null() {
+        let message = CString::new(message.replace('\0', "")).unwrap_or_default();
+        // SAFETY: the caller guarantees `error` is writable.
+        unsafe { *error = message.into_raw() };
+    }
+}
+
+/// # Safety
+/// `options` must be null or NUL-terminated, and `error` null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn malmal_scanner_new_json(
+    options: *const c_char,
+    error: *mut *mut c_char,
+) -> *mut malmal_scanner {
+    if !error.is_null() {
+        // SAFETY: the caller guarantees `error` is writable.
+        unsafe { *error = ptr::null_mut() };
+    }
+    // SAFETY: the caller guarantees null or NUL-terminated.
+    let Some(json) = (unsafe { optional_utf8(options) }) else {
+        // SAFETY: as above.
+        unsafe { report_error(error, "the options are not UTF-8") };
+        return ptr::null_mut();
+    };
+    let built = catch_unwind(|| ScannerOptions::parse(&json)?.build());
+    match built {
+        Ok(Ok(built)) => {
+            let mut scanner = built.scanner;
+            scanner
+                .set_memory_limit((built.max_memory > 0).then(|| memory_limit(built.max_memory)));
+            malmal_scanner::boxed(scanner, built.wait)
+        }
+        Ok(Err(message)) => {
+            // SAFETY: the caller guarantees `error` is null or writable.
+            unsafe { report_error(error, &message) };
+            ptr::null_mut()
+        }
+        Err(_) => {
+            // SAFETY: as above.
+            unsafe { report_error(error, "the scanner could not be created") };
+            ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// `scanner` must be null or a live pointer from a `malmal_scanner_new*`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn malmal_scanner_overdue(scanner: *const malmal_scanner) -> u64 {
+    if scanner.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller guarantees a live scanner.
+    unsafe { (*scanner).scanner.overdue() as u64 }
+}
 
 /// # Safety
 /// `hashlist` must be null or point to `hashlist_len` readable bytes.
@@ -120,15 +198,12 @@ pub unsafe extern "C" fn malmal_scanner_new_with_allow(
         Ok::<_, String>(builder.pdf_passwords(passwords).build())
     });
     let message = match built {
-        Ok(Ok(scanner)) => return Box::into_raw(Box::new(malmal_scanner(scanner))),
+        Ok(Ok(scanner)) => return malmal_scanner::boxed(scanner, None),
         Ok(Err(message)) => message,
         Err(_) => "the scanner could not be created".to_string(),
     };
-    if !error.is_null() {
-        let message = CString::new(message.replace('\0', "")).unwrap_or_default();
-        // SAFETY: the caller guarantees `error` is writable.
-        unsafe { *error = message.into_raw() };
-    }
+    // SAFETY: the caller guarantees `error` is null or writable.
+    unsafe { report_error(error, &message) };
     ptr::null_mut()
 }
 
@@ -150,7 +225,7 @@ pub unsafe extern "C" fn malmal_scanner_set_max_memory(scanner: *mut malmal_scan
         return;
     }
     // SAFETY: the caller guarantees a live scanner that nothing else uses.
-    let scanner = unsafe { &mut (*scanner).0 };
+    let scanner = unsafe { &mut (*scanner).scanner };
     scanner.set_memory_limit((max > 0).then(|| memory_limit(max)));
 }
 
@@ -195,7 +270,10 @@ pub unsafe extern "C" fn malmal_scan(
             filename: filename.as_deref(),
             content_type: content_type.as_deref(),
         };
-        let report = scanner.scan_bytes(bytes, hints);
+        let report = match scanner.wait {
+            Some(wait) => scanner.scanner.scan_within(Arc::from(bytes), hints, wait),
+            None => scanner.scanner.scan_bytes(bytes, hints),
+        };
         let json = serde_json::to_string(&report).ok()?;
         Some((report.verdict as c_int, CString::new(json).ok()?))
     }));
@@ -226,6 +304,75 @@ pub unsafe extern "C" fn malmal_sanitize(
     image_len: *mut usize,
     info_json: *mut *mut c_char,
 ) -> c_int {
+    let mut options = Options::default();
+    if let Ok(quality @ 1..=100) = u8::try_from(jpeg_quality) {
+        options.jpeg_quality = quality;
+    }
+    // SAFETY: the caller's guarantees are the ones asked for there.
+    unsafe {
+        sanitize_with(
+            scanner,
+            data,
+            len,
+            filename,
+            content_type,
+            Ok(options),
+            image,
+            image_len,
+            info_json,
+        )
+    }
+}
+
+/// # Safety
+/// As for `malmal_sanitize`; `options` must be null or NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn malmal_sanitize_json(
+    scanner: *const malmal_scanner,
+    data: *const u8,
+    len: usize,
+    filename: *const c_char,
+    content_type: *const c_char,
+    options: *const c_char,
+    image: *mut *mut u8,
+    image_len: *mut usize,
+    info_json: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: the caller guarantees null or NUL-terminated.
+    let options = match unsafe { optional_utf8(options) } {
+        Some(json) => SanitizeOptions::parse(&json),
+        None => Err("the options are not UTF-8".to_string()),
+    };
+    // SAFETY: the caller's guarantees are the ones asked for there.
+    unsafe {
+        sanitize_with(
+            scanner,
+            data,
+            len,
+            filename,
+            content_type,
+            options,
+            image,
+            image_len,
+            info_json,
+        )
+    }
+}
+
+/// # Safety
+/// As for `malmal_sanitize`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn sanitize_with(
+    scanner: *const malmal_scanner,
+    data: *const u8,
+    len: usize,
+    filename: *const c_char,
+    content_type: *const c_char,
+    options: Result<Options, String>,
+    image: *mut *mut u8,
+    image_len: *mut usize,
+    info_json: *mut *mut c_char,
+) -> c_int {
     // SAFETY: the caller guarantees each is null or writable.
     unsafe {
         if !image.is_null() {
@@ -242,6 +389,19 @@ pub unsafe extern "C" fn malmal_sanitize(
     if image.is_null() || image_len.is_null() {
         return MALMAL_ERROR;
     }
+    let options = match options {
+        Ok(options) => options,
+        Err(message) => {
+            if !info_json.is_null() {
+                let info = serde_json::json!({ "error": message }).to_string();
+                if let Ok(info) = CString::new(info) {
+                    // SAFETY: the caller guarantees `info_json` is writable.
+                    unsafe { *info_json = info.into_raw() };
+                }
+            }
+            return MALMAL_ERROR;
+        }
+    };
     // SAFETY: the caller guarantees a live scanner and `len` readable bytes.
     let Some((scanner, bytes)) = (unsafe { input(scanner, data, len) }) else {
         return MALMAL_ERROR;
@@ -254,11 +414,7 @@ pub unsafe extern "C" fn malmal_sanitize(
             filename: filename.as_deref(),
             content_type: content_type.as_deref(),
         };
-        let mut options = Options::default();
-        if let Ok(quality @ 1..=100) = u8::try_from(jpeg_quality) {
-            options.jpeg_quality = quality;
-        }
-        let (status, rebuilt, info) = match scanner.sanitize(bytes, hints, &options) {
+        let (status, rebuilt, info) = match scanner.scanner.sanitize(bytes, hints, &options) {
             Ok(sanitized) => {
                 let info = serde_json::json!({
                     "report": sanitized.report,
@@ -345,12 +501,12 @@ unsafe fn input<'a>(
     scanner: *const malmal_scanner,
     data: *const u8,
     len: usize,
-) -> Option<(&'a Scanner, &'a [u8])> {
+) -> Option<(&'a malmal_scanner, &'a [u8])> {
     if scanner.is_null() || (data.is_null() && len != 0) {
         return None;
     }
     // SAFETY: checked non-null above; the caller guarantees validity.
-    let scanner = unsafe { &(*scanner).0 };
+    let scanner = unsafe { &*scanner };
     let bytes: &[u8] = if len == 0 {
         &[]
     } else {
@@ -358,6 +514,20 @@ unsafe fn input<'a>(
         unsafe { std::slice::from_raw_parts(data, len) }
     };
     Some((scanner, bytes))
+}
+
+/// The UTF-8 text `pointer` points to, empty when it is null; `None` when it
+/// is not UTF-8.
+///
+/// # Safety
+/// `pointer` must be null or NUL-terminated.
+unsafe fn optional_utf8(pointer: *const c_char) -> Option<String> {
+    if pointer.is_null() {
+        return Some(String::new());
+    }
+    // SAFETY: the caller guarantees a NUL-terminated string.
+    let text = unsafe { CStr::from_ptr(pointer) };
+    text.to_str().ok().map(str::to_owned)
 }
 
 /// # Safety
@@ -652,6 +822,94 @@ mod tests {
             malmal_scanner_free(strict);
             malmal_scanner_free(allowing);
         }
+    }
+
+    fn new_json(options: &CStr) -> Result<*mut malmal_scanner, String> {
+        let mut error = ptr::dangling_mut::<c_char>();
+        let scanner = unsafe { malmal_scanner_new_json(options.as_ptr(), &mut error) };
+        if scanner.is_null() {
+            let message = unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { malmal_string_free(error) };
+            return Err(message);
+        }
+        assert!(error.is_null());
+        Ok(scanner)
+    }
+
+    #[test]
+    fn json_options_reach_the_scanner() {
+        let form = b"%PDF-1.7\n1 0 obj << /Type /Catalog /AcroForm << /XFA 2 0 R >> >> endobj\n\
+            2 0 obj << /Length 0 >> stream\n\nendstream endobj\n\
+            trailer << /Root 1 0 R >>\n%%EOF\n";
+        let default = new_json(c"{}").unwrap();
+        assert_eq!(scan(default, form, c"a.pdf").0, 1);
+        let documents = new_json(cr#"{"policy": "documents", "wait": 60}"#).unwrap();
+        let (verdict, report) = scan(documents, form, c"a.pdf");
+        assert_eq!(verdict, MALMAL_CLEAN, "{report}");
+        assert_eq!(unsafe { malmal_scanner_overdue(documents) }, 0);
+
+        let images = new_json(cr#"{"types": ["png"], "without_hash": true}"#).unwrap();
+        let (verdict, report) = scan(images, form, c"a.pdf");
+        assert_eq!(verdict, 1, "{report}");
+        assert!(report.contains("type.not_allowed"), "{report}");
+        assert!(report.contains(r#""sha256":"""#), "{report}");
+
+        let error = new_json(cr#"{"policy": "strict", "alow": []}"#).unwrap_err();
+        assert!(error.contains("unknown field `alow`"), "{error}");
+        // No options at all are the defaults.
+        let scanner = unsafe { malmal_scanner_new_json(ptr::null(), ptr::null_mut()) };
+        assert!(!scanner.is_null());
+        assert_eq!(unsafe { malmal_scanner_overdue(ptr::null()) }, 0);
+
+        let version = unsafe { CStr::from_ptr(malmal_version()) }
+            .to_str()
+            .unwrap();
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        unsafe {
+            for scanner in [default, documents, images, scanner] {
+                malmal_scanner_free(scanner);
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_takes_json_options() {
+        let scanner = new_json(c"{}").unwrap();
+        let run = |options: &CStr| {
+            let (mut image, mut image_len, mut json) = (ptr::null_mut(), 0, ptr::null_mut());
+            let status = unsafe {
+                malmal_sanitize_json(
+                    scanner,
+                    PNG.as_ptr(),
+                    PNG.len(),
+                    ptr::null(),
+                    ptr::null(),
+                    options.as_ptr(),
+                    &mut image,
+                    &mut image_len,
+                    &mut json,
+                )
+            };
+            let info = unsafe { CStr::from_ptr(json) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe {
+                malmal_bytes_free(image, image_len);
+                malmal_string_free(json);
+            }
+            (status, image_len, info)
+        };
+        let (status, len, info) = run(cr#"{"jpeg_quality": 80, "types": ["png"]}"#);
+        assert_eq!(status, MALMAL_CLEAN, "{info}");
+        assert!(len > 0);
+        let (status, _, info) = run(cr#"{"types": ["jpeg"]}"#);
+        assert_eq!(status, MALMAL_NOT_REBUILT, "{info}");
+        let (status, len, info) = run(cr#"{"pdf_dpi": 5}"#);
+        assert_eq!((status, len), (MALMAL_ERROR, 0));
+        assert!(info.contains("pdf_dpi"), "{info}");
+        unsafe { malmal_scanner_free(scanner) };
     }
 
     #[test]

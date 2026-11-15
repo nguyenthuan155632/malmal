@@ -21,6 +21,20 @@ in the [main README](https://github.com/nguyenthuan155632/malmal#allowing-findin
 `Scanner(max_memory=...)` is what one scan may hold, in bytes (512 MiB unless given;
 `None` or `0` for no limit); a scan that holds more is stopped with `limit.memory`.
 
+```python
+scanner = malmal.Scanner(
+    policy="documents",                # or "default", "strict"
+    types=["jpeg", "png", "pdf"],      # accepted file types
+    limits={"max_size": 20_000_000, "scan_timeout": 5},
+    wait=30,                           # answer within 30 s whatever the file does
+)
+```
+
+With `wait`, a scan that has not ended in time is reported with `limit.time`, never clean,
+and left running on its thread; `scanner.overdue` counts those, and above 0 the program is
+due a restart. `sanitize` also takes `types`, `pdf_dpi`, `pdf_jpeg`, `pdf_text` and
+`pdf_vector_text`.
+
 `sanitize` scans and then writes a clean image anew from its pixels, so that nothing but the
 picture is kept:
 
@@ -39,7 +53,7 @@ A wheel from the [releases](https://github.com/nguyenthuan155632/malmal/releases
 the library, for x86-64 and ARM64 Linux with glibc 2.17 or newer:
 
 ```bash
-pip install malmal-0.3.0-py3-none-manylinux2014_x86_64.whl
+pip install malmal-0.4.0-py3-none-manylinux2014_x86_64.whl
 ```
 
 Such a wheel is built with `bindings/python/build_wheel.sh x86_64` (or `aarch64`), which

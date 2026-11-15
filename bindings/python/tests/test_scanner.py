@@ -93,8 +93,8 @@ class ScannerTest(unittest.TestCase):
             self.assertEqual(encrypted(scanner), "medium")
         with malmal.Scanner(pdf_passwords=["wrong", b"secret"]) as scanner:
             self.assertEqual(encrypted(scanner), "info")
-        with self.assertRaises(ValueError):
-            malmal.Scanner(pdf_passwords=["two\nlines"])
+        # Passwords no longer travel one to a line: a line break is a character.
+        malmal.Scanner(pdf_passwords=["two\nlines"]).close()
 
     def test_sanitize_documents(self):
         corpus = os.path.join(os.path.dirname(__file__), "../../../tests/corpus")
@@ -204,3 +204,47 @@ class ScannerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OptionsTest(unittest.TestCase):
+    FORM = (
+        b"%PDF-1.7\n1 0 obj << /Type /Catalog /AcroForm << /XFA 2 0 R >> >> endobj\n"
+        b"2 0 obj << /Length 0 >> stream\n\nendstream endobj\n"
+        b"trailer << /Root 1 0 R >>\n%%EOF\n"
+    )
+
+    def test_policies_and_types(self):
+        with malmal.Scanner() as scanner:
+            self.assertEqual(scanner.scan(self.FORM, filename="a.pdf").verdict, "suspicious")
+            self.assertEqual(scanner.library_version.count("."), 2)
+        with malmal.Scanner(policy="documents") as scanner:
+            self.assertTrue(scanner.scan(self.FORM, filename="a.pdf").clean)
+        with malmal.Scanner(types=["png"], without_hash=True) as scanner:
+            report = scanner.scan(GIF)
+            self.assertIn("type.not_allowed", [f["code"] for f in report.findings])
+            self.assertEqual(report.sha256, "")
+        with self.assertRaises(ValueError):
+            malmal.Scanner(policy="lenient")
+        with self.assertRaises(ValueError):
+            malmal.Scanner(strict=True, policy="documents")
+        with self.assertRaises(ValueError):
+            malmal.Scanner(limits={"max_sise": 10})
+
+    def test_limits_and_wait(self):
+        with malmal.Scanner(limits={"max_size": 8}, wait=60) as scanner:
+            report = scanner.scan(GIF)
+            self.assertIn("limit.size", [f["code"] for f in report.findings])
+            self.assertEqual(scanner.overdue, 0)
+
+    def test_non_utf8_password_is_accepted(self):
+        malmal.Scanner(pdf_passwords=[b"\xe9t\xe9", "secret"]).close()
+
+    def test_sanitize_options(self):
+        with malmal.Scanner() as scanner:
+            self.assertEqual(scanner.sanitize(png_with_comment(), types=["png"]).file_type, "png")
+            with self.assertRaises(malmal.NotRebuilt):
+                scanner.sanitize(png_with_comment(), types=["jpeg"])
+            with self.assertRaises(ValueError):
+                scanner.sanitize(png_with_comment(), pdf_dpi=5)
+            with self.assertRaises(ValueError):
+                scanner.sanitize(png_with_comment(), dpi=100)

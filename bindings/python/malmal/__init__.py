@@ -123,16 +123,19 @@ def _load(path):
             "libmalmal_ffi was not found; build it with `cargo build --release "
             "-p malmal-ffi` and set MALMAL_LIBRARY to its path"
         )
-    library.malmal_scanner_new_with_allow.restype = ctypes.c_void_p
-    library.malmal_scanner_new_with_allow.argtypes = [
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_size_t,
-        ctypes.c_char_p,
-        ctypes.c_size_t,
+    if not hasattr(library, "malmal_scanner_new_json"):
+        raise OSError(
+            "this libmalmal_ffi is older than the package; it needs malmal_scanner_new_json"
+        )
+    library.malmal_scanner_new_json.restype = ctypes.c_void_p
+    library.malmal_scanner_new_json.argtypes = [
         ctypes.c_char_p,
         ctypes.POINTER(ctypes.c_void_p),
     ]
+    library.malmal_scanner_overdue.restype = ctypes.c_uint64
+    library.malmal_scanner_overdue.argtypes = [ctypes.c_void_p]
+    library.malmal_version.restype = ctypes.c_char_p
+    library.malmal_version.argtypes = []
     library.malmal_scanner_set_max_memory.restype = None
     library.malmal_scanner_set_max_memory.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
     library.malmal_scanner_free.restype = None
@@ -148,14 +151,14 @@ def _load(path):
     ]
     library.malmal_string_free.restype = None
     library.malmal_string_free.argtypes = [ctypes.c_void_p]
-    library.malmal_sanitize.restype = ctypes.c_int
-    library.malmal_sanitize.argtypes = [
+    library.malmal_sanitize_json.restype = ctypes.c_int
+    library.malmal_sanitize_json.argtypes = [
         ctypes.c_void_p,
         ctypes.c_char_p,
         ctypes.c_size_t,
         ctypes.c_char_p,
         ctypes.c_char_p,
-        ctypes.c_int,
+        ctypes.c_char_p,
         ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(ctypes.c_size_t),
         ctypes.POINTER(ctypes.c_void_p),
@@ -176,7 +179,10 @@ class Scanner:
     """A configured scanner. One instance may be shared between threads;
     the interpreter lock is released while a file is scanned.
 
-    ``strict`` selects the strict policy. ``hashlist`` is an optional
+    ``policy`` is ``"default"``, ``"strict"`` or ``"documents"`` (XFA forms and
+    attachments in PDFs do not count; what they hold does); ``strict=True`` is
+    ``policy="strict"``. ``types`` narrows the accepted file types, such as
+    ``["jpeg", "png", "pdf"]``. ``hashlist`` is an optional
     SHA-256 blocklist as text, one hex digest per line. ``library`` is the
     path of ``libmalmal_ffi``, when it is not found otherwise.
     ``pdf_passwords`` are passwords (``str`` or ``bytes``) to try on
@@ -188,6 +194,13 @@ class Scanner:
     list that does not parse. ``max_memory`` is the most a scan may hold, in
     bytes, beyond what its thread held when it began; past it the scan stops
     with ``limit.memory``. ``None`` or ``0`` is no limit.
+
+    ``limits`` is a dict of ``max_size``, ``max_decompressed``,
+    ``max_pixels``, ``max_depth`` and ``scan_timeout`` (seconds).
+    ``without_hash`` leaves the SHA-256 out of reports. ``wait`` (seconds)
+    makes :meth:`scan` answer within that time even if a step of the scan
+    never ends: the report then has ``limit.time``, and the scan is left
+    running on its thread; :attr:`overdue` counts such scans.
     """
 
     def __init__(
@@ -198,31 +211,52 @@ class Scanner:
         pdf_passwords=(),
         allow=(),
         max_memory=512 << 20,
+        policy=None,
+        types=None,
+        limits=None,
+        without_hash=False,
+        wait=None,
     ):
         # Before anything is loaded: `close` runs even when this raises.
         self._handle = None
-        passwords = [
-            password.encode() if isinstance(password, str) else bytes(password)
-            for password in pdf_passwords
-        ]
-        if any(b"\n" in password for password in passwords):
-            raise ValueError("a password cannot contain a line break")
-        passwords = b"\n".join(passwords)
+        if strict and policy not in (None, "strict"):
+            raise ValueError("strict=True and policy=%r disagree" % (policy,))
+        passwords = []
+        for password in pdf_passwords:
+            if isinstance(password, str):
+                passwords.append(password)
+            else:
+                raw = bytes(password)
+                try:
+                    passwords.append(raw.decode())
+                except UnicodeDecodeError:
+                    passwords.append(list(raw))
         codes = [allow] if isinstance(allow, str) else list(allow)
         if not all(isinstance(code, str) for code in codes):
             raise TypeError("allow takes finding codes as str")
-        codes = ",".join(code.replace("\0", "") for code in codes).encode()
+        codes = [code.strip() for text in codes for code in text.replace("|", ",").split(",")]
+        if max_memory is not None and max_memory < 0:
+            raise ValueError("max_memory cannot be negative")
+        if isinstance(hashlist, bytes):
+            hashlist = hashlist.decode()
+        options = {
+            "policy": policy or ("strict" if strict else "default"),
+            "allow": [code for code in codes if code],
+            "pdf_passwords": passwords,
+            "max_memory": max_memory or 0,
+            "without_hash": bool(without_hash),
+        }
+        if types is not None:
+            options["types"] = [types] if isinstance(types, str) else list(types)
+        if hashlist is not None:
+            options["hashlist"] = hashlist
+        if wait is not None:
+            options["wait"] = wait
+        options.update(limits or {})
         self._library = _load(library)
-        blocklist = hashlist.encode() if isinstance(hashlist, str) else hashlist
         error = ctypes.c_void_p()
-        self._handle = self._library.malmal_scanner_new_with_allow(
-            int(strict),
-            blocklist,
-            len(blocklist) if blocklist else 0,
-            passwords,
-            len(passwords),
-            codes,
-            ctypes.byref(error),
+        self._handle = self._library.malmal_scanner_new_json(
+            json.dumps(options).encode(), ctypes.byref(error)
         )
         if not self._handle:
             message = "the scanner could not be created"
@@ -230,9 +264,19 @@ class Scanner:
                 message = ctypes.string_at(error.value).decode(errors="replace")
                 self._library.malmal_string_free(error)
             raise ValueError(message)
-        if max_memory is not None and max_memory < 0:
-            raise ValueError("max_memory cannot be negative")
-        self._library.malmal_scanner_set_max_memory(self._handle, max_memory or 0)
+
+    @property
+    def overdue(self):
+        """Scans that ``wait`` stopped waiting for and that are still
+        running. Above 0, restart the program when it can be."""
+        if not self._handle:
+            return 0
+        return self._library.malmal_scanner_overdue(self._handle)
+
+    @property
+    def library_version(self):
+        """The version of the loaded ``libmalmal_ffi``."""
+        return self._library.malmal_version().decode()
 
     def scan(self, data, filename=None, content_type=None):
         """Scan ``data`` (bytes). ``filename`` and ``content_type`` are what
@@ -254,10 +298,14 @@ class Scanner:
             self._library.malmal_string_free(report)
         return _report(fields)
 
-    def sanitize(self, data, filename=None, content_type=None, jpeg_quality=90):
+    def sanitize(self, data, filename=None, content_type=None, jpeg_quality=90, **options):
         """Scan ``data`` and, if it is clean and of a type that can be,
         write it anew. Returns a :class:`Sanitized`, whose ``data`` is the
         file to keep in place of the upload.
+
+        ``options`` are those of the rebuild: ``types`` (the types to
+        rebuild), ``pdf_dpi``, ``pdf_jpeg``, ``pdf_text`` and
+        ``pdf_vector_text``. An unknown option raises :class:`ValueError`.
 
         Raises :class:`Rejected` if the scan of the upload, or of the file
         made from it, did not come back clean; ``report`` is the one that
@@ -268,22 +316,29 @@ class Scanner:
             raise ScanError("the scanner is closed")
         data = bytes(data)
         encoded = _claims(filename, content_type)
+        # As before: a quality out of range is the default.
+        if 1 <= int(jpeg_quality) <= 100:
+            options["jpeg_quality"] = int(jpeg_quality)
         image, length, info = ctypes.c_void_p(), ctypes.c_size_t(), ctypes.c_void_p()
-        status = self._library.malmal_sanitize(
+        status = self._library.malmal_sanitize_json(
             self._handle,
             data,
             len(data),
             encoded[0],
             encoded[1],
-            int(jpeg_quality),
+            json.dumps(options).encode(),
             ctypes.byref(image),
             ctypes.byref(length),
             ctypes.byref(info),
         )
         try:
-            if status == _ERROR or not info.value:
+            fields = json.loads(ctypes.string_at(info.value)) if info.value else {}
+            if status == _ERROR:
+                if "error" in fields:
+                    raise ValueError(fields["error"])
                 raise ScanError("the scanner failed; the file was not scanned")
-            fields = json.loads(ctypes.string_at(info.value))
+            if not info.value:
+                raise ScanError("the scanner failed; the file was not scanned")
             if status == _NOT_REBUILT:
                 raise NotRebuilt(fields.get("error", "the image was not rebuilt"))
             report = _report(fields["report"])

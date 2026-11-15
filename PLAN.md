@@ -483,6 +483,105 @@ Taken from a comparison with quelda (github.com/tranhuucanh/quelda), a PDF scann
 - [ ] Not done: a token for ICAP and clamd; `scan_within` in the C and Python interfaces;
       TLS.
 
+### M15 — Ruby gem and Rails integration
+
+Two gems from `bindings/ruby/`, released together with the crates:
+
+- **`malmal`**: the scanner for any Ruby program, on the `ffi` gem over
+  `libmalmal_ffi`, as the Python package is on `ctypes`. The library ships inside
+  per-platform gems; no Rust is needed to install it.
+- **`malmal-rails`**: Rails integration (Railtie, Active Storage validator, analyzer and
+  job, sanitizing helper). Pure Ruby, depends on `malmal` and `activestorage >= 7.1`.
+
+Why the C ABI and not `magnus`/`rb-sys`: one ABI to keep for every language, already
+tested and fuzzed through Python; `ffi` releases the GVL with `blocking: true`; a native
+extension would have to be rebuilt for each Ruby minor version, a shared library is not.
+
+**Step 1: a C ABI that carries every option (in `malmal-ffi`, used by Python too).**
+
+- [ ] `malmal_scanner_new_json(const char *options, char **error)`: one JSON object with
+      `policy` (`default`, `strict`, `documents`), `allow`, `types`, `hashlist`,
+      `pdf_passwords`, `limits` (`max_size`, `max_decompressed`, `max_pixels`,
+      `scan_timeout`), `max_memory`, `without_hash`, and `wait` (seconds; when set,
+      `malmal_scan` goes through `Scanner::scan_within`). Unknown keys are an error, so
+      that a misspelling is not a silent default. The older constructors stay.
+- [ ] `malmal_scanner_overdue(const malmal_scanner *)`, and `malmal_version()`, which the
+      gems compare with their own version at load time.
+- [ ] `malmal_sanitize_json(scanner, data, len, filename, content_type, options_json, ...)`:
+      the `cdr::Options` beyond `jpeg_quality` (PDF dpi, text, JPEG pages).
+- [ ] The Python package moves to the new constructor (`policy=`, `types=`, `limits=`,
+      `wait=`), keeping its current arguments.
+
+**Step 2: the `malmal` gem.**
+
+- [ ] `Malmal::Scanner.new(policy: :default, allow: [], types: nil, hashlist: nil,
+      pdf_passwords: [], max_size: nil, max_memory: nil, wait: nil, ...)`, freed by a
+      finalizer and by `#close`. Thread-safe: one scanner shared by every Puma thread.
+- [ ] `#scan(data_or_io, filename:, content_type:)` returns `Malmal::Report` (`verdict`,
+      `clean?`, `findings` as `Malmal::Finding` with `code`, `severity`, `message`,
+      `offset`, `sha256`, `detected_type`, `declared_types`, `to_h`). An `IO` is read up to
+      `max_size` + 1 bytes, as `Scanner::scan_reader` does. `MALMAL_ERROR` raises
+      `Malmal::ScanError`, never returns a report.
+- [ ] `#sanitize(data, ...)` returns `Malmal::Sanitized` (`data`, `file_type`,
+      `content_type`, `report`) or raises `Malmal::Rejected` (with the report),
+      `Malmal::NotRebuilt`, `Malmal::SanitizeError`.
+- [ ] `Malmal::Client.new(url, token:)`: the same `#scan` and `#sanitize` over HTTP against
+      `malmald`, with `Net::HTTP` only. For deployments that want `--hard-timeout` and the
+      sandbox, or one scanner process for many Ruby processes.
+- [ ] The library is found in the gem (`lib/malmal/<platform>/libmalmal_ffi.so`), else at
+      `MALMAL_LIBRARY`; a missing or mismatched library raises `Malmal::LoadError` with
+      what to do.
+- [ ] Platform gems: `x86_64-linux`, `aarch64-linux` (glibc 2.17 through cargo-zigbuild, as
+      the wheels), `x86_64-linux-musl`, `aarch64-linux-musl` (Alpine images, a `cdylib`
+      built with `-C target-feature=-crt-static`), `arm64-darwin`, `x86_64-darwin`
+      (Rails developers' machines; the library needs no sandbox). A `ruby` platform gem
+      without a library, for `MALMAL_LIBRARY`.
+- [ ] Ruby 3.2 to 4.0 in CI; `rbs` signatures in `sig/`.
+
+**Step 3: the `malmal-rails` gem.**
+
+- [ ] Railtie: `config.malmal` (`policy`, `allow`, `types`, limits, `wait`, or
+      `client_url` + `client_token` to use the daemon), one scanner built at boot and
+      kept in `Malmal::Rails.scanner`. `bin/rails generate malmal:install` writes
+      `config/initializers/malmal.rb`.
+- [ ] Validator: `validates :avatar, malmal: true` (or `malmal: { policy: :strict, types:
+      %i[jpeg png] }`), for `has_one_attached` and `has_many_attached`. It scans what is
+      being attached before it is uploaded (`attachment_changes`: an
+      `ActionDispatch::Http::UploadedFile`, an `IO` hash, a `Rack::Test::UploadedFile`),
+      with the file name and the `Content-Type` the client gave. Errors are
+      `:malmal_suspicious`, `:malmal_malicious`, `:malmal_error` with I18n messages
+      (English and Vietnamese); the codes are in `record.errors.details`. A blob already
+      stored (direct upload, signed id) is downloaded up to `max_size` and scanned.
+- [ ] Direct uploads skip validations until the record is saved; for them,
+      `Malmal::Rails::Analyzer` (an Active Storage analyzer) writes `malmal_verdict` and
+      the finding codes to `blob.metadata`, and `Malmal::Rails::PurgeJob` purges a blob
+      that is not clean when `config.malmal.purge_unclean` is on.
+- [ ] `sanitizes_attachment :avatar`: before validation, the attachment is replaced with
+      the rebuilt file (same name, the new type and extension); a file that cannot be
+      rebuilt is rejected or kept, per `on_not_rebuilt: :reject | :keep`.
+- [ ] Instrumentation: `ActiveSupport::Notifications` events `scan.malmal` and
+      `sanitize.malmal` (verdict, codes, size, duration), and a log line per scan that is
+      not clean, without the file name unless `config.malmal.log_filenames`.
+- [ ] Rails 7.1, 7.2, 8.0, 8.1 in CI (`gemfiles/`), each with a dummy app in
+      `test/dummy` using the Disk service.
+
+**Step 4: trying it out.**
+
+- [ ] `examples/rails/`: a small Rails 8 app (upload form, `has_one_attached :document`,
+      the validator with `policy: :documents`, a sanitized avatar, direct uploads with the
+      analyzer), and a `docker compose` file that runs it beside `malmald` for the client
+      mode. The README of the example walks through uploading a clean file and one from
+      `tests/corpus/malicious`.
+- [ ] A pre-release (`0.4.0.pre1`) of both gems pushed to RubyGems from the release
+      workflow (`RUBYGEMS_API_KEY`, behind a `RUBYGEMS_PUBLISH` switch like PyPI), then
+      installed in a fresh Rails app on Linux and macOS: `bundle add malmal-rails`, no Rust
+      on the machine.
+- [ ] Measured: scans per second from Ruby against the same files from Rust, to show what
+      the copy over FFI and the JSON report cost.
+
+Not planned: Shrine and CarrierWave plugins (the `malmal` gem is enough for them; added if
+asked), a Rack middleware that scans every multipart upload, Windows.
+
 ## Order and dependencies
 
 ```
@@ -498,9 +597,10 @@ M3 and M4 are independent. M5 needs M4 because modern AI files are PDFs. M6 need
 - `rustup target add x86_64-unknown-linux-musl`
 - `cargo install cargo-fuzz cargo-deny cbindgen` (fuzzing also needs the nightly toolchain)
 - Docker or Podman to test on a bare Debian (M6)
+- Ruby 3.2 or later with Bundler, for the gems (M15); none is installed on this machine yet
 
 ## Out of scope (recorded for later)
 
 - Office (DOCX/XLSX macros), archives (recursive ZIP/RAR), video.
 - A rebuilt PDF that keeps its links and forms (see M11).
-- Bindings beyond C and Python; wheels for macOS and Windows.
+- Bindings beyond C, Python and Ruby (M15); wheels for macOS and Windows.

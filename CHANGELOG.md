@@ -1,8 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 ### Added
+
+- `malmal_scanner_new_json` in the C interface: one JSON object carries every option
+  (`policy`, `allow`, `types`, `hashlist`, `pdf_passwords`, the limits, `max_memory`,
+  `without_hash`, and `wait`, which sends `malmal_scan` through `Scanner::scan_within`).
+  An unknown key is an error. Also `malmal_scanner_overdue`, `malmal_version` and
+  `malmal_sanitize_json`, which takes the options of the rebuild (`types`, `pdf_dpi`,
+  `pdf_jpeg`, `pdf_text`, `pdf_vector_text`). The older constructors stay.
+- Python: `Scanner(policy=, types=, limits=, without_hash=, wait=)`, `Scanner.overdue`,
+  `Scanner.library_version`, and the rebuild options as keywords of `sanitize`.
 
 - `Policy::documents()` and `--policy documents`: the default policy with XFA forms and
   attachments allowed, for services that take documents from people. What they contain
@@ -66,6 +75,8 @@
 
 ### Changed
 
+- The Python package needs a `libmalmal_ffi` of this version: it uses the JSON
+  constructor. PDF passwords may now contain line breaks.
 - The crates declare `rust-version = "1.95"`, the oldest Rust that builds them with every
   feature (`yara-x` needs it); CI builds with it.
 - The features `zenavif`, `avif-decode`, `svg-hush` and `hayro` of `malmal` are gone. The
