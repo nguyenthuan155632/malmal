@@ -332,5 +332,11 @@ jobs:
       - name: Push, the platform gems first and malmal-rails last
         run: |
           for gem in pkg/malmal-[0-9]*-*.gem pkg/malmal-[0-9]*[0-9].gem pkg/malmal-rails-*.gem; do
+            # A version RubyGems already has cannot be pushed again; one an
+            # earlier run pushed is left as it is.
+            if curl -sfIL -o /dev/null "https://rubygems.org/downloads/${gem#pkg/}"; then
+              echo "${gem#pkg/} is already on RubyGems"
+              continue
+            fi
             gem push "$gem"
           done
