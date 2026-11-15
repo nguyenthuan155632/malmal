@@ -151,10 +151,18 @@ jobs:
           cargo build --release -p malmal-cli --features yara --target x86_64-unknown-linux-musl
           release=target/x86_64-unknown-linux-musl/release
           file $release/malmal | grep -E 'static(ally|-pie) linked'
-          mkdir rules && echo 'rule Marker { strings: $a = "MALMAL-YARA-MARKER" condition: $a }' > rules/marker.yar
-          printf 'GIF89a MALMAL-YARA-MARKER' > marker.gif
-          docker run --rm -v "$PWD:/w:ro" debian:stable-slim /w/$release/malmal scan --yara /w/rules /w/marker.gif \
-            | grep 'yara.match'
+          # The repository has a rules/ of its own; this test uses a directory apart.
+          smoke=$(mktemp -d)
+          cp $release/malmal "$smoke"
+          mkdir "$smoke/rules"
+          echo 'rule Marker { strings: $a = "MALMAL-YARA-MARKER" condition: $a }' > "$smoke/rules/marker.yar"
+          echo 'import "elf" rule ElfExec { condition: elf.type == elf.ET_EXEC }' > "$smoke/rules/elf.yar"
+          printf 'GIF89a MALMAL-YARA-MARKER' > "$smoke/marker.gif"
+          # A malicious verdict exits with 2, so the output is checked and not the status.
+          docker run --rm -v "$smoke:/w:ro" debian:stable-slim /w/malmal scan --yara /w/rules /w/marker.gif \
+            > "$smoke/out.txt" || true
+          cat "$smoke/out.txt"
+          grep -q 'matches YARA rule Marker' "$smoke/out.txt"
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
 

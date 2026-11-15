@@ -111,12 +111,13 @@ class ScannerTest < Minitest::Test
     assert_raises(Malmal::ScanError) { closing.scan(GIF) }
   end
 
-  # A picture slow enough to rebuild that another thread can act meanwhile.
+  # A picture slow enough to rebuild that another thread can act meanwhile,
+  # even on a fast machine: 2000 by 2000 pixels of noise.
   def slow_png
     chunk = ->(kind, body) { [body.bytesize].pack("N") + kind + body + [Zlib.crc32(kind + body)].pack("N") }
     random = Random.new(1)
-    rows = Array.new(1000) { "\0".b + random.bytes(3000) }.join
-    "\x89PNG\r\n\x1a\n".b + chunk.call("IHDR", [1000, 1000, 8, 2, 0, 0, 0].pack("NNCCCCC")) +
+    rows = Array.new(2000) { "\0".b + random.bytes(6000) }.join
+    "\x89PNG\r\n\x1a\n".b + chunk.call("IHDR", [2000, 2000, 8, 2, 0, 0, 0].pack("NNCCCCC")) +
       chunk.call("IDAT", Zlib::Deflate.deflate(rows, 1)) + chunk.call("IEND", "")
   end
 
@@ -124,7 +125,7 @@ class ScannerTest < Minitest::Test
     image = slow_png
     closing = Malmal::Scanner.new
     running = Thread.new { closing.sanitize(image) }
-    sleep 0.02
+    sleep 0.01
     closing.close
     assert_predicate closing, :closed?
     assert_equal :png, running.value.file_type
@@ -134,7 +135,9 @@ class ScannerTest < Minitest::Test
   def test_an_interrupt_waits_for_the_call
     image = slow_png
     running = Thread.new { scanner.sanitize(image) }
-    sleep 0.02
+    sleep 0.01
+    # An interrupt sent to a thread that has already returned is lost.
+    assert running.alive?, "the rebuild finished before it could be interrupted"
     running.raise(Interrupt)
     assert_raises(Interrupt) { running.join }
     assert_predicate scanner.scan(GIF), :clean?
