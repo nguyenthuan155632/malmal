@@ -78,6 +78,18 @@ class BlobScanTest < ActiveSupport::TestCase
     refute ActiveStorage::Blob.exists?(blob.id)
   end
 
+  test "a blob is scanned even when the analyzer of Active Storage fails" do
+    blob = ActiveStorage::Blob.create_and_upload!(io: StringIO.new(ELF), filename: "photo.jpg")
+    failing = Class.new(ActiveStorage::Analyzer) do
+      def self.accept?(_blob) = true
+      def metadata = raise(NameError, "uninitialized constant MiniMagick")
+    end
+    ActiveStorage.stub(:analyzers, [failing]) do
+      assert_raises(NameError) { blob.analyze }
+    end
+    assert_equal "malicious", blob.reload.metadata.dig("malmal", "verdict")
+  end
+
   test "a blob that was never scanned is neither clean nor not" do
     blob = ActiveStorage::Blob.create_and_upload!(io: StringIO.new(GIF), filename: "a.gif")
     assert_nil blob.malmal_clean?

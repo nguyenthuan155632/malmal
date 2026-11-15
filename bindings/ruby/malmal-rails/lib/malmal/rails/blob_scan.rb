@@ -48,8 +48,16 @@ module Malmal
 
       # Included in ActiveStorage::Blob.
       module Blob
+        # The blob is scanned even when Active Storage's own analyzer fails
+        # (an analyzer that cannot load what it needs), and that
+        # failure is raised afterwards.
         def analyze
-          super
+          begin
+            super
+          rescue StandardError
+            Malmal::Rails::BlobScan.call(self)
+            raise
+          end
           Malmal::Rails::BlobScan.call(self)
         end
 

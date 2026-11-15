@@ -38,10 +38,15 @@ class ValidatorTest < ActiveSupport::TestCase
   end
 
   test "an uploaded file from a form is read from its tempfile" do
-    file = Rack::Test::UploadedFile.new(StringIO.new(ELF), "image/png", true, original_filename: "x.png")
-    document = Document.new(file: file)
-    refute document.valid?
-    assert_equal :malmal_malicious, document.errors.details[:file].first[:error]
+    Tempfile.create(["upload", ".png"]) do |tempfile|
+      tempfile.binmode
+      tempfile.write(ELF)
+      tempfile.rewind
+      file = Rack::Test::UploadedFile.new(tempfile.path, "image/png", true, original_filename: "x.png")
+      document = Document.new(file: file)
+      refute document.valid?
+      assert_equal :malmal_malicious, document.errors.details[:file].first[:error]
+    end
   end
 
   test "a direct upload is read back from the service" do
