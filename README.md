@@ -397,6 +397,7 @@ The Python and C interfaces use the default limits. Embedded files are scanned u
 | `--pdf-dpi <N>` | 150 | Resolution of rebuilt PDF pages, 36–600 |
 | `--pdf-jpeg` | off | Store a PDF page as JPEG when that is smaller |
 | `--pdf-no-text` | off | Leave out the invisible text layer of a rebuilt PDF |
+| `--pdf-raster-text` | off | Keep all text of a rebuilt PDF in the page images |
 
 `malmald` also takes:
 
@@ -553,10 +554,15 @@ In C, use `malmal_sanitize`. In every interface, if rebuilding fails, store noth
   ([svg-hush](https://github.com/cloudflare/svg-hush)) that keeps only what draws.
   The result is scanned again and refused if it is not clean.
 - **PDF** pages are rendered ([hayro](https://github.com/LaurenzV/hayro)) and the new PDF
-  contains the page images and, under each, the page's characters where they stood, in
-  a font of glyphs that draw nothing: text can still be selected, searched and copied
-  (`--pdf-no-text` or `Options::pdf_text = false` leaves it out). Fonts, links and forms
-  are removed, and text documents become about ten times larger. This needs the
+  contains the page images and the page's characters where they stood: text can still be
+  selected, searched and copied (`--pdf-no-text` or `Options::pdf_text = false` leaves it
+  out). Text in one opaque colour on a plain background is taken out of the image, once
+  each glyph is checked against it, and drawn from the outlines of its glyphs, in fonts
+  written anew, so it stays sharp at any size (`--pdf-raster-text` or
+  `Options::pdf_vector_text = false` keeps it in the image); other text stays in the
+  image, over characters that draw nothing. No font program, link or form is kept. On
+  clean documents of CIC-Evasive-PDFMal2022, those with text come out about five times
+  the size of the original (median), and scans about three times. This needs the
   `cdr-pdf` feature, which is not included in the released binaries, container or wheels:
 
   ```bash

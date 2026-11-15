@@ -355,8 +355,10 @@ Not done:
   assembly on x86-64 (it needs `nasm`, and cannot be told not to), and `rav1d` has no
   safe API of its own.
 - HEIC: no HEVC decoder in Rust.
-- A rebuilt PDF that keeps its fonts, links and forms. Its text it keeps, since M13, as
-  characters that do not draw.
+- A rebuilt PDF that keeps its links and forms. Its text it keeps, since M13, and draws
+  from the outlines of its glyphs where the page shows it plainly; text over a picture,
+  in a pattern or behind a transparency stays in the drawing of the page, and so do
+  lines and boxes.
 
 ### M12 — A time limit that holds
 
@@ -448,6 +450,15 @@ Taken from a comparison with quelda (github.com/tranhuucanh/quelda), a PDF scann
       the writer puts the characters under the picture in Type 3 fonts whose glyphs
       draw nothing, with a `ToUnicode` map. On 80 clean CIC files, pdftotext finds
       97.9 % of the words of the first three pages in the rebuilt copy (median 99.3 %).
+- [x] Text drawn as shapes in a rebuilt PDF (`Options::pdf_vector_text`,
+      `--pdf-raster-text` to keep it in the picture). The renderer cannot be told to leave
+      text out, so the glyphs are drawn again on their own, as the renderer draws them
+      (hinted, uncached), and each one whose pixels are its colour laid over a plain
+      background as much as its outline covers them is taken out of the picture and
+      written as a Type 3 glyph of its outline. A glyph that fails, and one that shares a
+      pixel with it, stays in the picture. On 78 clean CIC files, the 47 with text come out
+      a fifth of the size (median), with 2.5 % of the dark pixels left in the picture
+      (median); none drawn by poppler further from the original than the picture alone.
 - [ ] Not done: reading object streams, attachments, XFA and metadata in blocks;
       recursion through patterns, soft masks and glyphs; embedded fonts and colour
       profiles; presets and locked rules; the content masking that no structure shows

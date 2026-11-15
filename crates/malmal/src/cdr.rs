@@ -106,6 +106,14 @@ pub struct Options {
     /// characters that can be selected, searched and copied and that do not
     /// draw: the picture is what shows. Nothing else of a font is kept.
     pub pdf_text: bool,
+    /// Whether a rebuilt PDF draws text as shapes rather than as part of the
+    /// picture of its page, where it can: text of one solid colour on a
+    /// plain background, with nothing over it, and drawn exactly as the
+    /// shapes say, which is checked against the picture. The shapes are
+    /// the outlines of the glyphs, written anew; no font program is kept.
+    /// Such text stays sharp at any size, and a page of it takes a fraction
+    /// of the room. Other text stays in the picture.
+    pub pdf_vector_text: bool,
 }
 
 /// How the picture of a page is kept in a rebuilt PDF.
@@ -130,6 +138,7 @@ impl Default for Options {
             pdf_dpi: 150,
             pdf_pages: PageImage::Lossless,
             pdf_text: true,
+            pdf_vector_text: true,
         }
     }
 }
@@ -305,9 +314,12 @@ fn rebuild_inner(
 /// A PDF whose pages are pictures of the pages of `data`, and nothing else:
 /// each page is drawn and the drawing is what the new file holds, along
 /// with, if [`Options::pdf_text`] says so, the characters of its text where
-/// they stood, in a font of this module's that draws nothing. Links and
-/// forms are gone, and so is everything else a PDF can carry. A document
-/// that one of `passwords` opens comes back as one that needs none.
+/// they stood, in a font of this module's that draws nothing. Where
+/// [`Options::pdf_vector_text`] says so, text that the picture shows exactly
+/// as its glyphs' outlines say is taken out of the picture and drawn from
+/// those outlines instead. Links and forms are gone, and so is everything
+/// else a PDF can carry. A document that one of `passwords` opens comes back
+/// as one that needs none.
 #[cfg(feature = "cdr-pdf")]
 fn pdf(
     data: &[u8],
@@ -337,8 +349,13 @@ fn pdf(
         y_scale: scale,
         bg_color: WHITE,
     };
-    let (interpreter, render_settings) =
-        (InterpreterSettings::default(), RenderSettings::default());
+    let interpreter = InterpreterSettings::default();
+    // Glyphs drawn from a cache of pictures of them land a fraction of a
+    // pixel from where their outlines do, and could not be checked.
+    let render_settings = RenderSettings {
+        glyph_caching: !options.pdf_vector_text,
+        ..RenderSettings::default()
+    };
     let cache = RenderCache::new();
 
     let mut written = PagesPdf::default();
@@ -351,8 +368,10 @@ fn pdf(
         if !(1..=u64::from(u16::MAX)).contains(&pixels(width))
             || !(1..=u64::from(u16::MAX)).contains(&pixels(height))
             || area > limits.max_pixels
-            // The drawing and the copy of it without its alpha channel.
-            || area.saturating_mul(7) > limits.max_decompressed
+            // The drawing, the copy of it without its alpha channel, and,
+            // for text drawn as shapes, a drawing of those shapes and a mark
+            // for each pixel.
+            || area.saturating_mul(12) > limits.max_decompressed
         {
             return Err(Error::TooLarge);
         }
@@ -364,23 +383,38 @@ fn pdf(
             &pixmap_settings,
         );
         // Opaque, on the white it was drawn on.
-        let colours: Vec<u8> = drawn
+        let mut colours: Vec<u8> = drawn
             .data_as_u8_slice()
             .as_chunks::<4>()
             .0
             .iter()
             .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
             .collect();
+        let (wide, high) = (drawn.width(), drawn.height());
+        drop(drawn);
         let jpeg = (options.pdf_pages == PageImage::Jpeg).then_some(options.jpeg_quality);
-        let text = if options.pdf_text {
+        let mut text = if options.pdf_text || options.pdf_vector_text {
             deadline.check()?;
-            text_of(page, &interpreter, height)
+            let found = Found {
+                scale: f64::from(scale),
+                wide,
+                high,
+                shapes: options.pdf_vector_text,
+            };
+            text_of(page, &interpreter, height, found)
         } else {
             Vec::new()
         };
+        if !options.pdf_text {
+            text.iter_mut().for_each(|character| character.text.clear());
+        }
+        if options.pdf_vector_text {
+            deadline.check()?;
+            vectorise(&mut colours, wide, high, &mut text, &mut written);
+        }
         let picture = Picture {
-            wide: drawn.width(),
-            high: drawn.height(),
+            wide,
+            high,
             colours: &colours,
             jpeg,
         };
@@ -402,39 +436,76 @@ fn pdf(
     })
 }
 
+/// How the text of a page is looked for: on a picture of it `wide` by
+/// `high` pixels, `scale` pixels to the point, and with the shapes of its
+/// glyphs or not.
+#[cfg(feature = "cdr-pdf")]
+struct Found {
+    scale: f64,
+    wide: u16,
+    high: u16,
+    shapes: bool,
+}
+
 /// The characters a page draws, each as its text, where it stands on the
 /// page and how far it reaches: the transform, from a square one unit on a
 /// side at the origin to the box of the character on a page `height`
-/// points high whose origin is its lower left corner.
+/// points high whose origin is its lower left corner. With the shape of
+/// each glyph that could be drawn as one, if `found` asks for them.
 #[cfg(feature = "cdr-pdf")]
 fn text_of(
     page: &hayro::hayro_syntax::page::Page<'_>,
     settings: &hayro::hayro_interpret::InterpreterSettings,
     height: f32,
+    found: Found,
 ) -> Vec<Character> {
+    use hayro::hayro_interpret::font::HintingCache;
     use hayro::hayro_interpret::util::TransformExt;
     use hayro::hayro_interpret::{Context, InterpreterCache, interpret_page};
     use hayro::kurbo::{Affine, Rect};
 
     let cache = InterpreterCache::new();
-    // Points, from the top left corner, as the page is drawn.
-    let transform = page.initial_transform(true).to_kurbo();
-    let (wide, high) = page.render_dimensions();
-    let bounds = Rect::new(0.0, 0.0, f64::from(wide), f64::from(high));
+    // Pixels, from the top left corner, as the page is drawn.
+    let transform = Affine::scale(found.scale) * page.initial_transform(true).to_kurbo();
+    let bounds = Rect::new(0.0, 0.0, f64::from(found.wide), f64::from(found.high));
     let mut context = Context::new(transform, bounds, &cache, page.xref(), settings.clone());
-    let mut found = Characters {
-        upright: Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, f64::from(height)]),
+    let mut characters = Characters {
+        upright: Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, f64::from(height)])
+            * Affine::scale(1.0 / found.scale),
+        hinting: found.shapes.then(HintingCache::new),
+        groups: Vec::new(),
         found: Vec::new(),
     };
-    interpret_page(page, &mut context, &mut found);
-    found.found
+    interpret_page(page, &mut context, &mut characters);
+    characters.found
 }
 
 /// A character of the text of a page: see [`text_of`].
 #[cfg(feature = "cdr-pdf")]
 struct Character {
+    /// What it stands for; empty for a glyph that says nothing.
     text: String,
     place: [f64; 6],
+    /// The glyph as a shape, while it can be drawn as one.
+    shape: Option<Shape>,
+}
+
+/// A glyph that might be drawn as a shape rather than kept in the picture.
+#[cfg(feature = "cdr-pdf")]
+struct Shape {
+    /// The outline, in units of which an em has a thousand.
+    outline: hayro::kurbo::BezPath,
+    /// The outline as the picture has it, hinted or not, and the transform
+    /// that put it on the picture.
+    drawn: hayro::kurbo::BezPath,
+    pixels: hayro::kurbo::Affine,
+    colour: [u8; 3],
+    /// From the outline to the page, in thousandths.
+    matrix: [f64; 6],
+    /// How far the next glyph starts, in units of the outline.
+    advance: f64,
+    /// Its code in the fonts of the new document, once it has one.
+    code: Option<usize>,
 }
 
 /// The most characters kept of a page, which is some hundred times what a
@@ -442,11 +513,49 @@ struct Character {
 #[cfg(feature = "cdr-pdf")]
 const MAX_CHARACTERS: usize = 1 << 18;
 
+/// The most points and curves of an outline drawn as a shape; a letter has
+/// some tens.
+#[cfg(feature = "cdr-pdf")]
+const MAX_OUTLINE: usize = 1 << 11;
+
 /// A device that draws nothing and keeps the characters of a page.
 #[cfg(feature = "cdr-pdf")]
 struct Characters {
+    /// From pixels on the picture to points on the page.
     upright: hayro::kurbo::Affine,
+    /// For the outlines of glyphs as the renderer draws them, when shapes
+    /// are wanted.
+    hinting: Option<hayro::hayro_interpret::font::HintingCache>,
+    /// For each transparency group drawn into: whether it is drawn as is.
+    groups: Vec<bool>,
     found: Vec<Character>,
+}
+
+#[cfg(feature = "cdr-pdf")]
+impl Characters {
+    /// The outline of `glyph` as the renderer fills it with `transform`,
+    /// and the transform it is filled with: hinted at the size it is drawn
+    /// if the renderer hints it, as it does at most sizes of upright text.
+    fn as_drawn(
+        &self,
+        glyph: &hayro::hayro_interpret::font::OutlineGlyph,
+        transform: hayro::kurbo::Affine,
+        hint: bool,
+    ) -> (hayro::kurbo::BezPath, hayro::kurbo::Affine) {
+        let [a, b, c, d, e, f] = transform.as_coeffs();
+        let ppem = d.abs() * 1000.0;
+        if let Some(cache) = self.hinting.as_ref().filter(|_| hint)
+            && b == 0.0
+            && (4.0..=128.0).contains(&ppem)
+            && let Some(hinted) = glyph.hinted_outline(ppem as f32, cache)
+        {
+            return (
+                hinted,
+                hayro::kurbo::Affine::new([a, b, c, d, e, f.round()]),
+            );
+        }
+        (glyph.outline(), transform)
+    }
 }
 
 #[cfg(feature = "cdr-pdf")]
@@ -461,25 +570,46 @@ impl<'a> hayro::hayro_interpret::Device<'a> for Characters {
     fn push_clip_path(&mut self, _: &hayro::hayro_interpret::ClipPath) {}
     fn push_transparency_group(
         &mut self,
-        _: f32,
-        _: Option<hayro::hayro_interpret::SoftMask<'a>>,
-        _: hayro::hayro_interpret::BlendMode,
+        opacity: f32,
+        mask: Option<hayro::hayro_interpret::SoftMask<'a>>,
+        blend: hayro::hayro_interpret::BlendMode,
     ) {
+        let plain = opacity == 1.0
+            && mask.is_none()
+            && matches!(blend, hayro::hayro_interpret::BlendMode::Normal);
+        self.groups.push(plain);
     }
     fn draw_glyph_run(
         &mut self,
         run: &hayro::hayro_interpret::font::GlyphRun<'_, 'a>,
         props: hayro::hayro_interpret::DrawProps<'a>,
-        _: &hayro::hayro_interpret::DrawMode,
+        mode: &hayro::hayro_interpret::DrawMode,
     ) {
-        use hayro::hayro_interpret::hayro_cmap::BfString;
-        use hayro::kurbo::Affine;
+        use hayro::hayro_interpret::font::Glyph;
+        use hayro::hayro_interpret::hayro_cmap::{BfString, WritingMode};
+        use hayro::hayro_interpret::{BlendMode, DrawMode, Paint};
+        use hayro::kurbo::{Affine, Shape as _};
         let glyphs = run.glyphs();
         // Where each glyph is drawn: from glyph space, in which an em is a
         // thousand units, to the page.
         let placed = |glyph: &hayro::hayro_interpret::font::PositionedGlyph<'_>| {
             self.upright * props.transform * glyph.transform()
         };
+        // Filled in one opaque colour, as is, where shapes are wanted.
+        let colour = match &props.paint {
+            Paint::Color(colour) if self.hinting.is_some() => {
+                let [r, g, b, a] = colour.to_rgba().to_rgba8();
+                (a == 255).then_some([r, g, b])
+            }
+            _ => None,
+        }
+        .filter(|_| {
+            matches!(mode, DrawMode::Fill(_))
+                && props.soft_mask.is_none()
+                && matches!(props.blend_mode, BlendMode::Normal)
+                && self.groups.iter().all(|&plain| plain)
+        });
+        let hint = run.writing_mode() == WritingMode::Horizontal;
         for (index, glyph) in glyphs.iter().enumerate() {
             if self.found.len() >= MAX_CHARACTERS {
                 return;
@@ -487,11 +617,11 @@ impl<'a> hayro::hayro_interpret::Device<'a> for Characters {
             let text = match glyph.as_unicode() {
                 Some(BfString::Char(character)) => character.to_string(),
                 Some(BfString::String(text)) => text,
-                None => continue,
+                None => String::new(),
             };
-            let text: String = text.chars().filter(|c| !c.is_control()).collect();
-            if text.is_empty() || text.len() > 32 {
-                continue;
+            let mut text: String = text.chars().filter(|c| !c.is_control()).collect();
+            if text.len() > 32 {
+                text.clear();
             }
             let place = placed(glyph);
             // The box reaches as far along as the next glyph starts, or
@@ -501,11 +631,40 @@ impl<'a> hayro::hayro_interpret::Device<'a> for Characters {
                 (place.inverse() * start).x
             });
             let advance = next.filter(|x| (1.0..4000.0).contains(x)).unwrap_or(500.0);
+            let shape = match (colour, &**glyph) {
+                (Some(colour), Glyph::Outline(outline)) => {
+                    let pixels = props.transform * glyph.transform();
+                    let (drawn, pixels) = self.as_drawn(outline, pixels, hint);
+                    let outline = outline.outline();
+                    let matrix = (place * Affine::scale(1000.0)).as_coeffs();
+                    let size = outline.elements().len();
+                    (size > 0
+                        && size <= MAX_OUTLINE
+                        && !drawn.elements().is_empty()
+                        && drawn.bounding_box().is_finite()
+                        && outline.bounding_box().is_finite()
+                        && matrix.iter().all(|value| value.is_finite())
+                        && pixels.as_coeffs().iter().all(|value| value.is_finite()))
+                    .then_some(Shape {
+                        outline,
+                        drawn,
+                        pixels,
+                        colour,
+                        matrix,
+                        advance,
+                        code: None,
+                    })
+                }
+                _ => None,
+            };
+            if text.is_empty() && shape.is_none() {
+                continue;
+            }
             let place = (place * Affine::scale_non_uniform(advance, 1000.0)).as_coeffs();
             if place.iter().all(|value| value.is_finite())
                 && place[0] * place[3] - place[1] * place[2] != 0.0
             {
-                self.found.push(Character { text, place });
+                self.found.push(Character { text, place, shape });
             }
         }
     }
@@ -516,7 +675,243 @@ impl<'a> hayro::hayro_interpret::Device<'a> for Characters {
     ) {
     }
     fn pop_clip(&mut self) {}
-    fn pop_transparency_group(&mut self) {}
+    fn pop_transparency_group(&mut self) {
+        self.groups.pop();
+    }
+}
+
+/// How far a pixel around a glyph may be from the others around it, in
+/// each channel, for the background to count as plain.
+#[cfg(feature = "cdr-pdf")]
+const PLAIN: u8 = 2;
+
+/// How far a pixel of a glyph may be from the glyph's colour laid over the
+/// background as much as the outline covers the pixel, in each channel.
+#[cfg(feature = "cdr-pdf")]
+const MATCHING: i32 = 6;
+
+/// Take out of the picture `colours`, `wide` by `high` pixels, the glyphs
+/// of `text` that it shows as their shapes say, on a plain background, and
+/// as nothing else; they are then drawn as shapes, with codes of `written`.
+/// The shape of every other glyph is dropped, and it stays in the picture.
+#[cfg(feature = "cdr-pdf")]
+fn vectorise(
+    colours: &mut [u8],
+    wide: u16,
+    high: u16,
+    text: &mut [Character],
+    written: &mut PagesPdf,
+) {
+    use hayro::kurbo::Shape as _;
+    use hayro::vello_cpu::color::palette::css::{BLACK, TRANSPARENT};
+    use hayro::vello_cpu::peniko::Fill;
+    use hayro::vello_cpu::{Pixmap, RasterizerSettings, RenderContext, Resources, TargetInit};
+
+    if text.iter().all(|character| character.shape.is_none()) {
+        return;
+    }
+    let (wide_, high_) = (usize::from(wide), usize::from(high));
+    // How much of each pixel the glyphs cover, as the renderer covered it.
+    let mut context = RenderContext::new(wide, high);
+    context.set_paint(BLACK);
+    context.set_fill_rule(Fill::NonZero);
+    for shape in text.iter().filter_map(|character| character.shape.as_ref()) {
+        context.set_transform(shape.pixels);
+        context.fill_path(&shape.drawn);
+    }
+    context.flush();
+    let mut covered = Pixmap::new(wide, high);
+    context.render_with(
+        &mut covered,
+        &mut Resources::default(),
+        RasterizerSettings {
+            target_init: TargetInit::Clear(TRANSPARENT),
+            ..Default::default()
+        },
+    );
+    drop(context);
+    let coverage = |at: usize| covered.data_as_u8_slice()[at * 4 + 3];
+
+    // The pixels each glyph reaches, if they are all on the picture.
+    let reach = |shape: &Shape| {
+        let bounds = shape.pixels.transform_rect_bbox(shape.drawn.bounding_box());
+        let (left, top) = (bounds.x0.floor() - 2.0, bounds.y0.floor() - 2.0);
+        let (right, bottom) = (bounds.x1.ceil() + 2.0, bounds.y1.ceil() + 2.0);
+        (left >= 0.0 && top >= 0.0 && right <= f64::from(wide) && bottom <= f64::from(high))
+            .then_some([left as usize, top as usize, right as usize, bottom as usize])
+    };
+    // No more pixels looked at than eight times the picture.
+    let mut budget = wide_ * high_ * 8;
+    let mut backgrounds = vec![None; text.len()];
+    // The pixels each glyph inks, as far as they are on the picture.
+    let inks: Vec<Option<[usize; 4]>> = (text.iter())
+        .map(|character| {
+            let shape = character.shape.as_ref()?;
+            let bounds = shape.pixels.transform_rect_bbox(shape.drawn.bounding_box());
+            let left = bounds.x0.floor().clamp(0.0, f64::from(wide)) as usize;
+            let top = bounds.y0.floor().clamp(0.0, f64::from(high)) as usize;
+            let right = bounds.x1.ceil().clamp(0.0, f64::from(wide)) as usize;
+            let bottom = bounds.y1.ceil().clamp(0.0, f64::from(high)) as usize;
+            Some([left, top, right.max(left), bottom.max(top)])
+        })
+        .collect();
+    for (index, character) in text.iter_mut().enumerate() {
+        let Some(shape) = character.shape.as_ref() else {
+            continue;
+        };
+        let plain = reach(shape).and_then(|[left, top, right, bottom]| {
+            let size = (right - left) * (bottom - top);
+            budget = budget.checked_sub(size)?;
+            let pixel = |x: usize, y: usize| y * wide_ + x;
+            let colour = |at: usize| [colours[at * 3], colours[at * 3 + 1], colours[at * 3 + 2]];
+            let mut background: Option<[u8; 3]> = None;
+            for y in top..bottom {
+                for x in left..right {
+                    let at = pixel(x, y);
+                    if coverage(at) != 0 {
+                        continue;
+                    }
+                    let here = colour(at);
+                    match background {
+                        None => background = Some(here),
+                        Some(seen) if (0..3).all(|c| seen[c].abs_diff(here[c]) <= PLAIN) => {}
+                        Some(_) => return None,
+                    }
+                }
+            }
+            let background = background?;
+            for y in top..bottom {
+                for x in left..right {
+                    let at = pixel(x, y);
+                    let cover = i32::from(coverage(at));
+                    if cover == 0 {
+                        continue;
+                    }
+                    let here = colour(at);
+                    let fits = (0..3).all(|c| {
+                        let laid = (cover * i32::from(shape.colour[c])
+                            + (255 - cover) * i32::from(background[c])
+                            + 127)
+                            / 255;
+                        (laid - i32::from(here[c])).abs() <= MATCHING
+                    });
+                    if !fits {
+                        return None;
+                    }
+                }
+            }
+            Some(background)
+        });
+        match plain {
+            Some(background) => backgrounds[index] = Some(background),
+            None => character.shape = None,
+        }
+    }
+
+    // A code for each glyph kept, while there are codes left.
+    for character in text.iter_mut() {
+        if let Some(shape) = character.shape.as_mut() {
+            let drawing = shape_of(&shape.outline);
+            let held = shape.outline.bounding_box();
+            shape.code = written.code(&character.text, Some((drawing, held)), shape.advance);
+            if shape.code.is_none() {
+                character.shape = None;
+            }
+        }
+    }
+
+    // A glyph that stays in the picture keeps every pixel it inks, and a
+    // glyph that inks one of them stays there too.
+    let mut kept = vec![false; wide_ * high_];
+    let mark = |kept: &mut [bool], [left, top, right, bottom]: [usize; 4]| {
+        for y in top..bottom {
+            kept[y * wide_ + left..y * wide_ + right].fill(true);
+        }
+    };
+    for (index, character) in text.iter().enumerate() {
+        if let (Some(inked), None) = (inks[index], &character.shape) {
+            mark(&mut kept, inked);
+        }
+    }
+    let mut rounds = 0;
+    loop {
+        let mut changed = false;
+        for (index, character) in text.iter_mut().enumerate() {
+            let Some(inked @ [left, top, right, bottom]) = inks[index] else {
+                continue;
+            };
+            if character.shape.is_some()
+                && (top..bottom).any(|y| kept[y * wide_ + left..y * wide_ + right].contains(&true))
+            {
+                character.shape = None;
+                mark(&mut kept, inked);
+                changed = true;
+            }
+        }
+        rounds += 1;
+        if !changed {
+            break;
+        }
+        if rounds == 16 {
+            // Not settled: every glyph stays in the picture.
+            text.iter_mut().for_each(|character| character.shape = None);
+            return;
+        }
+    }
+
+    // Out of the picture with the rest.
+    for (index, character) in text.iter().enumerate() {
+        let (Some(_), Some([left, top, right, bottom]), Some(background)) =
+            (&character.shape, inks[index], backgrounds[index])
+        else {
+            continue;
+        };
+        for y in top..bottom {
+            for x in left..right {
+                let at = y * wide_ + x;
+                if coverage(at) != 0 {
+                    colours[at * 3..at * 3 + 3].copy_from_slice(&background);
+                }
+            }
+        }
+    }
+}
+
+/// An outline as the drawing of a glyph of a Type 3 font, after the width
+/// of the glyph: the outline, filled in the colour of the text. To a tenth
+/// of a thousandth of an em, which is a twentieth of a pixel at a hundred
+/// pixels to the em.
+#[cfg(feature = "cdr-pdf")]
+fn shape_of(outline: &hayro::kurbo::BezPath) -> String {
+    use hayro::kurbo::{PathEl, Point};
+    let number = |value: f64| (value * 10.0).round() / 10.0;
+    let mut drawing = String::new();
+    let mut line = |points: &[Point], operator: &str| {
+        for point in points {
+            drawing += &format!("{} {} ", number(point.x), number(point.y));
+        }
+        drawing += operator;
+        drawing.push('\n');
+    };
+    let (mut at, mut start) = (Point::ORIGIN, Point::ORIGIN);
+    for element in outline.elements() {
+        match *element {
+            PathEl::MoveTo(p) => {
+                start = p;
+                line(&[p], "m");
+            }
+            PathEl::LineTo(p) => line(&[p], "l"),
+            // The same curve, as a cubic one.
+            PathEl::QuadTo(q, p) => line(
+                &[at + (q - at) * (2.0 / 3.0), p + (q - p) * (2.0 / 3.0), p],
+                "c",
+            ),
+            PathEl::CurveTo(one, two, p) => line(&[one, two, p], "c"),
+            PathEl::ClosePath => line(&[], "h"),
+        }
+        at = element.end_point().unwrap_or(start);
+    }
+    drawing + "f"
 }
 
 /// The picture of a page: `wide` by `high` pixels of `colours`, three bytes
@@ -541,11 +936,28 @@ struct PagesPdf {
     /// Where each object after the first three starts.
     offsets: Vec<usize>,
     pages: u32,
-    /// The text of each character code of the fonts: code `n` is code
-    /// `n % 256` of font `n / 256`.
-    codes: Vec<String>,
-    coded: std::collections::HashMap<String, usize>,
+    /// What each character code of the fonts stands for and draws: code
+    /// `n` is code `n % 256` of font `n / 256`.
+    codes: Vec<Code>,
+    coded: std::collections::HashMap<(String, Option<String>), usize>,
+    /// How long the drawings of the codes are, together.
+    drawn: usize,
 }
+
+/// A character code of the fonts of a rebuilt PDF.
+#[cfg(feature = "cdr-pdf")]
+struct Code {
+    /// The text it stands for; empty for none.
+    text: String,
+    /// What it draws, and the box that holds that, if it draws anything.
+    drawing: Option<(String, hayro::kurbo::Rect)>,
+    width: f64,
+}
+
+/// Most bytes of the drawings of glyphs in a document, which is some
+/// hundred times what a book's fonts take.
+#[cfg(feature = "cdr-pdf")]
+const MAX_DRAWN: usize = 1 << 25;
 
 /// Most character codes the text of a document is given, 256 to a font.
 #[cfg(feature = "cdr-pdf")]
@@ -579,21 +991,41 @@ impl PagesPdf {
         self.data.extend_from_slice(b"endobj\n");
     }
 
-    /// The code of `text`, if it has one or there are codes left.
-    fn code(&mut self, text: &str) -> Option<usize> {
-        if let Some(&code) = self.coded.get(text) {
+    /// The code of `text` drawn as `drawing`, held in `bounds`, or as
+    /// nothing, if it has one or there are codes left; `width` is how far
+    /// the glyph reaches, in thousandths of the size of the text, as far as
+    /// the first glyph given the code does.
+    fn code(
+        &mut self,
+        text: &str,
+        drawing: Option<(String, hayro::kurbo::Rect)>,
+        width: f64,
+    ) -> Option<usize> {
+        let key = (
+            text.to_owned(),
+            drawing.as_ref().map(|(drawn, _)| drawn.clone()),
+        );
+        if let Some(&code) = self.coded.get(&key) {
             return Some(code);
         }
         let code = self.codes.len();
-        (code < MAX_CODES).then(|| {
-            self.codes.push(text.to_owned());
-            self.coded.insert(text.to_owned(), code);
-            code
-        })
+        let size = drawing.as_ref().map_or(0, |(drawn, _)| drawn.len());
+        if code >= MAX_CODES || self.drawn + size > MAX_DRAWN {
+            return None;
+        }
+        self.drawn += size;
+        self.codes.push(Code {
+            text: text.to_owned(),
+            drawing,
+            width,
+        });
+        self.coded.insert(key, code);
+        Some(code)
     }
 
     /// Add a page `width` by `height` points that shows `picture` over all
-    /// of it, and holds `text`, which does not draw.
+    /// of it, and holds `text`: the glyphs that have a code drawn over the
+    /// picture, and the rest as characters that do not draw.
     fn page(
         &mut self,
         width: f32,
@@ -620,21 +1052,40 @@ impl PagesPdf {
         let mut paint = format!("q {width} 0 0 {height} 0 0 cm /P Do Q");
         if !text.is_empty() {
             use std::fmt::Write as _;
-            // Characters that are not drawn, in a font of glyphs that
-            // would draw nothing if they were.
-            paint += "\nBT 3 Tr";
-            let mut font = None;
+            // Glyphs drawn in their colour, and characters that are not
+            // drawn, in a font of glyphs that would draw nothing if they
+            // were.
+            paint += "\nBT";
+            let (mut font, mut drawn, mut colour) = (None, None, None);
             for character in text {
-                let Some(code) = self.code(&character.text) else {
-                    continue;
+                let shape = character.shape.as_ref();
+                let (code, place) = match shape.and_then(|shape| shape.code) {
+                    Some(code) => (code, shape.map_or(character.place, |shape| shape.matrix)),
+                    None if character.text.is_empty() => continue,
+                    None => match self.code(&character.text, None, 1000.0) {
+                        Some(code) => (code, character.place),
+                        None => continue,
+                    },
                 };
                 if font != Some(code / 256) {
                     font = Some(code / 256);
                     let _ = write!(paint, "\n/T{} 1 Tf", code / 256);
                 }
-                let [a, b, c, d, e, f] = character
-                    .place
-                    .map(|value| (value * 1000.0).round() / 1000.0);
+                let draws = shape.is_some_and(|shape| shape.code.is_some());
+                if drawn != Some(draws) {
+                    drawn = Some(draws);
+                    let _ = write!(paint, "\n{} Tr", if draws { 0 } else { 3 });
+                }
+                if let Some(shape) = shape.filter(|_| draws)
+                    && colour != Some(shape.colour)
+                {
+                    colour = Some(shape.colour);
+                    let [r, g, b] = shape
+                        .colour
+                        .map(|c| (f64::from(c) / 255.0 * 1000.0).round() / 1000.0);
+                    let _ = write!(paint, "\n{r} {g} {b} rg");
+                }
+                let [a, b, c, d, e, f] = place.map(|value| (value * 1000.0).round() / 1000.0);
                 let _ = write!(
                     paint,
                     "\n{a} {b} {c} {d} {e} {f} Tm <{:02X}> Tj",
@@ -688,8 +1139,9 @@ impl PagesPdf {
         Ok(())
     }
 
-    /// Write the fonts of the text: each a Type 3 font of 256 glyphs that
-    /// draw nothing and are an em wide, with what each one stands for.
+    /// Write the fonts of the text: each a Type 3 font of 256 glyphs, each
+    /// one drawn as its code says, or as nothing an em wide, with what each
+    /// one stands for.
     fn fonts(&mut self) -> Vec<usize> {
         use std::fmt::Write as _;
         let fonts = self.codes.len().div_ceil(256);
@@ -702,29 +1154,53 @@ impl PagesPdf {
             .map(|code| format!("/g{code}"))
             .collect::<Vec<_>>()
             .join(" ");
-        let procs: String = (0..256)
-            .map(|code| format!("/g{code} {nothing} 0 R"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let widths = vec!["1000"; 256].join(" ");
         let mut numbers = Vec::new();
         for font in 0..fonts {
-            let codes = &self.codes[font * 256..self.codes.len().min(font * 256 + 256)];
+            let range = font * 256..self.codes.len().min(font * 256 + 256);
+            // The drawings of the glyphs, and the box that holds them all,
+            // which some readers draw no glyph beyond.
+            let mut procs = String::new();
+            let mut widths = String::new();
+            let mut bounds = hayro::kurbo::Rect::new(0.0, -200.0, 1000.0, 800.0);
+            for code in 0..256 {
+                let mut number = nothing;
+                let mut width = 1000.0;
+                if let Some(at) = range.clone().nth(code) {
+                    width = self.codes[at].width;
+                    if let Some((drawing, held)) = self.codes[at].drawing.take() {
+                        bounds = bounds.union(held);
+                        let drawing = format!("{} 0 d0\n{drawing}", (width * 10.0).round() / 10.0);
+                        let packed =
+                            miniz_oxide::deflate::compress_to_vec_zlib(drawing.as_bytes(), 6);
+                        number = self.offsets.len() + 4;
+                        self.object(
+                            &format!("/Filter /FlateDecode /Length {}", packed.len()),
+                            Some(&packed),
+                        );
+                    }
+                }
+                let _ = write!(procs, "/g{code} {number} 0 R ");
+                let _ = write!(widths, "{} ", (width * 10.0).round() / 10.0);
+            }
+            let codes = &self.codes[range];
             let mut map = String::from(
                 "/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n\
                  /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
                  /CMapName /Adobe-Identity-UCS def /CMapType 2 def\n\
                  1 begincodespacerange <00> <FF> endcodespacerange\n",
             );
-            for chunk in codes.chunks(100).enumerate() {
-                let (index, chunk) = chunk;
+            let said: Vec<(usize, &str)> = (codes.iter().enumerate())
+                .filter(|(_, code)| !code.text.is_empty())
+                .map(|(at, code)| (at, code.text.as_str()))
+                .collect();
+            for chunk in said.chunks(100) {
                 let _ = writeln!(map, "{} beginbfchar", chunk.len());
-                for (at, text) in chunk.iter().enumerate() {
+                for &(at, text) in chunk {
                     let units: String = text
                         .encode_utf16()
                         .map(|unit| format!("{unit:04X}"))
                         .collect();
-                    let _ = writeln!(map, "<{:02X}> <{units}>", index * 100 + at);
+                    let _ = writeln!(map, "<{at:02X}> <{units}>");
                 }
                 map += "endbfchar\n";
             }
@@ -738,10 +1214,14 @@ impl PagesPdf {
             numbers.push(self.offsets.len() + 4);
             self.object(
                 &format!(
-                    "/Type /Font /Subtype /Type3 /FontBBox [0 -200 1000 800] \
+                    "/Type /Font /Subtype /Type3 /FontBBox [{} {} {} {}] \
                      /FontMatrix [0.001 0 0 0.001 0 0] /Resources << >> \
-                     /CharProcs << {procs} >> /Encoding << /Type /Encoding /Differences [0 {names}] >> \
-                     /FirstChar 0 /LastChar 255 /Widths [{widths}] /ToUnicode {unicode} 0 R"
+                     /CharProcs << {procs}>> /Encoding << /Type /Encoding /Differences [0 {names}] >> \
+                     /FirstChar 0 /LastChar 255 /Widths [{widths}] /ToUnicode {unicode} 0 R",
+                    bounds.x0.floor(),
+                    bounds.y0.floor(),
+                    bounds.x1.ceil(),
+                    bounds.y1.ceil()
                 ),
                 None,
             );
@@ -2038,9 +2518,16 @@ mod tests {
         use hayro::hayro_syntax::Pdf;
         let document = Pdf::new(hayro::hayro_syntax::PdfData::from(data.to_vec())).unwrap();
         let page = &document.pages()[0];
-        let (_, height) = page.render_dimensions();
+        let (width, height) = page.render_dimensions();
         let settings = hayro::hayro_interpret::InterpreterSettings::default();
-        (text_of(page, &settings, height).into_iter())
+        let found = Found {
+            scale: 1.0,
+            wide: width as u16,
+            high: height as u16,
+            shapes: false,
+        };
+        (text_of(page, &settings, height, found).into_iter())
+            .filter(|character| !character.text.is_empty())
             .map(|character| {
                 let [.., x, y] = character.place;
                 (character.text, [x.round() as i32, y.round() as i32])
@@ -2048,11 +2535,10 @@ mod tests {
             .collect()
     }
 
+    /// A document of one page, US letter, that draws `content`, with
+    /// Helvetica as `/F1`.
     #[cfg(feature = "cdr-pdf")]
-    #[test]
-    fn pdf_text_is_kept_where_it_was_and_does_not_draw() {
-        let content: &[u8] = b"BT /F1 24 Tf 72 700 Td (Hi there) Tj ET \
-                               BT /F1 18 Tf 0 1 -1 0 300 300 Tm (Up) Tj ET";
+    fn one_page(content: &[u8]) -> Vec<u8> {
         let objects: [&[u8]; 5] = [
             b"<< /Type /Catalog /Pages 2 0 R >>",
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -2081,33 +2567,159 @@ mod tests {
         }
         let tail = format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{table}\n%%EOF\n");
         data.extend_from_slice(tail.as_bytes());
+        data
+    }
 
+    /// The first page of a document as a reader draws it, two pixels to
+    /// the point, in levels of grey.
+    #[cfg(feature = "cdr-pdf")]
+    fn looks(data: &[u8]) -> Vec<u8> {
+        use hayro::hayro_interpret::InterpreterSettings;
+        use hayro::hayro_syntax::Pdf;
+        use hayro::vello_cpu::color::palette::css::WHITE;
+        use hayro::{PixmapSettings, RenderCache, RenderSettings, render};
+        let document = Pdf::new(hayro::hayro_syntax::PdfData::from(data.to_vec())).unwrap();
+        let settings = PixmapSettings {
+            x_scale: 2.0,
+            y_scale: 2.0,
+            bg_color: WHITE,
+        };
+        let drawn = render(
+            &document.pages()[0],
+            &RenderCache::new(),
+            &InterpreterSettings::default(),
+            // Hinting moves the stems of a font's glyphs to whole pixels,
+            // which a reader does for one font and not for another.
+            &RenderSettings {
+                hinting: false,
+                ..RenderSettings::default()
+            },
+            &settings,
+        );
+        let pixels = drawn.data_as_u8_slice().as_chunks::<4>().0.iter();
+        pixels.map(|pixel| pixel[1]).collect()
+    }
+
+    /// How many pixels of two drawings of the same size are more than a
+    /// quarter of the way from black to white apart.
+    #[cfg(feature = "cdr-pdf")]
+    fn apart(one: &[u8], other: &[u8]) -> usize {
+        assert_eq!(one.len(), other.len());
+        (one.iter().zip(other))
+            .filter(|(a, b)| a.abs_diff(**b) > 64)
+            .count()
+    }
+
+    /// The picture of the first page of a rebuilt document, as written.
+    #[cfg(feature = "cdr-pdf")]
+    fn page_picture(data: &[u8]) -> Vec<u8> {
+        let at = data.windows(6).position(|w| w == b"/Image").unwrap();
+        let end = data[at..]
+            .windows(9)
+            .position(|w| w == b"endstream")
+            .unwrap();
+        data[at..at + end].to_vec()
+    }
+
+    #[cfg(feature = "cdr-pdf")]
+    #[test]
+    fn pdf_text_is_kept_where_it_was_and_drawn_as_shapes() {
+        let data = one_page(
+            b"BT /F1 24 Tf 72 700 Td (Hi there) Tj ET \
+              BT /F1 18 Tf 0 1 -1 0 300 300 Tm (Up) Tj ET \
+              BT /F1 9 Tf 0.8 0.1 0.1 rg 72 600 Td (small and red) Tj ET",
+        );
         let before = said(&data);
         let text: String = before.iter().map(|(text, _)| text.as_str()).collect();
-        assert_eq!(text, "Hi thereUp");
+        assert_eq!(text, "Hi thereUpsmall and red");
         assert_eq!(before[0].1, [72, 700]);
-        let rebuilt = run(&data).unwrap();
-        assert!(scans_clean(&rebuilt.data));
-        assert!(contains(&rebuilt.data, b"/Subtype /Type3"));
+        let blank = page_picture(&run(&one_page(b"")).unwrap().data);
+        let ink = looks(&data).iter().filter(|&&grey| grey < 192).count();
+        assert!(ink > 1000, "{ink}");
+
+        let rebuilt = run(&data).unwrap().data;
+        assert!(scans_clean(&rebuilt));
+        assert!(contains(&rebuilt, b"/Subtype /Type3"));
+        assert!(!contains(&rebuilt, b"FontFile"));
         // The same characters, where they were, upright or not.
-        assert_eq!(said(&rebuilt.data), before);
-        // None of it is drawn: the picture is the one of the page without.
-        let without = Options {
+        assert_eq!(said(&rebuilt), before);
+        // Out of the picture, and drawn as they were, to the odd pixel at
+        // the edge of a glyph.
+        assert!(page_picture(&rebuilt) == blank);
+        let off = apart(&looks(&rebuilt), &looks(&data));
+        assert!(off * 50 < ink, "{off} of {ink}");
+
+        // Kept in the picture, the characters do not draw.
+        let raster = Options {
+            pdf_vector_text: false,
+            ..Options::default()
+        };
+        let pictured = rebuild(&data, &Limits::default(), &raster).unwrap().data;
+        assert_eq!(said(&pictured), before);
+        assert!(page_picture(&pictured) != blank);
+
+        // Without the text, the shapes are drawn and say nothing.
+        let silent = Options {
             pdf_text: false,
             ..Options::default()
         };
-        let plain = rebuild(&data, &Limits::default(), &without).unwrap().data;
+        let shapes = rebuild(&data, &Limits::default(), &silent).unwrap().data;
+        assert_eq!(said(&shapes), []);
+        assert!(page_picture(&shapes) == blank);
+        assert_eq!(looks(&shapes), looks(&rebuilt));
+
+        // With neither, a picture of the page and nothing else.
+        let neither = Options {
+            pdf_text: false,
+            pdf_vector_text: false,
+            ..Options::default()
+        };
+        let plain = rebuild(&data, &Limits::default(), &neither).unwrap().data;
         assert!(!contains(&plain, b"Type3"));
         assert_eq!(said(&plain), []);
-        let image = |data: &[u8]| {
-            let at = data.windows(6).position(|w| w == b"/Image").unwrap();
-            let end = data[at..]
-                .windows(9)
-                .position(|w| w == b"endstream")
-                .unwrap();
-            data[at..at + end].to_vec()
+        assert!(page_picture(&plain) == page_picture(&pictured));
+    }
+
+    #[cfg(feature = "cdr-pdf")]
+    #[test]
+    fn pdf_text_that_is_not_drawn_plainly_stays_in_the_picture() {
+        let raster = Options {
+            pdf_vector_text: false,
+            ..Options::default()
         };
-        assert!(image(&rebuilt.data) == image(&plain));
+        // Whether all of it stays, and what is drawn on the page.
+        for (stays, content) in [
+            // Half covered by a white box drawn after it: the letters it
+            // covers stay, hidden, and the others are shapes.
+            (
+                false,
+                &b"BT /F1 24 Tf 72 700 Td (Covered) Tj ET 1 g 100 690 40 40 re f"[..],
+            ),
+            // Outlined, not filled.
+            (true, b"BT /F1 24 Tf 1 Tr 72 600 Td (Outlined) Tj ET"),
+            // On a background of two colours, which meet under it.
+            (
+                true,
+                b"0.9 g 72 495 30 40 re f 0.6 g 102 495 60 40 re f \
+                  0 g BT /F1 24 Tf 90 505 Td (W) Tj ET",
+            ),
+        ] {
+            let shown = String::from_utf8_lossy(content);
+            let data = one_page(content);
+            let pictured = rebuild(&data, &Limits::default(), &raster).unwrap().data;
+            let rebuilt = run(&data).unwrap().data;
+            assert_eq!(said(&rebuilt), said(&data));
+            let same = page_picture(&rebuilt) == page_picture(&pictured);
+            assert_eq!(same, stays, "{shown}");
+            // No farther from the page than the picture alone is.
+            let ink = looks(&data).iter().filter(|&&grey| grey < 192).count();
+            let off = apart(&looks(&rebuilt), &looks(&data));
+            let pictured = apart(&looks(&pictured), &looks(&data));
+            assert!(
+                off <= pictured + ink / 50,
+                "{shown}: {off}, {pictured} of {ink}"
+            );
+        }
     }
 
     #[cfg(feature = "cdr-pdf")]
