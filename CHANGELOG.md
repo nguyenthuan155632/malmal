@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Ruby: an interrupt during a scan or a rebuild, such as `Timeout.timeout` or
+  `Thread#raise`, no longer loses the report and the rebuilt file the library allocated;
+  it is raised once they are freed. `Malmal::Scanner#close` while another thread scans
+  no longer frees the scanner under it: the scanner is freed as the last scan running
+  returns, and scans after `close` raise `Malmal::ScanError`.
+
 ## 0.4.0
 
 ### Added

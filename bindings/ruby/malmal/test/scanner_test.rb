@@ -111,6 +111,35 @@ class ScannerTest < Minitest::Test
     assert_raises(Malmal::ScanError) { closing.scan(GIF) }
   end
 
+  # A picture slow enough to rebuild that another thread can act meanwhile.
+  def slow_png
+    chunk = ->(kind, body) { [body.bytesize].pack("N") + kind + body + [Zlib.crc32(kind + body)].pack("N") }
+    random = Random.new(1)
+    rows = Array.new(1000) { "\0".b + random.bytes(3000) }.join
+    "\x89PNG\r\n\x1a\n".b + chunk.call("IHDR", [1000, 1000, 8, 2, 0, 0, 0].pack("NNCCCCC")) +
+      chunk.call("IDAT", Zlib::Deflate.deflate(rows, 1)) + chunk.call("IEND", "")
+  end
+
+  def test_close_waits_for_the_scans_running
+    image = slow_png
+    closing = Malmal::Scanner.new
+    running = Thread.new { closing.sanitize(image) }
+    sleep 0.02
+    closing.close
+    assert_predicate closing, :closed?
+    assert_equal :png, running.value.file_type
+    assert_raises(Malmal::ScanError) { closing.scan(GIF) }
+  end
+
+  def test_an_interrupt_waits_for_the_call
+    image = slow_png
+    running = Thread.new { scanner.sanitize(image) }
+    sleep 0.02
+    running.raise(Interrupt)
+    assert_raises(Interrupt) { running.join }
+    assert_predicate scanner.scan(GIF), :clean?
+  end
+
   def test_library
     assert_equal Malmal::VERSION, scanner.library_version
     assert Malmal::Native.path

@@ -62,6 +62,8 @@ module Malmal
       @options.merge!(limits)
       @handle = build(JSON.generate(@options))
       @mutex = Mutex.new
+      @in_use = 0
+      @closed = false
     end
 
     # Scan +data+: a String of bytes, or an IO read up to the size limit and
@@ -69,14 +71,18 @@ module Malmal
     # claimed. Returns a Report; raises ScanError if the file was not scanned.
     def scan(data, filename: nil, content_type: nil)
       bytes = read(data)
-      with_input(bytes) do |pointer|
-        report = FFI::MemoryPointer.new(:pointer)
-        verdict = Native.malmal_scan(handle, pointer, bytes.bytesize, claim(filename), claim(content_type), report)
-        json = take_string(report.read_pointer)
-        raise ScanError, "the scanner failed; the file was not scanned" if verdict == Native::ERROR || json.nil?
-
-        Report.from_h(JSON.parse(json))
+      filename = claim(filename)
+      content_type = claim(content_type)
+      verdict, json = native_call do |scanner|
+        with_input(bytes) do |pointer|
+          report = FFI::MemoryPointer.new(:pointer)
+          verdict = Native.malmal_scan(scanner, pointer, bytes.bytesize, filename, content_type, report)
+          [verdict, take_string(report.read_pointer)]
+        end
       end
+      raise ScanError, "the scanner failed; the file was not scanned" if verdict == Native::ERROR || json.nil?
+
+      Report.from_h(JSON.parse(json))
     end
 
     # Scan +data+ and, if it is clean and of a type that can be, write it
@@ -93,22 +99,32 @@ module Malmal
       options[:types] = Array(options[:types]).map(&:to_s) if options.key?(:types)
       options[:jpeg_quality] = jpeg_quality if jpeg_quality
       bytes = read(data)
-      with_input(bytes) do |pointer|
-        image = FFI::MemoryPointer.new(:pointer)
-        length = FFI::MemoryPointer.new(:size_t)
-        info = FFI::MemoryPointer.new(:pointer)
-        status = Native.malmal_sanitize_json(handle, pointer, bytes.bytesize, claim(filename), claim(content_type),
-                                             JSON.generate(options), image, length, info)
-        rebuilt = take_bytes(image.read_pointer, length.read(:size_t))
-        json = take_string(info.read_pointer)
-        sanitized(status, rebuilt, json ? JSON.parse(json) : {})
+      filename = claim(filename)
+      content_type = claim(content_type)
+      options = JSON.generate(options)
+      status, rebuilt, json = native_call do |scanner|
+        with_input(bytes) do |pointer|
+          image = FFI::MemoryPointer.new(:pointer)
+          length = FFI::MemoryPointer.new(:size_t)
+          info = FFI::MemoryPointer.new(:pointer)
+          status = Native.malmal_sanitize_json(scanner, pointer, bytes.bytesize, filename, content_type, options,
+                                               image, length, info)
+          # Both are taken, and freed, whichever of them fails.
+          begin
+            rebuilt = take_bytes(image.read_pointer, length.read(:size_t))
+          ensure
+            json = take_string(info.read_pointer)
+          end
+          [status, rebuilt, json]
+        end
       end
+      sanitized(status, rebuilt, json ? JSON.parse(json) : {})
     end
 
     # Scans that +wait+ stopped waiting for and that are still running.
     # Above 0, restart the process when it can be.
     def overdue
-      Native.malmal_scanner_overdue(handle)
+      native_call { |scanner| Native.malmal_scanner_overdue(scanner) }
     end
 
     # The version of the loaded libmalmal_ffi.
@@ -116,16 +132,19 @@ module Malmal
       Native.version
     end
 
-    # Free the scanner now rather than when it is collected.
+    # Free the scanner now rather than when it is collected. Scans already
+    # running finish first, and the scanner is freed as the last of them
+    # returns; new ones raise ScanError.
     def close
       @mutex.synchronize do
-        @handle&.free
-        @handle = nil
+        @closed = true
+        free_if_unused
       end
+      nil
     end
 
     def closed?
-      @handle.nil?
+      @closed
     end
 
     def inspect
@@ -144,8 +163,43 @@ module Malmal
       Handle.new(pointer)
     end
 
-    def handle
-      @handle or raise ScanError, "the scanner is closed"
+    # Call into the library with the handle, which #close leaves alone until
+    # every call holding it has returned. Interrupts, such as Timeout's, wait
+    # until the call's results are taken and freed: raised as the native
+    # function returns, which is when Ruby raises them, they would leave
+    # what it allocated for the caller to free with no one to free it.
+    def native_call
+      Thread.handle_interrupt(Object => :never) do
+        scanner = acquire
+        begin
+          yield scanner
+        ensure
+          release
+        end
+      end
+    end
+
+    def acquire
+      @mutex.synchronize do
+        raise ScanError, "the scanner is closed" if @closed
+
+        @in_use += 1
+        @handle
+      end
+    end
+
+    def release
+      @mutex.synchronize do
+        @in_use -= 1
+        free_if_unused
+      end
+    end
+
+    def free_if_unused
+      return unless @closed && @in_use.zero? && @handle
+
+      @handle.free
+      @handle = nil
     end
 
     def password_json(password)
