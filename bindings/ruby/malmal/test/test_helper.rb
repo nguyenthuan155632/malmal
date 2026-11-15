@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
-$LOAD_PATH.unshift File.expand_path("../lib", __dir__)
+# MALMAL_TEST_INSTALLED=1 tests the gem as installed, library and all.
+$LOAD_PATH.unshift File.expand_path("../lib", __dir__) unless ENV["MALMAL_TEST_INSTALLED"] == "1"
 require "malmal"
 require "minitest/autorun"
 require "digest"
