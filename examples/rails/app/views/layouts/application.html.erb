@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>malmal upload demo</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 44rem; margin: 2rem auto; padding: 0 1rem; }
+      .notice { color: #1a6b2d; } .alert { color: #a3141b; }
+      form { margin: 1rem 0 2rem; } li { margin: .25rem 0; } code { font-size: .9em; }
+    </style>
+  </head>
+  <body>
+    <% if notice %><p class="notice"><%= notice %></p><% end %>
+    <% if alert %><p class="alert"><%= alert %></p><% end %>
+    <%= yield %>
+  </body>
+</html>

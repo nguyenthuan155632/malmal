@@ -36,12 +36,23 @@ module Malmal
       Report.from_h(body["report"])
     end
 
-    # As Scanner#sanitize, with the daemon's own options of the rebuild.
-    def sanitize(data, filename: nil, content_type: nil)
+    # As Scanner#sanitize, with the daemon's own options of the rebuild
+    # (the --jpeg-quality and --pdf-* flags it was started with). +types+ is
+    # checked here, against the type of the rebuilt file: one of another type
+    # raises NotRebuilt. Any other option raises ArgumentError.
+    def sanitize(data, filename: nil, content_type: nil, types: nil, **options)
+      unless options.empty?
+        raise ArgumentError, "#{options.keys.join(", ")} cannot be sent to malmald; start the daemon with them instead"
+      end
+
       response = post("/sanitize", data, filename, content_type)
       case response.code
       when "200"
         file_type = Sanitized::CONTENT_TYPES.key(response["Content-Type"].to_s.split(";").first) || :unknown
+        if types && !Array(types).map(&:to_sym).include?(file_type)
+          raise NotRebuilt, "a #{file_type} file is not among the types to rebuild"
+        end
+
         # The daemon does not send the report of a file it rebuilt; the
         # rebuilt file was clean, or it would not have been sent.
         report = Report.new(verdict: :clean, detected_type: file_type)

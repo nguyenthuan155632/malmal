@@ -1,0 +1,50 @@
+#!/bin/sh
+# Start the demo, upload a few files from tests/corpus through its forms, and
+# print what it answered. Exits non-zero if an answer is not the expected one.
+#
+#   MALMAL_FROM_CHECKOUT=1 MALMAL_LIBRARY=.../libmalmal_ffi.so bin/try
+set -u
+cd "$(dirname "$0")/.."
+corpus=../../tests/corpus
+port=${PORT:-3999}
+base=http://127.0.0.1:$port
+work=$(mktemp -d)
+trap 'kill $server 2>/dev/null; rm -rf "$work"' EXIT
+
+bundle install --quiet
+rm -f storage/*.sqlite3*
+bin/rails db:prepare >/dev/null
+bin/rails server -p "$port" -P "$work/server.pid" >"$work/server.log" 2>&1 &
+server=$!
+for _ in $(seq 1 60); do curl -sf -o /dev/null "$base/" && break; sleep 1; done
+
+jar=$work/cookies
+# Each form has a token of its own.
+token() {
+  curl -s -c "$jar" -b "$jar" "$base/" | grep -A3 "action=\"$1\"" \
+    | grep -o 'name="authenticity_token" value="[^"]*"' | head -1 | sed 's/.*value="//; s/"$//'
+}
+failed=0
+# expect <path> <field> <file> <name> <type> <text the answer has to contain>
+expect() {
+  curl -s -c "$jar" -b "$jar" -o /dev/null -F "authenticity_token=$(token "$1")" \
+    -F "$2=@$3;filename=$4;type=$5" "$base$1"
+  answer=$(curl -s -c "$jar" -b "$jar" "$base/" | grep -oE 'class="(notice|alert)">[^<]*' | sed 's/.*">//')
+  case $answer in
+    *"$6"*) echo "ok    $4: $answer" ;;
+    *) echo "FAIL  $4: $answer (expected \"$6\")"; failed=1 ;;
+  esac
+}
+
+printf '\177ELF\002\001\001\000\000\000\000\000\000\000\000\000' > "$work/elf"
+expect /documents file "$corpus/clean/page.pdf" page.pdf application/pdf "page.pdf was accepted"
+expect /documents file "$work/elf" invoice.pdf application/pdf "looks malicious (type.mismatch, type.executable)"
+expect /documents file "$corpus/malicious/password-javascript.pdf" locked.pdf application/pdf "pdf.javascript"
+expect /avatars avatar "$corpus/clean/cmyk-profile.jpg" me.jpg image/jpeg "rebuilt as me.jpg"
+expect /avatars avatar "$corpus/clean/pixels-spell-pdf.png" me.png image/png "image.polyglot"
+
+# The analyze job scans what was stored, in the background.
+sleep 2
+curl -s "$base/" | grep -q '<code>clean' || { echo "FAIL  no stored file was scanned"; failed=1; }
+[ $failed = 0 ] || { echo "--- server log"; tail -40 "$work/server.log"; }
+exit $failed

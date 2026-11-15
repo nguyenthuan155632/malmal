@@ -58,6 +58,9 @@ class ClientTest < Minitest::Test
     assert_equal :png, sanitized.file_type
     refute_includes sanitized.data, "holiday"
     assert_raises(Malmal::Rejected) { client.sanitize(ELF, filename: "photo.jpg") }
+    assert_equal :png, client.sanitize(png_with_comment, filename: "a.png", types: %i[png jpeg]).file_type
+    assert_raises(Malmal::NotRebuilt) { client.sanitize(png_with_comment, filename: "a.png", types: [:jpeg]) }
+    assert_raises(ArgumentError) { client.sanitize(png_with_comment, jpeg_quality: 80) }
   end
 
   def test_unreachable
