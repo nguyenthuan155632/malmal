@@ -98,8 +98,9 @@
 //! colours are, checked to give every colour of a grid of them as the
 //! original does; one that cannot be is turned into sRGB as before. An AVIF
 //! that names its primaries and transfer keeps them, named in the PNG
-//! (`cICP`). One for a display of high dynamic range always does: sRGB
-//! cannot show it.
+//! (`cICP`). One for a display of high dynamic range (PQ, HLG) does so
+//! whatever the option, as sRGB cannot show it, unless [`Hdr::Sdr`] has it
+//! tone mapped into sRGB, for viewers that do not read `cICP`.
 //!
 //! With [`Inks::Keep`], a CMYK JPEG, TIFF or PSD keeps its inks instead:
 //! a JPEG its coefficients, a TIFF or PSD its samples, written as a TIFF.
@@ -195,6 +196,30 @@ pub struct Options {
     /// What becomes of an image in colours of an RGB or grey profile other
     /// than sRGB, such as Display P3 or Adobe RGB.
     pub profiles: Profiles,
+    /// What becomes of an AVIF for a display of high dynamic range.
+    pub hdr: Hdr,
+}
+
+/// What becomes of an AVIF for a display of high dynamic range, coded with
+/// PQ or HLG: colours brighter than the white of sRGB, which sRGB cannot
+/// show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Hdr {
+    /// Kept as they are, in a PNG of 16 bits that names them (`cICP`).
+    /// A viewer that reads the chunk shows them as the AVIF did; one that
+    /// does not shows them washed out.
+    #[default]
+    Keep,
+    /// Tone mapped into sRGB, which every viewer shows alike. The white of
+    /// a page (203 nits, ITU-R BT.2408) is the white of sRGB: what is
+    /// darker than four fifths of it is as it was, and what is brighter, up
+    /// to the brightest the file says it has (1000 nits if it does not, and
+    /// for HLG), is pressed into the rest, the brightest to white, each
+    /// colour as a whole so that its hue stays. What only a display of high
+    /// dynamic range showed is lost. Only BT.709, BT.2020 and Display P3
+    /// primaries are tone mapped; others are refused.
+    Sdr,
 }
 
 /// What becomes of the colours of an image under an RGB or grey profile
@@ -257,6 +282,7 @@ impl Default for Options {
             pdf_vector_text: true,
             inks: Inks::Srgb,
             profiles: Profiles::Srgb,
+            hdr: Hdr::Keep,
         }
     }
 }
@@ -1588,13 +1614,19 @@ fn raster(
         FileType::Tiff => {
             // JPEG of the first kind is the JPEG it stands for, rebuilt as
             // any JPEG is.
-            if let Some(jpeg) = ojpeg::jpeg(data, limits)
+            if let Some(jpeg) = ojpeg::jpeg(data, limits, deadline)
                 && detect::detect(&jpeg) == FileType::Jpeg
             {
                 match raster(&jpeg, FileType::Jpeg, limits, options, deadline) {
                     Err(Error::Decode(_) | Error::Encode(_)) => {}
                     other => return other,
                 }
+            }
+            // Pages of it, as a TIFF of JPEG pages of the later kind.
+            if let Some(pages) =
+                ojpeg::pages(data, limits, deadline, options.profiles == Profiles::Keep)
+            {
+                return Ok(pages);
             }
             tif::rebuild(
                 data,
@@ -1662,7 +1694,13 @@ fn raster(
         }
         // There is no AV1 encoder here; a PNG keeps every pixel.
         FileType::Avif => {
-            let shown = avif::shown(data, limits, deadline, options.profiles == Profiles::Keep)?;
+            let shown = avif::shown(
+                data,
+                limits,
+                deadline,
+                options.profiles == Profiles::Keep,
+                options.hdr == Hdr::Sdr,
+            )?;
             match shown.space {
                 avif::Space::Srgb => write(shown.image, deadline, Output::Png(None)),
                 avif::Space::Icc(icc) => {
@@ -3771,6 +3809,37 @@ mod tests {
             );
             assert!(rebuilt.data.len() < data.len() * 2, "{name}");
         }
+        // A page of LZW between two of JPEG is as it is from its pixels;
+        // the others keep their coefficients.
+        let data = corpus("mixed-pages.tif");
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Tiff);
+        assert_eq!((rebuilt.frames, rebuilt.width, rebuilt.height), (3, 48, 32));
+        let kinds = strips(&rebuilt.data);
+        assert_eq!(kinds[0], (7, 6));
+        assert_eq!(kinds[1].1, 2);
+        assert_ne!(kinds[1].0, 7);
+        assert_eq!(kinds[2], (7, 6));
+        let pixels = |data: &[u8]| {
+            let mut decoder = tiff::decoder::Decoder::new(Cursor::new(data)).unwrap();
+            let mut pages = Vec::new();
+            loop {
+                let size = decoder.dimensions().unwrap();
+                let tiff::decoder::DecodingResult::U8(samples) = decoder.read_image().unwrap()
+                else {
+                    panic!("not 8-bit");
+                };
+                pages.push((size, samples));
+                if !decoder.more_images() {
+                    break;
+                }
+                decoder.next_image().unwrap();
+            }
+            pages
+        };
+        let (ours, theirs) = (pixels(&rebuilt.data), pixels(&data));
+        assert_eq!(ours[1], theirs[1]);
+        assert_eq!(ours[1].0, (40, 24));
         let data = corpus("cmyk-jpeg.tif");
         let options = Options {
             inks: Inks::Keep,

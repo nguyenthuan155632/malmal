@@ -641,17 +641,38 @@ asked), a Rack middleware that scans every multipart upload, Windows.
 
 Not done: HEIC (no HEVC decoder in Rust); AVIF image sequences without a still image.
 
+Then, from those limits:
+
+- [x] Old-style JPEG in TIFF in tiles (each a JPEG, or a scan of the tables in tags),
+      and of more than one page, which becomes a TIFF of JPEG pages of the later kind.
+- [x] A TIFF of JPEG pages keeps the coefficients of each page that can; the others
+      are as they are from their pixels.
+- [x] Duotones are shown as Photoshop shows them, from the alternate colours it writes
+      (resource 1066: a Lab colour for each of 256 levels of grey), checked on a file
+      saved by Photoshop. Without it, the inks are mixed as before, in the colours that
+      resource gives the inks if it is there (a Pantone ink's is only there). An
+      overprint the file leaves unset is the product of its inks, not black.
+- [x] Profiles of Ghostscript (grey and RGB) are rewritten and checked against Little
+      CMS as well as moxcms; CI installs them.
+- [x] `Hdr::Sdr` (`--tone-map`, `tone_map`) tone maps a PQ or HLG AVIF into sRGB.
+- [x] Lossless WebP about twice as fast: a shorter search for copies, no far copies
+      shorter than six pixels (which made files larger), the two ways tried at once
+      for pictures of up to 4 megapixels.
+
 Known limits of what is done:
 
-- Old-style JPEG in TIFF (compression 6): one page in strips only; tiles or more pages
-  are refused as before.
-- A TIFF of JPEG pages keeps its coefficients only if every page can; one page that
-  cannot (another compression, extra samples, a profile not kept) sends the whole file
-  through its pixels (Deflate).
-- Duotone overprints: their order in the colour mode data (1+2, 1+3, 2+3, 1+2+3, ...)
-  is inferred, not checked against files saved by Photoshop.
-- Grey profiles kept are tested on a profile made by moxcms only.
-- AVIF PQ/HLG as a PNG with `cICP`: viewers that ignore the chunk show it wrong.
+- Old-style JPEG in TIFF: pages of another compression in the same file, or a page
+  whose profile is not kept, still refuse the whole file.
+- A TIFF of JPEG pages whose JPEG pages do not show what their pixels do is all
+  through its pixels, as before.
+- Duotones without resource 1066 (written by Photoshop 7 and later): the inks alone
+  come within about 30 of 255 of what Photoshop shows on the one file checked, and the
+  order of overprints (1+2, 1+3, 2+3, 1+2+3, ...) is that of Photoshop's dialog, not
+  checked against a tritone or quadtone file, of which none was found.
+- Tone mapping is a curve of its own (linear to 80 percent of the white of a page,
+  then pressed to the brightest the file says), not BT.2390's; primaries other than
+  BT.709, BT.2020 and Display P3 are refused. JPEG XL of high dynamic range is shown
+  as jxl-oxide renders it.
 - The forks in `third_party/` need upkeep; see its README.
 
 ## Order and dependencies

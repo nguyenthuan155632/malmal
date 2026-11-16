@@ -44,6 +44,9 @@ Options:
                        or the primaries an AVIF names, as they are, with the
                        profile written anew, rather than turning them into
                        sRGB
+  --tone-map           sanitize: bring an AVIF of high dynamic range (PQ,
+                       HLG) into sRGB, rather than keep it in a PNG that
+                       names its colours, which some viewers ignore
   --pdf-dpi <N>        sanitize: dots per inch of a rebuilt PDF's pages,
                        36-600 [default: 150]
   --pdf-jpeg           sanitize: keep a page of a rebuilt PDF as a JPEG, at
@@ -69,6 +72,7 @@ struct Args {
     jpeg_quality: u8,
     keep_cmyk: bool,
     keep_profile: bool,
+    tone_map: bool,
     pdf_dpi: u16,
     pdf_jpeg: bool,
     pdf_text: bool,
@@ -116,6 +120,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
         jpeg_quality: 90,
         keep_cmyk: false,
         keep_profile: false,
+        tone_map: false,
         pdf_dpi: 150,
         pdf_jpeg: false,
         pdf_text: true,
@@ -143,6 +148,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
             parsed.keep_cmyk = true;
         } else if arg == "--keep-profile" && sanitize {
             parsed.keep_profile = true;
+        } else if arg == "--tone-map" && sanitize {
+            parsed.tone_map = true;
         } else if arg == "--pdf-jpeg" && sanitize {
             parsed.pdf_jpeg = true;
         } else if arg == "--pdf-no-text" && sanitize {
@@ -326,6 +333,9 @@ fn sanitize(args: &Args, scanner: &malmal::Scanner) -> ExitCode {
     }
     if args.keep_profile {
         options.profiles = malmal::cdr::Profiles::Keep;
+    }
+    if args.tone_map {
+        options.hdr = malmal::cdr::Hdr::Sdr;
     }
     if args.pdf_jpeg {
         options.pdf_pages = malmal::cdr::PageImage::Jpeg;

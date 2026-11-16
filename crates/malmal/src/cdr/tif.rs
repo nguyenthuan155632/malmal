@@ -147,19 +147,7 @@ pub(super) fn jpeg_page<R: std::io::Read + std::io::Seek>(
     if !fits {
         return None;
     }
-    // Colours of another profile are kept in it, written anew, or not at
-    // all: the page's pixels are then converted. Inks keep theirs.
-    let mut profile = None;
-    if let Ok(icc) = decoder.get_tag_u8_vec(Tag::IccProfile) {
-        if inks {
-            profile = Some(colour::rewritten_cmyk(&icc)?);
-        } else if ToSrgb::new(Some(icc.clone())).is_some() {
-            if !keep_profile {
-                return None;
-            }
-            profile = Some(colour::rewritten_screen(&icc, spp as usize)?);
-        }
-    }
+    let profile = page_profile(decoder, spp as usize, inks, keep_profile)?;
     let (width, height) = decoder.dimensions().ok()?;
     if u64::from(width) * u64::from(height) > limits.max_pixels {
         return None;
@@ -222,6 +210,32 @@ pub(super) fn jpeg_page<R: std::io::Read + std::io::Seek>(
         photometric,
         profile,
     })
+}
+
+/// The profile the page `decoder` is at keeps as a page of JPEG, of `spp`
+/// samples a pixel (or of inks): `Some(None)` for none or sRGB, `None` if
+/// the page cannot keep its colours as they are. Colours of another
+/// profile are kept in it, written anew, or not at all: the page's pixels
+/// are then converted. Inks keep theirs.
+pub(super) fn page_profile<R: std::io::Read + std::io::Seek>(
+    decoder: &mut Decoder<R>,
+    spp: usize,
+    inks: bool,
+    keep_profile: bool,
+) -> Option<Option<Vec<u8>>> {
+    let Ok(icc) = decoder.get_tag_u8_vec(Tag::IccProfile) else {
+        return Some(None);
+    };
+    if inks {
+        return Some(Some(colour::rewritten_cmyk(&icc)?));
+    }
+    if ToSrgb::new(Some(icc.clone())).is_none() {
+        return Some(None);
+    }
+    if !keep_profile {
+        return None;
+    }
+    Some(Some(colour::rewritten_screen(&icc, spp)?))
 }
 
 /// The one page of the TIFF in `data`, whose pixels `shown` holds, as a
@@ -298,7 +312,7 @@ pub(super) fn pages_for_test(data: &[u8]) -> Vec<u8> {
 }
 
 /// The resolution of a page, as a JPEG states it.
-fn jfif_density<R: std::io::Read + std::io::Seek>(
+pub(super) fn jfif_density<R: std::io::Read + std::io::Seek>(
     decoder: &mut Decoder<R>,
 ) -> super::jpeg::Density {
     let mut value = |tag| match decoder.find_tag(tag).ok()?? {

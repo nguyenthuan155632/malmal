@@ -13,6 +13,7 @@ corpus/clean/cmyk-profile.jpg	Clean
 corpus/clean/cmyk-profile.tif	Clean	
 corpus/clean/colours.avif	Clean	
 corpus/clean/decoder-panic.jxl	Clean	
+corpus/clean/duotone-photoshop.psd	Clean	
 corpus/clean/encrypted-empty-password.pdf	Clean	pdf.encrypted
 corpus/clean/encrypted-rc4.pdf	Clean	pdf.encrypted
 corpus/clean/fax-g3-1d.tif	Clean	
@@ -33,6 +34,7 @@ corpus/clean/layers.psd	Clean
 corpus/clean/line.eps	Clean	
 corpus/clean/lossy-alpha.webp	Clean	
 corpus/clean/lossy-animation.webp	Clean	
+corpus/clean/mixed-pages.tif	Clean	
 corpus/clean/p3-jpeg.tif	Clean	
 corpus/clean/p3-lossy.webp	Clean	
 corpus/clean/p3.jpg	Clean	

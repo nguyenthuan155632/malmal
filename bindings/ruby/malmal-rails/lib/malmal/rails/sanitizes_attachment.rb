@@ -21,7 +21,7 @@ module Malmal
     # +:malmal_not_rebuilt+, or is kept as it was with
     # <tt>on_not_rebuilt: :keep</tt> (pair that with the validator). Other
     # options are those of Malmal::Scanner#sanitize: +types+, +jpeg_quality+,
-    # +keep_cmyk+, +keep_profile+, +pdf_dpi+, +pdf_jpeg+, +pdf_text+, +pdf_vector_text+.
+    # +keep_cmyk+, +keep_profile+, +tone_map+, +pdf_dpi+, +pdf_jpeg+, +pdf_text+, +pdf_vector_text+.
     module SanitizesAttachment
       extend ActiveSupport::Concern
 

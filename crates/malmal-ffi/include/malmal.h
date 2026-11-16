@@ -160,6 +160,9 @@ int malmal_sanitize(const malmal_scanner *scanner, const uint8_t *data,
  *                      or grey profile other than sRGB (Display P3, Adobe
  *                      RGB) in it, with the profile written anew, rather
  *                      than as sRGB
+ *   "tone_map"         true to bring an AVIF of high dynamic range (PQ,
+ *                      HLG) into sRGB, rather than keep it in a PNG that
+ *                      names its colours (cICP)
  *   "pdf_dpi"          36 to 600 [150]
  *   "pdf_jpeg"         true to keep a page as JPEG where that is smaller
  *   "pdf_text"         false to leave out the text layer of a rebuilt PDF
