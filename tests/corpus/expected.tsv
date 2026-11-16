@@ -110,6 +110,9 @@ corpus/malicious/xxe.svg	Malicious	svg.entity
 corpus/malicious/zip-after-image.ico	Malicious	image.polyglot,image.trailing_data
 corpus/malicious/zip-header-inside.pdf	Malicious	pdf.polyglot
 corpus/malicious/zip-polyglot.png	Malicious	image.polyglot,image.trailing_data
+prototypes/files/avif-php-trailing.avif	Malicious	image.malformed,payload.php
+prototypes/files/avif-script-trailing.avif	Malicious	image.malformed,payload.script
+prototypes/files/avif-zip-polyglot.avif	Malicious	image.malformed,image.polyglot
 prototypes/files/bmp-php-trailing.bmp	Malicious	image.trailing_data,payload.php
 prototypes/files/bmp-pixel-bomb.bmp	Suspicious	image.malformed
 prototypes/files/bmp-zip-polyglot.bmp	Malicious	image.polyglot,image.trailing_data
@@ -120,26 +123,50 @@ prototypes/files/bomb-png-iccp.png	Suspicious	limit.decompression
 prototypes/files/bomb-png-ztxt.png	Suspicious	limit.decompression
 prototypes/files/bomb-svgz.svgz	Suspicious	limit.decompression,type.mismatch,type.not_allowed
 prototypes/files/clean-a85-image.eps	Clean	
+prototypes/files/clean-avif.avif	Suspicious	image.malformed
 prototypes/files/clean-data-png.svg	Clean	
 prototypes/files/clean-double-dot.jpg	Clean	
 prototypes/files/clean-eps-prolog.eps	Clean	
+prototypes/files/clean-eps-standard.eps	Clean	
 prototypes/files/clean-exif-caption.jpg	Clean	
 prototypes/files/clean-exif-description.tif	Clean	
 prototypes/files/clean-form-no-js.pdf	Clean	
 prototypes/files/clean-icc.png	Clean	
+prototypes/files/clean-ico.ico	Suspicious	image.malformed,image.trailing_data
 prototypes/files/clean-inline-css.svg	Clean	
 prototypes/files/clean-link-uri.pdf	Clean	
 prototypes/files/clean-local-gradient.svg	Clean	
+prototypes/files/clean-long-exif.jpg	Clean	
 prototypes/files/clean-netscape-loop.gif	Clean	
+prototypes/files/clean-pdf-acroform.pdf	Clean	
+prototypes/files/clean-pdf-link-small.pdf	Clean	pdf.uri
+prototypes/files/clean-pdf-metadata-xmp.pdf	Clean	
+prototypes/files/clean-pdf-outline.pdf	Clean	
 prototypes/files/clean-photo.jpg	Clean	
 prototypes/files/clean-photo.png	Clean	
 prototypes/files/clean-photo.tif	Clean	
 prototypes/files/clean-photo.webp	Clean	
 prototypes/files/clean-plain.svg	Clean	
+prototypes/files/clean-svg-animate-color.svg	Clean	
+prototypes/files/clean-svg-filter-blur.svg	Clean	
+prototypes/files/clean-svg-use-local.svg	Clean	
 prototypes/files/clean-title-desc.svg	Clean	
 prototypes/files/clean-xmp-packet.jpg	Clean	
 prototypes/files/elf.jpg	Malicious	type.executable,type.mismatch
 prototypes/files/empty.jpg	Suspicious	type.mismatch,type.unknown
+prototypes/files/evasion-jsp-expression.jpg	Malicious	payload.template
+prototypes/files/evasion-pdf-deep-next-chain.pdf	Malicious	pdf.javascript,pdf.open_action,pdf.uri
+prototypes/files/evasion-pdf-launch-hex.pdf	Malicious	pdf.launch,pdf.obfuscated_name,pdf.open_action
+prototypes/files/evasion-pdf-nested-objstm.pdf	Malicious	pdf.javascript,pdf.open_action
+prototypes/files/evasion-php-backtick.jpg	Malicious	payload.php
+prototypes/files/evasion-php-bom.png	Malicious	payload.php
+prototypes/files/evasion-ps-charbychar.eps	Clean	
+prototypes/files/evasion-ps-eexec.eps	Malicious	ps.pipe
+prototypes/files/evasion-ps-nested-proc.eps	Malicious	ps.file_access
+prototypes/files/evasion-script-null.png	Malicious	payload.script
+prototypes/files/evasion-svg-cdata-split.svg	Malicious	svg.script
+prototypes/files/evasion-svg-entity-js.svg	Malicious	svg.javascript_uri
+prototypes/files/evasion-svg-set-onclick.svg	Malicious	svg.event_handler
 prototypes/files/gif-javascript-header.gif	Suspicious	image.malformed
 prototypes/files/gif-php-after-trailer.gif	Malicious	image.trailing_data,payload.php
 prototypes/files/gif-php-application.gif	Malicious	payload.php
@@ -148,8 +175,12 @@ prototypes/files/gif-php-header.gif	Malicious	image.malformed,payload.php
 prototypes/files/gif-pixel-bomb.gif	Suspicious	image.pixel_bomb
 prototypes/files/gif-script-after-trailer.gif	Malicious	image.polyglot,image.trailing_data,payload.script
 prototypes/files/gif-truncated.gif	Suspicious	image.malformed
+prototypes/files/heic-elf-trailing.heic	Suspicious	image.malformed
+prototypes/files/heic-php-trailing.heic	Malicious	image.malformed,payload.php
 prototypes/files/htaccess.jpg	Suspicious	type.mismatch,type.unknown
 prototypes/files/html.jpg	Suspicious	type.mismatch,type.not_allowed
+prototypes/files/ico-php-trailing.ico	Malicious	image.malformed,image.trailing_data,payload.php
+prototypes/files/ico-pixel-bomb.ico	Suspicious	image.malformed,image.trailing_data
 prototypes/files/image.php.jpg	Malicious	name.dangerous_extension
 prototypes/files/image.phtml	Malicious	name.dangerous_extension
 prototypes/files/image.png.exe	Malicious	name.dangerous_extension
@@ -168,6 +199,9 @@ prototypes/files/jpeg-script-comment.jpg	Malicious	payload.script
 prototypes/files/jpeg-short-tag-after-eoi.jpg	Malicious	image.trailing_data,payload.php
 prototypes/files/jpeg-truncated.jpg	Suspicious	image.malformed
 prototypes/files/jpeg-zip-polyglot.jpg	Malicious	image.polyglot,image.trailing_data
+prototypes/files/jxl-php-trailing.jxl	Malicious	payload.php
+prototypes/files/jxl-script-trailing.jxl	Malicious	image.malformed,payload.script
+prototypes/files/jxl-zip-polyglot.jxl	Malicious	image.malformed,image.polyglot
 prototypes/files/macho.gif	Malicious	type.executable,type.mismatch
 prototypes/files/malmal‮gpj.php	Malicious	name.dangerous_extension
 prototypes/files/name-aspx.gif.aspx	Malicious	name.dangerous_extension
@@ -201,18 +235,35 @@ prototypes/files/obf-svg-ns-prefix.svg	Suspicious	type.mismatch,type.unknown
 prototypes/files/obf-svg-onload-upper.svg	Malicious	svg.event_handler
 prototypes/files/obf-svg-script-comment.svg	Suspicious	svg.malformed
 prototypes/files/obf-svg-utf7.svg	Suspicious	svg.malformed
+prototypes/files/pdf-ambiguous-startxref.pdf	Malicious	pdf.javascript,pdf.open_action
 prototypes/files/pdf-annot-js.pdf	Malicious	pdf.javascript
 prototypes/files/pdf-catalog-aa.pdf	Malicious	pdf.additional_action,pdf.javascript
+prototypes/files/pdf-conflicting-objects.pdf	Malicious	pdf.conflicting_objects,pdf.javascript,pdf.malformed
+prototypes/files/pdf-dangerous-uri-file-exe.pdf	Suspicious	pdf.dangerous_uri,pdf.link_lure,pdf.uri
+prototypes/files/pdf-dangerous-uri-js.pdf	Malicious	pdf.dangerous_uri,pdf.link_lure,pdf.uri
+prototypes/files/pdf-dangerous-uri-msdt.pdf	Malicious	pdf.dangerous_uri,pdf.link_lure,pdf.uri
+prototypes/files/pdf-dangerous-uri-unc.pdf	Suspicious	pdf.dangerous_uri,pdf.link_lure,pdf.uri
+prototypes/files/pdf-disguised-gibberish.pdf	Suspicious	pdf.disguised_link,pdf.link_lure,pdf.uri
+prototypes/files/pdf-disguised-ip.pdf	Suspicious	pdf.disguised_link,pdf.link_lure,pdf.uri
+prototypes/files/pdf-disguised-punycode.pdf	Suspicious	pdf.disguised_link,pdf.link_lure,pdf.uri
+prototypes/files/pdf-disguised-shortener.pdf	Suspicious	pdf.disguised_link,pdf.link_lure,pdf.uri
+prototypes/files/pdf-elf-polyglot.pdf	Malicious	pdf.polyglot,pdf.trailing_data
 prototypes/files/pdf-embedded-exe.pdf	Malicious	pdf.embedded_file,type.executable
 prototypes/files/pdf-embedded-svg.pdf	Malicious	pdf.embedded_file,svg.script
 prototypes/files/pdf-encrypted.pdf	Suspicious	pdf.encrypted
+prototypes/files/pdf-external-form-ref.pdf	Suspicious	pdf.external_ref
+prototypes/files/pdf-external-stream.pdf	Suspicious	pdf.external_ref
 prototypes/files/pdf-field-js.pdf	Malicious	pdf.additional_action,pdf.javascript
 prototypes/files/pdf-file-attachment.pdf	Suspicious	pdf.embedded_file
 prototypes/files/pdf-flate-bomb.pdf	Suspicious	limit.decompression
 prototypes/files/pdf-gotoe.pdf	Suspicious	pdf.open_action,pdf.remote_goto
 prototypes/files/pdf-gotor.pdf	Suspicious	pdf.open_action,pdf.remote_goto
+prototypes/files/pdf-huge-page.pdf	Suspicious	pdf.page_size
+prototypes/files/pdf-image-pixel-bomb.pdf	Suspicious	pdf.pixel_bomb
 prototypes/files/pdf-import-data.pdf	Suspicious	pdf.open_action,pdf.submit_form
 prototypes/files/pdf-incremental-js.pdf	Malicious	pdf.incremental_update,pdf.javascript,pdf.open_action
+prototypes/files/pdf-jbig2-image.pdf	Clean	pdf.risky_codec
+prototypes/files/pdf-jpx-image.pdf	Clean	pdf.risky_codec
 prototypes/files/pdf-js-hex-filter.pdf	Malicious	pdf.javascript,pdf.open_action
 prototypes/files/pdf-js-hex-string.pdf	Malicious	pdf.javascript,pdf.open_action
 prototypes/files/pdf-js-no-action-type.pdf	Malicious	pdf.javascript,pdf.open_action,pdf.uri
@@ -222,16 +273,30 @@ prototypes/files/pdf-junk-prefix.pdf	Suspicious	pdf.malformed,pdf.polyglot
 prototypes/files/pdf-launch-objstm.pdf	Malicious	pdf.launch,pdf.open_action
 prototypes/files/pdf-launch-win.pdf	Malicious	pdf.launch,pdf.open_action
 prototypes/files/pdf-launch.pdf	Malicious	pdf.launch,pdf.open_action
+prototypes/files/pdf-link-lure.pdf	Suspicious	pdf.link_lure,pdf.uri
+prototypes/files/pdf-metadata-doctype.pdf	Suspicious	pdf.xml_entity
+prototypes/files/pdf-metadata-xinclude.pdf	Suspicious	pdf.xml_external_ref
 prototypes/files/pdf-names-js.pdf	Malicious	pdf.javascript
 prototypes/files/pdf-openaction-js.pdf	Malicious	pdf.javascript,pdf.open_action
+prototypes/files/pdf-opi.pdf	Suspicious	pdf.external_ref
 prototypes/files/pdf-page-aa.pdf	Malicious	pdf.additional_action,pdf.javascript
 prototypes/files/pdf-php-after-eof.pdf	Malicious	payload.php,pdf.trailing_data
+prototypes/files/pdf-print-only-annot.pdf	Clean	pdf.print_only
+prototypes/files/pdf-print-only-layer.pdf	Clean	pdf.print_only
+prototypes/files/pdf-ps-content-operator.pdf	Malicious	pdf.postscript
 prototypes/files/pdf-ps-xobject.pdf	Malicious	pdf.postscript
+prototypes/files/pdf-reference-loop.pdf	Clean	
 prototypes/files/pdf-rich-media.pdf	Suspicious	pdf.rich_media
+prototypes/files/pdf-self-drawing-form.pdf	Suspicious	pdf.draw_recursion
+prototypes/files/pdf-sig-no-byterange.pdf	Suspicious	pdf.signature_invalid
 prototypes/files/pdf-submit-form.pdf	Suspicious	pdf.open_action,pdf.submit_form
+prototypes/files/pdf-trailing-bytes.pdf	Suspicious	pdf.trailing_data
 prototypes/files/pdf-truncated.pdf	Suspicious	pdf.malformed
 prototypes/files/pdf-uri.pdf	Suspicious	pdf.open_action,pdf.uri
+prototypes/files/pdf-xfa-stylesheet.pdf	Suspicious	pdf.xfa,pdf.xml_external_ref
+prototypes/files/pdf-xfa-xxe.pdf	Malicious	pdf.xfa,pdf.xml_entity
 prototypes/files/pdf-xfa.pdf	Malicious	pdf.javascript,pdf.xfa
+prototypes/files/pdf-zip-polyglot.pdf	Malicious	pdf.polyglot,pdf.trailing_data
 prototypes/files/pe.png	Malicious	type.executable,type.mismatch
 prototypes/files/php.png	Malicious	payload.php,type.mismatch,type.unknown
 prototypes/files/png-bad-crc.png	Suspicious	image.malformed
@@ -258,22 +323,36 @@ prototypes/files/poly-pdf-in-pdf.pdf	Malicious	pdf.embedded_file,pdf.incremental
 prototypes/files/poly-pdf-svg-script.pdf	Malicious	pdf.embedded_file,svg.foreign_object,svg.script
 prototypes/files/poly-pdf-zip.pdf	Malicious	pdf.polyglot,pdf.trailing_data
 prototypes/files/poly-rar.png	Suspicious	type.mismatch,type.unknown
+prototypes/files/ps-bcpdecode.eps	Suspicious	ps.unusual_filter
+prototypes/files/ps-bcpencode.eps	Suspicious	ps.unusual_filter
 prototypes/files/ps-bind-alias.eps	Malicious	ps.file_access
+prototypes/files/ps-currentpagedevice.eps	Malicious	ps.ghostscript_internal
 prototypes/files/ps-deletefile.eps	Malicious	ps.file_access
 prototypes/files/ps-dos-binary-pipe.eps	Malicious	ps.file_access,ps.pipe,ps.wmf_preview
+prototypes/files/ps-dot-type.eps	Malicious	ps.ghostscript_internal
+prototypes/files/ps-driver-key-setpage.eps	Malicious	ps.device_access
+prototypes/files/ps-eqproc.eps	Malicious	ps.ghostscript_internal
 prototypes/files/ps-exec-a85.eps	Suspicious	ps.exec_dynamic
 prototypes/files/ps-exec-hex-string.eps	Malicious	ps.exec_dynamic,ps.file_access,ps.pipe
 prototypes/files/ps-exec-name.eps	Suspicious	ps.exec_dynamic
 prototypes/files/ps-exec-string.eps	Suspicious	ps.exec_dynamic
 prototypes/files/ps-file-read.eps	Malicious	ps.file_access
+prototypes/files/ps-file-status.eps	Malicious	ps.file_access
 prototypes/files/ps-file-write.eps	Malicious	ps.file_access
 prototypes/files/ps-filenameforall.eps	Malicious	ps.file_access
+prototypes/files/ps-finddevice.eps	Malicious	ps.device_access
 prototypes/files/ps-forceput.eps	Malicious	ps.ghostscript_internal
 prototypes/files/ps-getenv.eps	Malicious	ps.ghostscript_internal
 prototypes/files/ps-libfile.eps	Malicious	ps.ghostscript_internal
+prototypes/files/ps-libpath.eps	Malicious	ps.ghostscript_internal
 prototypes/files/ps-load-operator.eps	Malicious	ps.file_access
+prototypes/files/ps-lockfilepermissions.eps	Malicious	ps.ghostscript_internal
+prototypes/files/ps-locksafe.eps	Malicious	ps.ghostscript_internal
+prototypes/files/ps-no-header.eps	Suspicious	ps.malformed,type.mismatch,type.unknown
 prototypes/files/ps-pdf-interpreter.eps	Malicious	ps.ghostscript_internal
+prototypes/files/ps-permitfilereading.eps	Malicious	ps.ghostscript_internal
 prototypes/files/ps-pipe-concat.eps	Malicious	ps.file_access
+prototypes/files/ps-pipe-hex-escape.eps	Malicious	ps.file_access,ps.pipe
 prototypes/files/ps-pipe-named.jpg	Malicious	ps.file_access,ps.pipe,type.mismatch
 prototypes/files/ps-pipe-read.eps	Malicious	ps.file_access,ps.pipe
 prototypes/files/ps-pipe-write.eps	Malicious	ps.file_access,ps.pipe
@@ -283,13 +362,21 @@ prototypes/files/ps-pjl-prefix.eps	Malicious	ps.file_access,ps.malformed,ps.pipe
 prototypes/files/ps-putdeviceprops.eps	Malicious	ps.file_access,ps.ghostscript_internal
 prototypes/files/ps-renamefile.eps	Malicious	ps.file_access
 prototypes/files/ps-restore-trick.eps	Malicious	ps.ghostscript_internal
+prototypes/files/ps-run-remote.eps	Malicious	ps.exec_dynamic,ps.file_access,ps.pipe
 prototypes/files/ps-run.eps	Malicious	ps.file_access
+prototypes/files/ps-selectdevice.eps	Malicious	ps.device_access
+prototypes/files/ps-setdevice.eps	Malicious	ps.device_access
 prototypes/files/ps-setpagedevice-output.eps	Malicious	ps.file_access
+prototypes/files/ps-setsafe.eps	Malicious	ps.ghostscript_internal
 prototypes/files/ps-setuserparams.eps	Malicious	ps.ghostscript_internal
 prototypes/files/ps-statusdict.eps	Clean	
 prototypes/files/ps-stdin.eps	Suspicious	ps.exec_dynamic
 prototypes/files/ps-superexec.eps	Malicious	ps.ghostscript_internal
+prototypes/files/ps-tbcpencode.eps	Suspicious	ps.unusual_filter
 prototypes/files/ps-tempfile.eps	Malicious	ps.ghostscript_internal
+prototypes/files/ps-token-file-exec.eps	Clean	
+prototypes/files/ps-wmf-preview.eps	Clean	ps.wmf_preview
+prototypes/files/psb-php-trailing.psd	Malicious	image.malformed,payload.php
 prototypes/files/psd-php-resource.psd	Malicious	payload.php
 prototypes/files/psd-php-trailing.psd	Malicious	image.trailing_data,payload.php
 prototypes/files/psd-script-resource.psd	Malicious	payload.script
@@ -310,24 +397,36 @@ prototypes/files/struct-psd-huge-channels.psd	Suspicious	image.malformed
 prototypes/files/struct-tiff-many-ifd.tif	Clean	
 prototypes/files/struct-tiff-truncated-ifd.tif	Suspicious	image.malformed
 prototypes/files/struct-webp-huge-canvas.webp	Suspicious	image.malformed
+prototypes/files/svg-animate-entities-js.svg	Malicious	svg.javascript_uri
 prototypes/files/svg-animate-href.svg	Malicious	svg.javascript_uri
+prototypes/files/svg-animate-image-href.svg	Malicious	svg.javascript_uri
+prototypes/files/svg-animate-set-onload.svg	Malicious	svg.event_handler
+prototypes/files/svg-attlist.svg	Malicious	svg.entity
 prototypes/files/svg-css-import.svg	Suspicious	svg.external_ref
+prototypes/files/svg-css-js-url.svg	Malicious	svg.javascript_uri
 prototypes/files/svg-css-url.svg	Suspicious	svg.external_ref
 prototypes/files/svg-data-html.svg	Malicious	svg.data_uri
+prototypes/files/svg-data-object-svg.svg	Malicious	svg.foreign_object,svg.script
 prototypes/files/svg-data-svg-image.svg	Malicious	svg.script
+prototypes/files/svg-data-use-html.svg	Malicious	svg.data_uri
 prototypes/files/svg-entity-bomb.svg	Malicious	svg.entity
+prototypes/files/svg-entity-expansion-deep.svg	Malicious	svg.entity
 prototypes/files/svg-external-image.svg	Suspicious	svg.external_ref
 prototypes/files/svg-external-use.svg	Suspicious	svg.external_ref
+prototypes/files/svg-feimage-external.svg	Suspicious	svg.external_ref
 prototypes/files/svg-file-image.svg	Suspicious	svg.external_ref
 prototypes/files/svg-foreign-object-script.svg	Malicious	svg.foreign_object,svg.script
 prototypes/files/svg-foreign-object.svg	Suspicious	svg.external_ref,svg.foreign_object
 prototypes/files/svg-handler.svg	Malicious	svg.script
+prototypes/files/svg-import-nested.svg	Suspicious	svg.external_ref
 prototypes/files/svg-javascript-entities.svg	Malicious	svg.javascript_uri
 prototypes/files/svg-javascript-href.svg	Malicious	svg.javascript_uri
 prototypes/files/svg-named.png	Malicious	svg.script,type.mismatch
 prototypes/files/svg-onbegin.svg	Malicious	svg.event_handler
 prototypes/files/svg-onclick.svg	Malicious	svg.event_handler
+prototypes/files/svg-onfocusin.svg	Malicious	svg.event_handler
 prototypes/files/svg-onload.svg	Malicious	svg.event_handler
+prototypes/files/svg-onrepeat.svg	Malicious	svg.event_handler
 prototypes/files/svg-php-comment.svg	Malicious	payload.php
 prototypes/files/svg-script-cdata.svg	Malicious	svg.script
 prototypes/files/svg-script-external.svg	Malicious	svg.external_ref,svg.script
@@ -336,7 +435,10 @@ prototypes/files/svg-script.svg	Malicious	svg.script
 prototypes/files/svg-script.svgz	Malicious	svg.script
 prototypes/files/svg-set-href.svg	Malicious	svg.javascript_uri
 prototypes/files/svg-utf16-script.svg	Suspicious	type.mismatch,type.unknown
+prototypes/files/svg-utf16be-script.svg	Suspicious	type.mismatch,type.unknown
+prototypes/files/svg-wrong-root.svg	Suspicious	type.mismatch,type.not_allowed
 prototypes/files/svg-xml-stylesheet.svg	Malicious	svg.script
+prototypes/files/svg-xslt-embedded.svg	Malicious	svg.script
 prototypes/files/svg-xxe-parameter.svg	Malicious	svg.entity
 prototypes/files/svg-xxe.svg	Malicious	svg.entity
 prototypes/files/tiff-bigtiff.tif	Clean	

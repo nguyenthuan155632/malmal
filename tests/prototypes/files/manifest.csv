@@ -237,3 +237,105 @@ name-htaccess.png,block,Apache override text under a PNG name,37
 name-svg-xml.png,block,SVG with a script under a PNG name,160
 name-double-ext.jpg.exe,block,Valid JPEG named as an executable,9081
 malmal‮gpj.php,block,Right-to-left override makes a .php look like a .jpg,9081
+pdf-link-lure.pdf,block,Link annotation covering the whole page,590
+pdf-disguised-shortener.pdf,block,Link going through bit.ly,587
+pdf-disguised-ip.pdf,block,Link to a numeric IP address,586
+pdf-disguised-punycode.pdf,block,Link to a punycode domain,593
+pdf-disguised-gibberish.pdf,block,Link to a host of made-up syllables,595
+pdf-dangerous-uri-js.pdf,block,Link with a javascript: scheme,580
+pdf-dangerous-uri-unc.pdf,block,Link opening a network share,589
+pdf-dangerous-uri-msdt.pdf,block,Link invoking ms-msdt protocol handler,584
+pdf-dangerous-uri-file-exe.pdf,block,Link running a local executable,595
+pdf-external-stream.pdf,block,Stream data read from an outside file,576
+pdf-external-form-ref.pdf,block,Form XObject drawing a page of another document,599
+pdf-opi.pdf,block,OPI comment naming a file to replace the content,661
+pdf-xfa-xxe.pdf,block,XFA form with an XML entity declaration,712
+pdf-metadata-doctype.pdf,block,PDF metadata with a document type declaration,727
+pdf-metadata-xinclude.pdf,block,PDF metadata with an XInclude,698
+pdf-xfa-stylesheet.pdf,block,XFA with an xml-stylesheet processing instruction,710
+pdf-image-pixel-bomb.pdf,block,Image XObject declaring 100000 x 100000 pixels,653
+pdf-huge-page.pdf,block,Page with a 100000 x 100000 point media box,441
+pdf-jbig2-image.pdf,clean,Image compressed with JBIG2Decode,661
+pdf-jpx-image.pdf,clean,Image compressed with JPXDecode,659
+pdf-print-only-annot.pdf,clean,Annotation that is printed but hidden on screen,559
+pdf-print-only-layer.pdf,clean,Layer printed and hidden from the screen,625
+pdf-trailing-bytes.pdf,block,Random bytes appended after %%EOF,1233
+pdf-zip-polyglot.pdf,block,PDF file ending with a ZIP archive,569
+pdf-elf-polyglot.pdf,block,ELF executable appended after the PDF,497
+pdf-conflicting-objects.pdf,block,Same object defined twice with different content,501
+pdf-reference-loop.pdf,clean,Catalog whose Pages reference loops back,433
+pdf-ambiguous-startxref.pdf,block,startxref pointing at a comment instead of the cross-reference table,554
+pdf-sig-no-byterange.pdf,block,Signature without a byte range,685
+pdf-ps-content-operator.pdf,block,Content stream using the PS operator,427
+pdf-self-drawing-form.pdf,block,Form XObject that draws itself through Do,631
+heic-php-trailing.heic,block,PHP appended after a HEIC container,81
+heic-elf-trailing.heic,block,ELF executable appended to a HEIC file,112
+avif-php-trailing.avif,block,PHP appended after an AVIF container,85
+avif-script-trailing.avif,block,HTML script appended after an AVIF,94
+avif-zip-polyglot.avif,block,ZIP archive appended to an AVIF file,109
+jxl-php-trailing.jxl,block,PHP appended after a bare JPEG XL codestream,42
+jxl-script-trailing.jxl,block,Script appended after a JPEG XL container,74
+jxl-zip-polyglot.jxl,block,ZIP archive appended to a JPEG XL container,89
+ico-php-trailing.ico,block,PHP appended after an ICO file,1119
+ico-pixel-bomb.ico,block,ICO declaring a 65535x65535 image,62
+psb-php-trailing.psd,block,PHP appended to a PSB (large PSD) file,74
+ps-bcpencode.eps,block,EPS using the BCPEncode filter,147
+ps-tbcpencode.eps,block,EPS using the TBCPEncode filter,148
+ps-bcpdecode.eps,block,EPS using the BCPDecode filter,147
+ps-selectdevice.eps,block,EPS calling selectdevice,116
+ps-finddevice.eps,block,EPS calling finddevice,118
+ps-setdevice.eps,block,EPS calling setdevice,128
+ps-driver-key-setpage.eps,block,EPS setting the Driver key through setpagedevice,131
+ps-eqproc.eps,block,EPS calling the internal .eqproc operator,111
+ps-locksafe.eps,block,EPS calling the internal .locksafe operator,105
+ps-setsafe.eps,block,EPS calling the internal .setsafe operator,104
+ps-currentpagedevice.eps,block,EPS calling .currentpagedevice,118
+ps-dot-type.eps,block,EPS calling the internal .type operator,103
+ps-permitfilereading.eps,block,EPS setting PermitFileReading through userparams,165
+ps-lockfilepermissions.eps,block,EPS toggling LockFilePermissions,142
+ps-libpath.eps,block,EPS setting the LIBPATH key,115
+ps-file-status.eps,block,EPS probing a file's existence with status,148
+ps-token-file-exec.eps,clean,EPS reading a token from a file and executing it,131
+ps-wmf-preview.eps,clean,Binary EPS with a WMF preview image,188
+ps-no-header.eps,block,PostScript file missing the %! signature,40
+ps-pipe-hex-escape.eps,block,%pipe% assembled from individual hex escapes,121
+ps-run-remote.eps,block,run operator with a pipe to curl,154
+svg-animate-image-href.svg,block,Animation that sets a javascript: href on an image,242
+svg-onrepeat.svg,block,onrepeat handler on an animation,208
+svg-onfocusin.svg,block,onfocusin handler on a shape,199
+svg-data-use-html.svg,block,use element referencing data:text/html,189
+svg-data-object-svg.svg,block,foreignObject embedding data:image/svg+xml with a script,365
+svg-import-nested.svg,block,Style element with nested @import rules,266
+svg-feimage-external.svg,block,feImage filter fetching from a remote host,270
+svg-attlist.svg,block,SVG with an ATTLIST that could redefine attributes,221
+svg-entity-expansion-deep.svg,block,Deeply nested entity expansion (exponential growth),461
+svg-wrong-root.svg,block,XML file whose root is not an svg element,110
+svg-utf16be-script.svg,block,UTF-16 big-endian SVG with a script,312
+svg-xslt-embedded.svg,block,SVG embedding an XSLT stylesheet that runs code,295
+svg-animate-entities-js.svg,block,Animate setting href to javascript: spelled with entities,279
+svg-css-js-url.svg,block,CSS url() with a javascript: address,203
+svg-animate-set-onload.svg,block,Animation that writes an onload attribute,227
+evasion-php-backtick.jpg,block,PHP backtick shell execution in JPEG comment,9098
+evasion-php-bom.png,block,PHP tag preceded by a UTF-8 BOM in PNG,349341
+evasion-jsp-expression.jpg,block,JSP expression tag in JPEG comment,9119
+evasion-script-null.png,block,Script tag preceded by null bytes,349349
+evasion-pdf-deep-next-chain.pdf,block,JavaScript at the end of a long /Next action chain,824
+evasion-pdf-nested-objstm.pdf,block,JavaScript in a doubly nested object stream,643
+evasion-pdf-launch-hex.pdf,block,Launch action with every name hex-escaped,590
+evasion-svg-cdata-split.svg,block,Script content split across CDATA sections,184
+evasion-svg-entity-js.svg,block,javascript: fully spelled out with numeric character references,294
+evasion-svg-set-onclick.svg,block,set element writing an onclick handler,215
+evasion-ps-charbychar.eps,clean,File operator assembled character by character through cvn,191
+evasion-ps-nested-proc.eps,block,File operator hidden inside nested procedures,170
+evasion-ps-eexec.eps,block,Dangerous operator hidden inside an eexec-encrypted section,162
+clean-long-exif.jpg,clean,JPEG with a long but benign EXIF comment,9703
+clean-svg-animate-color.svg,clean,SVG with a color animation (no script),243
+clean-svg-filter-blur.svg,clean,SVG with a Gaussian blur filter,253
+clean-svg-use-local.svg,clean,SVG use element referencing a local symbol,228
+clean-pdf-outline.pdf,clean,PDF with bookmarks and page destinations,633
+clean-pdf-acroform.pdf,clean,PDF with a text field but no JavaScript,605
+clean-pdf-link-small.pdf,clean,PDF with a small web link that does not cover the page,578
+clean-pdf-metadata-xmp.pdf,clean,PDF with a standard XMP metadata stream,730
+clean-eps-standard.eps,clean,Standard EPS with drawing commands only,166
+clean-ico.ico,block,Minimal hand-built ICO (flagged as malformed),1086
+clean-avif.avif,block,Minimal hand-built AVIF (flagged as malformed),52

