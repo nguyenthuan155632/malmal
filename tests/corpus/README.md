@@ -18,3 +18,10 @@ a change to an analyzer shows what it did to real files. After adding a file,
 or when a change is intended, record the new state:
 
     MALMAL_RECORD=1 cargo test -p malmal --test corpus
+
+## Files from elsewhere
+
+- `clean/duotone-photoshop.psd`: `tests/psd_files/colormodes/4x4_8bit_duotone.psd`
+  of [psd-tools](https://github.com/psd-tools/psd-tools) (MIT, Copyright (c)
+  2019 Kota Yamaguchi), saved by Photoshop: a duotone of black
+  and PANTONE 327 CVC, with the colours Photoshop shows it in (resource 1066).

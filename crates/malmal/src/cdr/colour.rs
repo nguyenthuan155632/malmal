@@ -394,4 +394,116 @@ mod tests {
             [255, 255, 255, 0, 255, 255, 0, 0, 0]
         );
     }
+
+    /// Where the profiles of Ghostscript are, if it is installed.
+    fn ghostscript_profiles() -> Option<std::path::PathBuf> {
+        let mut places = vec![
+            std::path::PathBuf::from("/usr/share/ghostscript/iccprofiles"),
+            std::path::PathBuf::from("/usr/share/color/icc/ghostscript"),
+        ];
+        if let Ok(versions) = std::fs::read_dir("/usr/share/ghostscript") {
+            places.extend(versions.flatten().map(|v| v.path().join("iccprofiles")));
+        }
+        places.into_iter().find(|p| p.join("sgray.icc").is_file())
+    }
+
+    /// The colours of `samples` (lines of numbers, one per channel, 0 to
+    /// 255) through `icc` by Little CMS, in Lab; `None` without `transicc`.
+    fn lcms_lab(icc: &[u8], samples: &str, intent: u8) -> Option<Vec<[f64; 3]>> {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("malmal-lcms-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join(format!("{:016x}.icc", {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            icc.hash(&mut h);
+            h.finish()
+        }));
+        std::fs::write(&path, icc).ok()?;
+        let mut child = std::process::Command::new("transicc")
+            .args(["-n", "-t", &intent.to_string(), "-o", "*Lab", "-i"])
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(samples.as_bytes()).ok()?;
+        let out = child.wait_with_output().ok()?;
+        let _ = std::fs::remove_file(&path);
+        assert!(out.status.success(), "transicc failed");
+        let lab = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let v: Vec<f64> = l.split_whitespace().map(|x| x.parse().unwrap()).collect();
+                [v[0], v[1], v[2]]
+            })
+            .collect();
+        Some(lab)
+    }
+
+    /// Profiles made by others than moxcms (those of Ghostscript) are
+    /// rewritten, and Little CMS, which did not make them either, finds the
+    /// new one gives every colour the old one does.
+    #[test]
+    fn profiles_of_ghostscript_are_rewritten_to_the_same_colours() {
+        let required = std::env::var_os("MALMAL_REQUIRE_PROFILES").is_some();
+        let Some(dir) = ghostscript_profiles() else {
+            assert!(!required, "no profiles of Ghostscript");
+            return;
+        };
+        let shades: String = (0..=256)
+            .map(|i| format!("{}\n", f64::from(i) * 255.0 / 256.0))
+            .collect();
+        let steps = [0, 37, 64, 100, 128, 160, 200, 230, 255];
+        let mut grid = String::new();
+        for r in steps {
+            for g in steps {
+                for b in steps {
+                    grid += &format!("{r} {g} {b}\n");
+                }
+            }
+        }
+        let mut checked_by_lcms = 0;
+        for (name, grey) in [
+            ("default_gray.icc", true),
+            ("ps_gray.icc", true),
+            ("sgray.icc", true),
+            ("a98.icc", false),
+            ("default_rgb.icc", false),
+            ("esrgb.icc", false),
+            ("ps_rgb.icc", false),
+            ("rommrgb.icc", false),
+            ("scrgb.icc", false),
+            ("srgb.icc", false),
+        ] {
+            let Ok(icc) = std::fs::read(dir.join(name)) else {
+                continue;
+            };
+            assert_eq!(is_grey(&icc), grey, "{name}");
+            let new = rewritten_screen(&icc, if grey { 1 } else { 3 })
+                .unwrap_or_else(|| panic!("{name} is not rewritten"));
+            assert_eq!(is_grey(&new), grey, "{name}");
+            let samples = if grey { &shades } else { &grid };
+            for intent in [0, 1, 3] {
+                let Some(before) = lcms_lab(&icc, samples, intent) else {
+                    continue;
+                };
+                let after = lcms_lab(&new, samples, intent).unwrap();
+                assert_eq!(before.len(), samples.lines().count(), "{name}");
+                for (b, a) in before.iter().zip(&after) {
+                    for (x, y) in b.iter().zip(a) {
+                        assert!((x - y).abs() < 0.01, "{name}, intent {intent}: {b:?} {a:?}");
+                    }
+                }
+                checked_by_lcms += 1;
+            }
+        }
+        assert!(
+            !required || checked_by_lcms == 30,
+            "transicc checked {checked_by_lcms}"
+        );
+    }
 }

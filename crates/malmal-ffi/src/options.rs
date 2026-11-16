@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use malmal::cdr::{Inks, Options, PageImage, Profiles};
+use malmal::cdr::{Hdr, Inks, Options, PageImage, Profiles};
 use malmal::{FileType, HashList, Limits, Policy, Scanner};
 use serde::Deserialize;
 
@@ -155,6 +155,9 @@ pub struct SanitizeOptions {
     /// Keep colours of an RGB or grey profile other than sRGB in it.
     #[serde(default)]
     keep_profile: bool,
+    /// Tone map an AVIF of high dynamic range into sRGB.
+    #[serde(default)]
+    tone_map: bool,
     pdf_dpi: Option<u16>,
     /// Keep a page as JPEG where that is smaller.
     #[serde(default)]
@@ -198,6 +201,9 @@ impl SanitizeOptions {
         }
         if parsed.keep_profile {
             options.profiles = Profiles::Keep;
+        }
+        if parsed.tone_map {
+            options.hdr = Hdr::Sdr;
         }
         if parsed.pdf_jpeg {
             options.pdf_pages = PageImage::Jpeg;
@@ -272,7 +278,8 @@ mod tests {
     fn sanitize_options() {
         let options = SanitizeOptions::parse(
             r#"{"jpeg_quality": 70, "types": ["png"], "pdf_dpi": 100, "pdf_jpeg": true,
-                "keep_cmyk": true, "keep_profile": true, "pdf_text": false, "pdf_vector_text": false}"#,
+                "keep_cmyk": true, "keep_profile": true, "tone_map": true, "pdf_text": false,
+                "pdf_vector_text": false}"#,
         )
         .unwrap();
         assert_eq!(options.jpeg_quality, 70);
@@ -281,6 +288,7 @@ mod tests {
         assert_eq!(options.pdf_pages, PageImage::Jpeg);
         assert_eq!(options.inks, Inks::Keep);
         assert_eq!(options.profiles, Profiles::Keep);
+        assert_eq!(options.hdr, Hdr::Sdr);
         assert!(!options.pdf_text && !options.pdf_vector_text);
         assert_eq!(SanitizeOptions::parse("").unwrap().jpeg_quality, 90);
         for json in [

@@ -10,8 +10,9 @@
 //! or, when they are to be kept, left as they are under the profile written
 //! anew, or with the primaries and transfer named in the PNG (`cICP`).
 //! Pictures in a range only a display for high dynamic range shows (PQ,
-//! HLG) cannot be brought into sRGB: they are always left as they are, at
-//! 16 bits a channel, with what they are named in the PNG.
+//! HLG) cannot be brought into sRGB as they are: they are left as they
+//! are, at 16 bits a channel, with what they are named in the PNG, or tone
+//! mapped into sRGB when that is asked.
 
 use image::{DynamicImage, ImageBuffer, Luma, LumaA, Rgb, Rgba};
 use moxcms::{
@@ -919,6 +920,152 @@ fn cicp_to_srgb(primaries: u8, transfer: u8) -> Result<Option<ToSrgb>, Error> {
     Ok(ToSrgb::of(profile))
 }
 
+/// The white of sRGB on a display of high dynamic range, in nits: that of
+/// a page of paper or of a graphic (ITU-R BT.2408).
+const SDR_WHITE: f64 = 203.0;
+
+/// Colours of `primaries` coded with PQ (`transfer` 16) or HLG (18), as
+/// light on a display, brought into sRGB, whose white [`SDR_WHITE`] is:
+/// what is darker than 80 percent of it is as it was, and what is
+/// brighter, up to `peak` nits, is pressed into the rest, `peak` to white,
+/// each colour as a whole so that its hue stays. Colours outside sRGB's are
+/// cut to its edge.
+fn tone_mapped(
+    image: &DynamicImage,
+    primaries: u8,
+    transfer: u8,
+    peak: f64,
+    deadline: Deadline,
+) -> Result<DynamicImage, Error> {
+    // The chromaticities of the red, green and blue of a display, and of
+    // its white.
+    let chromaticities = |code: u8| match code {
+        1 => Some([(0.64, 0.33), (0.30, 0.60), (0.15, 0.06)]),
+        9 => Some([(0.708, 0.292), (0.170, 0.797), (0.131, 0.046)]),
+        12 => Some([(0.680, 0.320), (0.265, 0.690), (0.150, 0.060)]),
+        _ => None,
+    };
+    const D65: (f64, f64) = (0.3127, 0.3290);
+    let from = chromaticities(primaries)
+        .ok_or_else(|| refused("its colour primaries cannot be tone mapped"))?;
+    let to_srgb = multiply(
+        &invert(&to_xyz(chromaticities(1).unwrap_or_default(), D65)),
+        &to_xyz(from, D65),
+    );
+    let luminance = to_xyz(from, D65)[1];
+    // The light of each sample, in nits.
+    let pq = |e: f64| {
+        let (m1, m2) = (2610.0 / 16384.0, 2523.0 / 4096.0 * 128.0);
+        let (c1, c2, c3) = (
+            3424.0 / 4096.0,
+            2413.0 / 4096.0 * 32.0,
+            2392.0 / 4096.0 * 32.0,
+        );
+        let p = e.max(0.0).powf(1.0 / m2);
+        10000.0 * ((p - c1).max(0.0) / (c2 - c3 * p)).powf(1.0 / m1)
+    };
+    let hlg = |e: f64| {
+        let (a, b, c) = (0.178_832_77, 0.284_668_92, 0.559_910_73);
+        if e <= 0.5 {
+            e * e / 3.0
+        } else {
+            (((e - c) / a).exp() + b) / 12.0
+        }
+    };
+    // Shown on a display of 1000 nits, as BT.2100 has HLG shown.
+    let peak = if transfer == 18 { 1000.0 } else { peak };
+    let top = (peak / SDR_WHITE).max(1.0);
+    const KNEE: f64 = 0.8;
+    let press = |m: f64| {
+        if m <= KNEE || top <= 1.0 {
+            return m.min(1.0);
+        }
+        // From the knee, at the same slope, to 1 at the top.
+        let (t, end) = ((m - KNEE) / (1.0 - KNEE), (top - KNEE) / (1.0 - KNEE));
+        KNEE + (1.0 - KNEE) * (t * (1.0 + t / (end * end)) / (1.0 + t)).min(1.0)
+    };
+    let encode = |v: f64| {
+        let v = v.clamp(0.0, 1.0);
+        let e = if v <= 0.003_130_8 {
+            12.92 * v
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        };
+        (e * 65535.0).round() as u16
+    };
+    let alpha = image.color().has_alpha();
+    let rgba = image.to_rgba16();
+    let (width, height) = rgba.dimensions();
+    let mut out = Vec::with_capacity(rgba.len());
+    for (index, pixel) in rgba.pixels().enumerate() {
+        if index % (1 << 16) == 0 {
+            deadline.check()?;
+        }
+        let e = [0, 1, 2].map(|i| f64::from(pixel[i]) / 65535.0);
+        let display = if transfer == 16 {
+            e.map(pq)
+        } else {
+            let scene = e.map(hlg);
+            let y: f64 = (0..3).map(|i| luminance[i] * scene[i]).sum();
+            // The system gamma of 1.2 at 1000 nits.
+            let gain = 1000.0 * y.max(1e-6).powf(0.2);
+            scene.map(|v| v * gain)
+        };
+        let linear = [0, 1, 2]
+            .map(|r| (0..3).map(|c| to_srgb[r][c] * display[c]).sum::<f64>() / SDR_WHITE)
+            .map(|v| v.max(0.0));
+        let m = linear.iter().copied().fold(0.0, f64::max);
+        let scale = if m > 0.0 { press(m) / m } else { 0.0 };
+        out.extend(linear.map(|v| encode(v * scale)));
+        if alpha {
+            out.push(pixel[3]);
+        }
+    }
+    let image = if alpha {
+        ImageBuffer::<Rgba<u16>, _>::from_raw(width, height, out).map(DynamicImage::from)
+    } else {
+        ImageBuffer::<Rgb<u16>, _>::from_raw(width, height, out).map(DynamicImage::from)
+    };
+    image.ok_or_else(|| broken("the picture is not the size it says"))
+}
+
+/// The matrix from RGB of `primaries` and `white` to XYZ.
+fn to_xyz(primaries: [(f64, f64); 3], (wx, wy): (f64, f64)) -> [[f64; 3]; 3] {
+    let column = |(x, y): (f64, f64)| [x / y, 1.0, (1.0 - x - y) / y];
+    let [r, g, b] = primaries.map(column);
+    let m = [[r[0], g[0], b[0]], [r[1], g[1], b[1]], [r[2], g[2], b[2]]];
+    let white = column((wx, wy));
+    let inverse = invert(&m);
+    let s = [0, 1, 2].map(|i| (0..3).map(|j| inverse[i][j] * white[j]).sum::<f64>());
+    m.map(|row| [row[0] * s[0], row[1] * s[1], row[2] * s[2]])
+}
+
+fn multiply(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    [0, 1, 2].map(|i| [0, 1, 2].map(|j| (0..3).map(|k| a[i][k] * b[k][j]).sum()))
+}
+
+fn invert(m: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let [[a, b, c], [d, e, f], [g, h, i]] = *m;
+    let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    [
+        [
+            (e * i - f * h) / det,
+            (c * h - b * i) / det,
+            (b * f - c * e) / det,
+        ],
+        [
+            (f * g - d * i) / det,
+            (a * i - c * g) / det,
+            (c * d - a * f) / det,
+        ],
+        [
+            (d * h - e * g) / det,
+            (b * g - a * h) / det,
+            (a * e - b * d) / det,
+        ],
+    ]
+}
+
 /// What the colours of a picture read are in.
 pub(super) enum Space {
     Srgb,
@@ -942,7 +1089,7 @@ pub(super) fn read(
     limits: &Limits,
     deadline: Deadline,
 ) -> Result<DynamicImage, Error> {
-    let shown = shown(data, limits, deadline, false)?;
+    let shown = shown(data, limits, deadline, false, false)?;
     match shown.space {
         Space::Srgb => Ok(shown.image),
         _ => Err(refused(
@@ -953,12 +1100,14 @@ pub(super) fn read(
 
 /// The AVIF in `data`: its primary image, as it is shown, its colours
 /// left in what they are if `keep_profile` and that can be said in a PNG,
-/// in sRGB otherwise.
+/// in sRGB otherwise. Colours of high dynamic range (PQ, HLG) stay as they
+/// are, unless `tone_map`: then they are brought down into sRGB.
 pub(super) fn shown(
     data: &[u8],
     limits: &Limits,
     deadline: Deadline,
     keep_profile: bool,
+    tone_map: bool,
 ) -> Result<Shown, Error> {
     let heif = Heif::parse(data)?;
     let primary = heif.item(heif.primary)?;
@@ -1029,8 +1178,19 @@ pub(super) fn shown(
                 }
             },
         },
-        // PQ and HLG: sRGB cannot show them, so they stay as they are, at
-        // 16 bits whatever the stream has.
+        // PQ and HLG, brought down into what sRGB can show.
+        Described::Cicp(primaries, transfer @ (16 | 18)) if tone_map => {
+            // The brightest the picture is, if the file says.
+            let peak = heif
+                .property(primary, b"clli")?
+                .and_then(|b| Some(u16::from_be_bytes([*b.first()?, *b.get(1)?])))
+                .filter(|&nits| nits > 0)
+                .map_or(1000.0, f64::from);
+            image = tone_mapped(&image, primaries, transfer, peak, deadline)?;
+            Space::Srgb
+        }
+        // PQ and HLG otherwise: sRGB cannot show them, so they stay as
+        // they are, at 16 bits whatever the stream has.
         Described::Cicp(primaries, transfer @ (16 | 18)) => {
             image = if image.color().has_alpha() {
                 image.into_rgba16().into()
@@ -1400,6 +1560,106 @@ mod tests {
         ));
     }
 
+    /// PQ and HLG brought into sRGB: the white of a page is the same in
+    /// both, darker is as it was, the brightest is white, and the colour of
+    /// what is pressed stays.
+    #[test]
+    fn high_dynamic_range_is_tone_mapped() {
+        // The code of PQ for so many nits.
+        let pq = |nits: f64| {
+            let (m1, m2) = (2610.0 / 16384.0, 2523.0 / 4096.0 * 128.0);
+            let (c1, c2, c3) = (
+                3424.0 / 4096.0,
+                2413.0 / 4096.0 * 32.0,
+                2392.0 / 4096.0 * 32.0,
+            );
+            let y = (nits / 10000.0).powf(m1);
+            (((c1 + c2 * y) / (1.0 + c3 * y)).powf(m2) * 65535.0).round() as u16
+        };
+        let grey = |code: u16| [code, code, code];
+        let pixels = [
+            grey(0),
+            grey(pq(50.0)),
+            grey(pq(203.0)),
+            grey(pq(1000.0)),
+            grey(pq(4000.0)),
+            // A bright red of BT.2020, of 600 nits.
+            [pq(600.0), pq(20.0), pq(20.0)],
+            // HLG's white of a page: 75 percent.
+            grey((0.75 * 65535.0f64).round() as u16),
+        ];
+        let image = |pixels: &[[u16; 3]]| {
+            DynamicImage::from(
+                ImageBuffer::<Rgb<u16>, _>::from_raw(
+                    pixels.len() as u32,
+                    1,
+                    pixels.iter().flatten().copied().collect(),
+                )
+                .unwrap(),
+            )
+        };
+        let mapped = |transfer: u8, pixels: &[[u16; 3]]| {
+            tone_mapped(&image(pixels), 9, transfer, 1000.0, Deadline(None))
+                .unwrap()
+                .to_rgb8()
+                .pixels()
+                .map(|p| p.0)
+                .collect::<Vec<_>>()
+        };
+        let pq_mapped = mapped(16, &pixels[..6]);
+        assert_eq!(pq_mapped[0], [0, 0, 0]);
+        // 50 nits is a quarter of white, below the knee: as it was,
+        // 0.246 of light, 135 in sRGB.
+        assert!(
+            pq_mapped[1].iter().all(|&v| v.abs_diff(135) <= 1),
+            "{:?}",
+            pq_mapped[1]
+        );
+        // White, pressed a little: 0.9 of light.
+        assert!(
+            pq_mapped[2].iter().all(|&v| v.abs_diff(243) <= 1),
+            "{:?}",
+            pq_mapped[2]
+        );
+        assert_eq!(pq_mapped[3], [255, 255, 255]);
+        assert_eq!(pq_mapped[4], [255, 255, 255]);
+        let [r, g, b] = pq_mapped[5];
+        // Its green is outside sRGB's, and cut to the edge.
+        assert!(r == 255 && g < 60 && b < 60, "{r} {g} {b}");
+        // Darker to brighter stays so.
+        let ramp: Vec<[u16; 3]> = (0..=100).map(|i| grey(pq(f64::from(i) * 12.0))).collect();
+        let ramp = mapped(16, &ramp);
+        assert!(ramp.windows(2).all(|w| w[0][0] <= w[1][0]));
+        let hlg = mapped(18, &pixels[6..]);
+        assert!(
+            hlg[0]
+                .iter()
+                .zip(pq_mapped[2])
+                .all(|(a, b)| a.abs_diff(b) <= 2),
+            "{:?}",
+            hlg[0]
+        );
+        // Primaries it does not know are refused.
+        assert!(tone_mapped(&image(&pixels), 5, 16, 1000.0, Deadline(None)).is_err());
+
+        // From a file: sRGB, not the colours of the stream.
+        let nclx = boxed(
+            b"colr",
+            &[
+                &b"nclx"[..],
+                &9u16.to_be_bytes(),
+                &16u16.to_be_bytes(),
+                &[0, 2, 0],
+            ]
+            .concat(),
+        );
+        let data = with("colours.avif", &[nclx]);
+        let kept = shown(&data, &Limits::default(), Deadline(None), false, false).unwrap();
+        let sdr = shown(&data, &Limits::default(), Deadline(None), false, true).unwrap();
+        assert!(matches!(sdr.space, Space::Srgb));
+        assert_ne!(sdr.image.to_rgb8(), kept.image.to_rgb8());
+    }
+
     /// Colours to be kept stay as they are, under what the file says they
     /// are in; those of high dynamic range always do, at 16 bits.
     #[test]
@@ -1416,8 +1676,9 @@ mod tests {
                 .concat(),
             )
         };
-        let shown =
-            |data: &[u8], keep| shown(data, &Limits::default(), Deadline(None), keep).unwrap();
+        let shown = |data: &[u8], keep| {
+            shown(data, &Limits::default(), Deadline(None), keep, false).unwrap()
+        };
         let plain = read(&with("colours.avif", &[])).unwrap();
         let p3 = shown(&with("colours.avif", &[nclx(12, 13)]), true);
         assert!(matches!(p3.space, Space::Cicp([12, 13, 0, 1])));

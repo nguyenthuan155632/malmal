@@ -459,6 +459,7 @@ The Python and C interfaces use the default limits. Embedded files are scanned u
 | `--jpeg-quality <N>` | 90 | Quality of rebuilt JPEG files, 1–100 |
 | `--keep-cmyk` | off | Keep the inks of a CMYK JPEG, TIFF or PSD, with their profile, rather than turn them into sRGB |
 | `--keep-profile` | off | Keep the colors of an image under an RGB or grey profile other than sRGB (or the primaries an AVIF names), with the profile rewritten, rather than turn them into sRGB |
+| `--tone-map` | off | Bring an AVIF of high dynamic range (PQ, HLG) into sRGB, rather than keep it in a 16-bit PNG that names its colors (`cICP`), which some viewers ignore |
 | `--pdf-dpi <N>` | 150 | Resolution of rebuilt PDF pages, 36–600 |
 | `--pdf-jpeg` | off | Store a PDF page as JPEG when that is smaller |
 | `--pdf-no-text` | off | Leave out the invisible text layer of a rebuilt PDF |
@@ -650,6 +651,11 @@ In C, use `malmal_sanitize`. In every interface, if rebuilding fails, store noth
   coefficients, a lossy WebP its VP8 stream) and its profile, rebuilt the same way and
   checked on a grid of every color mix; an AVIF that names its primaries and transfer
   keeps them in the PNG's `cICP` chunk.
+- **HDR AVIF** (PQ, HLG) is kept as a 16-bit PNG that names its colors (`cICP`), since
+  sRGB cannot show them. With `--tone-map` (`Hdr::Sdr`, `tone_map` in the bindings) it
+  is tone mapped into sRGB instead, which every viewer shows alike: the white of a page
+  (203 nits) is sRGB's white, the brightest the file says it has is pressed below it,
+  and what only an HDR display showed is lost.
 - **SVG** is filtered through an allowlist
   ([svg-hush](https://github.com/cloudflare/svg-hush)) that keeps only what draws.
   The result is scanned again and refused if it is not clean.

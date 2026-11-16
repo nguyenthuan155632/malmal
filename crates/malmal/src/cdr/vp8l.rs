@@ -422,6 +422,12 @@ impl Token {
 }
 
 const MAX_LENGTH: usize = 4096;
+/// The shortest copy from further than the distances of the plane codes
+/// that is taken: one shorter costs more than its pixels as literals do,
+/// in a photograph, and is not much cheaper in a drawing.
+const FAR_MIN: usize = 6;
+/// How many earlier places of the same two pixels are tried for a copy.
+const TRIES: usize = 16;
 const MAX_DISTANCE: usize = (1 << 20) - 120;
 
 /// `pixels` as literals and copies of what came before.
@@ -438,8 +444,11 @@ fn tokens(pixels: &[u32], xsize: usize, deadline: Deadline) -> Result<Vec<Token>
         let key = u64::from(pixels[i]) ^ (u64::from(pixels[i + 1]) << 32);
         (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - HASH_BITS)) as usize
     };
-    let mut head = vec![usize::MAX; 1 << HASH_BITS];
-    let mut previous = vec![usize::MAX; pixels.len()];
+    // Places, as u32 (a picture has 2^28 pixels at most), u32::MAX for
+    // none.
+    const NONE: u32 = u32::MAX;
+    let mut head = vec![NONE; 1 << HASH_BITS];
+    let mut previous = vec![NONE; pixels.len()];
     let matching = |at: usize, from: usize| {
         let most = (pixels.len() - at).min(MAX_LENGTH);
         (0..most)
@@ -448,11 +457,11 @@ fn tokens(pixels: &[u32], xsize: usize, deadline: Deadline) -> Result<Vec<Token>
     };
     let mut found = Vec::new();
     let mut at = 0;
-    let insert = |head: &mut Vec<usize>, previous: &mut Vec<usize>, i: usize| {
+    let insert = |head: &mut Vec<u32>, previous: &mut Vec<u32>, i: usize| {
         if i + 1 < pixels.len() {
             let h = hash(i);
             previous[i] = head[h];
-            head[h] = i;
+            head[h] = i as u32;
         }
     };
     while at < pixels.len() {
@@ -471,21 +480,26 @@ fn tokens(pixels: &[u32], xsize: usize, deadline: Deadline) -> Result<Vec<Token>
         }
         if at + 1 < pixels.len() {
             let mut candidate = head[hash(at)];
-            let mut tries = 32;
-            while candidate != usize::MAX && tries > 0 && at - candidate <= MAX_DISTANCE {
-                let length = matching(at, candidate);
-                if length > best + 1 {
-                    (best, best_distance) = (length, at - candidate);
+            let mut tries = TRIES;
+            while candidate != NONE && tries > 0 && at - candidate as usize <= MAX_DISTANCE {
+                let place = candidate as usize;
+                // Only one that goes on past the best so far can beat it.
+                let past = best + 1;
+                if at + past < pixels.len() && pixels[place + past] == pixels[at + past] {
+                    let length = matching(at, place);
+                    if length > past {
+                        (best, best_distance) = (length, at - place);
+                    }
                 }
-                candidate = previous[candidate];
+                candidate = previous[place];
                 tries -= 1;
             }
         }
-        if best >= 3 {
-            let code = plane
-                .get(&best_distance)
-                .copied()
-                .unwrap_or(best_distance as u32 + 120);
+        let code = plane
+            .get(&best_distance)
+            .copied()
+            .unwrap_or(best_distance as u32 + 120);
+        if best >= if code <= 120 { 3 } else { FAR_MIN } {
             found.push(Token::Copy {
                 length: best as u32,
                 code,
@@ -1114,6 +1128,10 @@ fn indexed(
 
 /// A VP8L stream of `rgba`, four samples a pixel: the smaller of the ways
 /// tried. `None` if the picture is too large for the format.
+/// The most pixels the two ways of coding a picture are tried at once for:
+/// each holds some 40 bytes a pixel.
+const PARALLEL_PIXELS: usize = 1 << 22;
+
 pub(super) fn encode(
     rgba: &[u8],
     width: u32,
@@ -1153,13 +1171,36 @@ pub(super) fn encode(
         let (r, g, b) = (p >> 16 & 0xFF, p >> 8 & 0xFF, p & 0xFF);
         r != g || g != b
     });
-    for cross in [false, true] {
-        if cross && !colours {
-            continue;
-        }
+    let way = |cross: bool| {
         let mut bits = header();
         predicted(&mut bits, &argb, w, h, cross, deadline)?;
-        let stream = bits.finish();
+        Ok::<_, Error>(bits.finish())
+    };
+    let ways: Vec<bool> = [false, true]
+        .into_iter()
+        .filter(|&cross| !cross || colours)
+        .collect();
+    // With the colour transform and without, at once, unless holding both
+    // at once takes much memory.
+    let streams: Vec<Result<Vec<u8>, Error>> = if w * h <= PARALLEL_PIXELS {
+        std::thread::scope(|scope| {
+            let running: Vec<_> = ways
+                .iter()
+                .map(|&cross| scope.spawn(move || way(cross)))
+                .collect();
+            running
+                .into_iter()
+                .map(|way| {
+                    way.join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect()
+        })
+    } else {
+        ways.into_iter().map(way).collect()
+    };
+    for stream in streams {
+        let stream = stream?;
         if best.as_ref().is_none_or(|b| stream.len() < b.len()) {
             best = Some(stream);
         }

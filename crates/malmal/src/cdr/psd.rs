@@ -66,6 +66,8 @@ struct Resources<'a> {
     transparent_index: Option<u16>,
     /// How each spot or alpha channel is shown, in order.
     display: Vec<Ink>,
+    /// Alternate duotone colours: of each ink, and of each level of grey.
+    duotone: Option<&'a [u8]>,
 }
 
 /// The colour a channel of ink is shown in, and how much it covers what
@@ -77,6 +79,12 @@ struct Ink {
 }
 
 impl Ink {
+    /// Whether colour space `space` is one [`Self::of`] knows the colours
+    /// of: not those of colour books, whose components name a colour.
+    fn known(space: u16) -> bool {
+        matches!(space, 0 | 1 | 2 | 7 | 8)
+    }
+
     /// From a Photoshop colour: a colour space, four 16-bit components and
     /// an opacity from 0 to 100.
     fn of(space: u16, c: [u16; 4], opacity: u16) -> Self {
@@ -178,6 +186,7 @@ fn resources(mut data: &[u8]) -> Resources<'_> {
                 found.density = palette::per_metre(1, fixed(0), fixed(8));
             }
             0x0435 => found.display = display(body, true),
+            0x042A => found.duotone = Some(body),
             0x03EF if found.display.is_empty() => found.display = display(body, false),
             0x0417 if body.len() >= 2 => {
                 found.transparent_index = Some(u16::from_be_bytes([body[0], body[1]]));
@@ -803,7 +812,7 @@ pub(super) fn composite(
     // A duotone is grey printed in up to four inks, each through its own
     // curve; it is shown in the colours they make.
     if mode == 8
-        && let Some(inks) = Duotone::of(colour_mode)
+        && let Some(inks) = Duotone::of(colour_mode, found.duotone)
     {
         image = inks.apply(&image);
     }
@@ -826,12 +835,78 @@ struct Duotone {
     /// paper, by the mask of the inks in it: white for none, an ink's own
     /// colour for one, the overprint colour the file gives for more.
     mixes: Vec<[f32; 3]>,
+    /// The colour Photoshop shows each level of grey in, black first, at
+    /// [`Self::STEPS`] levels, when the file says.
+    shown: Option<Vec<[f32; 3]>>,
+}
+
+/// What the alternate duotone colours resource (1066) says: a colour for
+/// each ink, and the Lab colour Photoshop shows each of 256 levels of grey
+/// in. Photoshop writes it for other programs and does not read it.
+struct Alternate {
+    inks: Vec<Option<[f32; 3]>>,
+    shown: Option<Vec<[f32; 3]>>,
+}
+
+impl Alternate {
+    fn of(body: &[u8]) -> Option<Self> {
+        let be16 = |at: usize| Some(u16::from_be_bytes([*body.get(at)?, *body.get(at + 1)?]));
+        if be16(0)? != 1 {
+            return None;
+        }
+        let count = be16(2)? as usize;
+        if count > 4 {
+            return None;
+        }
+        let inks = (0..count)
+            .map(|ink| {
+                let spec = 4 + ink * 10;
+                let space = be16(spec)?;
+                let c = [
+                    be16(spec + 2)?,
+                    be16(spec + 4)?,
+                    be16(spec + 6)?,
+                    be16(spec + 8)?,
+                ];
+                Ink::known(space).then(|| Ink::of(space, c, 100).colour)
+            })
+            .collect();
+        let table = 4 + count * 10;
+        let lab = colour::Lab::new(colour::Lab::D50);
+        // Bytes of L* (to 255 for 100) and of a* and b* (128 for 0).
+        let shown = (be16(table)? == 256)
+            .then(|| body.get(table + 2..table + 2 + 3 * 256))
+            .flatten()
+            .map(|levels| {
+                let lab_of = |i: usize| {
+                    let at = i * 3;
+                    [
+                        levels[at] as f32 * 100.0 / 255.0,
+                        levels[at + 1] as f32 - 128.0,
+                        levels[at + 2] as f32 - 128.0,
+                    ]
+                };
+                (0..Duotone::STEPS)
+                    .map(|step| {
+                        let at = step as f32 * 255.0 / (Duotone::STEPS - 1) as f32;
+                        let (low, t) = (at.floor() as usize, at.fract());
+                        let (a, b) = (lab_of(low), lab_of((low + 1).min(255)));
+                        let [l, x, y] = [0, 1, 2].map(|i| a[i] + (b[i] - a[i]) * t);
+                        lab.srgb(l, x, y).map(|v| v.clamp(0.0, 1.0))
+                    })
+                    .collect()
+            });
+        Some(Self { inks, shown })
+    }
 }
 
 impl Duotone {
     const STEPS: usize = 1024;
 
-    fn of(data: &[u8]) -> Option<Self> {
+    /// From the colour mode data, and the alternate colours resource if
+    /// there is one.
+    fn of(data: &[u8], alternate: Option<&[u8]>) -> Option<Self> {
+        let alternate = alternate.and_then(Alternate::of);
         let be16 = |at: usize| Some(u16::from_be_bytes([*data.get(at)?, *data.get(at + 1)?]));
         if be16(0)? != 1 {
             return None;
@@ -853,7 +928,14 @@ impl Duotone {
                 be16(spec + 6)?,
                 be16(spec + 8)?,
             ];
-            let colour = Ink::of(be16(spec)?, c, 100).colour;
+            // The alternate resource gives the colour Photoshop shows the
+            // ink in: the only one there is for an ink of a colour book
+            // (Pantone, say), which names its colour rather than giving it,
+            // and for a CMYK black, a black that is not quite.
+            let colour = match alternate.as_ref().and_then(|a| *a.inks.get(ink)?) {
+                Some(colour) => colour,
+                None => Ink::of(be16(spec)?, c, 100).colour,
+            };
             let curve = 4 + 40 + 256 + ink * 28;
             // The points that are set, in tenths of a percent of ink.
             let mut points: Vec<(f32, f32)> = (0..13)
@@ -897,8 +979,11 @@ impl Duotone {
         }
         // Mixes of two inks or more, fewest first and then in the order of
         // their inks (1+2, 1+3, 2+3, 1+2+3 for three), each a colour of 10
-        // bytes after the dot gain. A mix the file does not give is the
-        // product of its inks.
+        // bytes after the dot gain: eleven slots, of which a duotone uses
+        // one, a tritone four and a quadtone all. That is the order of
+        // Photoshop's Overprint Colors dialog; Adobe's specification gives
+        // the slots but not their order. A mix the file does not give is
+        // the product of its inks.
         let mut mixes: Vec<[f32; 3]> = (0..1usize << count)
             .map(|mask| {
                 let mut out = [1.0f32; 3];
@@ -934,16 +1019,34 @@ impl Duotone {
             })() else {
                 break;
             };
-            mixes[mask] = Ink::of(be16(spec)?, c, 100).colour;
+            // A slot not set (65535, as Photoshop writes those it has no
+            // colour for) or of a colour book, whose colour is not in the
+            // file, leaves the product of the inks.
+            let space = be16(spec)?;
+            if Ink::known(space) {
+                mixes[mask] = Ink::of(space, c, 100).colour;
+            }
         }
-        Some(Self { inks, mixes })
+        let shown = alternate.and_then(|a| a.shown);
+        Some(Self { inks, mixes, shown })
     }
 
-    /// The colour of grey `level`, 0 for black (all ink) to 1 for white.
-    ///
-    /// Each mix of inks covers as much of the paper as its inks cover
-    /// together and the others leave bare, and shows its colour there.
+    /// The colour of grey `level`, 0 for black (all ink) to 1 for white:
+    /// the one Photoshop shows, if the file says, or else the one the inks
+    /// make.
     fn colour(&self, level: f32) -> [f32; 3] {
+        match &self.shown {
+            Some(shown) => {
+                shown[(level.clamp(0.0, 1.0) * (Self::STEPS - 1) as f32).round() as usize]
+            }
+            None => self.inked(level),
+        }
+    }
+
+    /// The colour the inks make of grey `level`. Each mix of inks covers
+    /// as much of the paper as its inks cover together and the others leave
+    /// bare, and shows its colour there.
+    fn inked(&self, level: f32) -> [f32; 3] {
         let step = ((1.0 - level.clamp(0.0, 1.0)) * (Self::STEPS - 1) as f32).round() as usize;
         let mut out = [0.0f32; 3];
         for (mask, mix) in self.mixes.iter().enumerate() {
@@ -1114,6 +1217,98 @@ mod tests {
             panic!("not colours");
         };
         assert!(!grey.image.color().has_color());
+    }
+
+    /// A duotone saved by Photoshop, of black and a Pantone ink, is shown
+    /// in the colours Photoshop says it shows each level of grey in.
+    #[test]
+    fn duotone_of_photoshop_is_shown_as_photoshop_shows_it() {
+        let data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/corpus/clean/duotone-photoshop.psd"
+        ))
+        .unwrap();
+        let (colour_mode, after) = section(&data, 26, false).unwrap();
+        let (resource_data, _) = section(&data, after, false).unwrap();
+        let found = resources(resource_data);
+        let duotone = Duotone::of(colour_mode, found.duotone).unwrap();
+        let shown = duotone.shown.as_ref().unwrap();
+        let byte = |c: [f32; 3]| c.map(|v| (v * 255.0).round() as u8);
+        // Black is not quite black, white is the paper, and between is the
+        // green of the ink.
+        assert_eq!(byte(shown[Duotone::STEPS - 1]), [255, 255, 255]);
+        let [r, g, b] = byte(shown[0]);
+        assert!(r < 8 && g < 16 && b < 16, "{r} {g} {b}");
+        let [r, g, b] = byte(shown[Duotone::STEPS / 2]);
+        assert!(g > r + 15 && b > r + 15, "{r} {g} {b}");
+        // The Pantone ink names its colour; the resource gives it.
+        let [r, g, b] = byte(duotone.inks[1].0);
+        assert!(r < 20 && g > 110 && b > 95, "{r} {g} {b}");
+        // The inks alone come near what Photoshop shows.
+        let worst = (0..Duotone::STEPS)
+            .map(|step| {
+                let level = step as f32 / (Duotone::STEPS - 1) as f32;
+                let (a, b) = (duotone.colour(level), duotone.inked(level));
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0, f32::max)
+            })
+            .fold(0.0, f32::max);
+        assert!(worst * 255.0 < 30.0, "{}", worst * 255.0);
+        // Every pixel is one of those colours.
+        let Composite::Colours(picture) =
+            composite(&data, &Limits::default(), Deadline(None), false, false).unwrap()
+        else {
+            panic!("not colours");
+        };
+        let rgb = picture.image.to_rgb8();
+        assert!(picture.image.color().has_color());
+        for pixel in rgb.pixels() {
+            assert!(
+                shown
+                    .iter()
+                    .any(|&c| byte(c).iter().zip(pixel.0).all(|(a, b)| a.abs_diff(b) <= 1)),
+                "{:?}",
+                pixel.0
+            );
+        }
+    }
+
+    /// An overprint the file leaves unset (colour space 65535) is the
+    /// product of its inks, not black.
+    #[test]
+    fn unset_overprints_are_the_product_of_their_inks() {
+        let mut spec = vec![0, 1, 0, 2];
+        // Red and yellow, as RGB of 16 bits: together, red.
+        for colour in [[65535u16, 0, 0], [65535, 65535, 0]] {
+            spec.extend_from_slice(&0u16.to_be_bytes());
+            for c in colour {
+                spec.extend_from_slice(&c.to_be_bytes());
+            }
+            spec.extend_from_slice(&[0, 0]);
+        }
+        spec.resize(4 + 40 + 256, 0);
+        for _ in 0..4 {
+            for i in 0..13 {
+                let value: i16 = match i {
+                    0 => 0,
+                    12 => 1000,
+                    _ => -1,
+                };
+                spec.extend_from_slice(&value.to_be_bytes());
+            }
+            spec.extend_from_slice(&[0, 0]);
+        }
+        spec.extend_from_slice(&[0, 20]);
+        for _ in 0..11 {
+            spec.extend_from_slice(&[0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        assert_eq!(spec.len(), 524);
+        let duotone = Duotone::of(&spec, None).unwrap();
+        let byte = |c: [f32; 3]| c.map(|v| (v * 255.0).round() as u8);
+        assert_eq!(byte(duotone.colour(0.0)), [255, 0, 0]);
+        assert_eq!(byte(duotone.colour(1.0)), [255, 255, 255]);
     }
 
     #[test]

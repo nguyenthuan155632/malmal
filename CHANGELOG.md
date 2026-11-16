@@ -8,8 +8,23 @@
   scan with an impossible spectral selection or approximation, is rebuilt from its
   pixels; the decoder used to panic on it (`malmal-jxl-jbr` 0.2.2).
 
+- A duotone PSD is shown in the colours Photoshop shows it in, which it writes in the
+  file for other programs (resource 1066); an ink of a colour book such as Pantone,
+  whose colour is not in the file otherwise, used to print black. An overprint colour
+  the file leaves unset is the product of its inks, as for a duotone of two, rather
+  than black.
+- A TIFF of JPEG pages with a page of another compression keeps the coefficients of
+  its JPEG pages; one such page used to send the whole file through its pixels.
+- Lossless WebP is written about twice as fast and some 2 to 3 percent smaller: far
+  copies of a few pixels, which cost more than the pixels, are no longer made.
+
 ### Added
 
+- `Hdr::Sdr` (`--tone-map`, `tone_map` in the bindings) tone maps an AVIF of high
+  dynamic range (PQ, HLG) into sRGB, for viewers that do not read the `cICP` chunk of
+  the 16-bit PNG it is kept as otherwise.
+- Old-style JPEG in TIFF (compression 6) in tiles, and of more than one page: the
+  pages become a TIFF of JPEG pages of the later kind, their coefficients kept.
 - A weekly `Forks` workflow checks the crates copied into `third_party/` for RustSec
   advisories under their upstream names, and warns once upstream releases a newer
   version.

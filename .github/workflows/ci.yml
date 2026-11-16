@@ -21,7 +21,13 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Colour profiles made by Ghostscript, and Little CMS to check the
+      # profiles malmal writes from them (`profiles_of_ghostscript_...`).
+      - name: Install Ghostscript's profiles and Little CMS
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgs-common liblcms2-utils
       - run: cargo test --workspace
+        env:
+          MALMAL_REQUIRE_PROFILES: "1"
       - name: Known-good files must come back clean
         run: cargo run --release -p malmal --example survey -- --expect-clean tests/corpus/clean
       # `ring` (TLS in the daemon) and `wasmtime` (YARA) compile C code.
