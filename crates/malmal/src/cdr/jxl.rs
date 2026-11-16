@@ -303,3 +303,71 @@ fn write(
     writer.finish().map_err(failed)?;
     Ok(data)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The JPEG XL in `data` with the body of its `jbrd` box replaced by
+    /// `body`.
+    fn with_jbrd(data: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at + 8 <= data.len() {
+            let size = u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+            let size = if size == 0 { data.len() - at } else { size };
+            if &data[at + 4..at + 8] == b"jbrd" {
+                out.extend_from_slice(&(body.len() as u32 + 8).to_be_bytes());
+                out.extend_from_slice(b"jbrd");
+                out.extend_from_slice(body);
+            } else {
+                out.extend_from_slice(&data[at..at + size]);
+            }
+            at += size;
+        }
+        out
+    }
+
+    /// Reconstruction data that is short or wrong is an error of the
+    /// decoder, never a panic in it (tirr-c/jxl-oxide#512): this calls it
+    /// without the guard `original_jpeg` has.
+    #[test]
+    fn broken_reconstruction_data_does_not_panic() {
+        let clean = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/clean");
+        for name in ["from-jpeg-comment.jxl", "from-progressive-jpeg.jxl"] {
+            let data = std::fs::read(format!("{clean}/{name}")).unwrap();
+            let image = JxlImage::builder().read(Cursor::new(&data)).unwrap();
+            let mut jpeg = Vec::new();
+            image.reconstruct_jpeg(&mut jpeg).unwrap();
+            // The body of the box, found by its name.
+            let at = data.windows(4).position(|w| w == b"jbrd").unwrap();
+            let size = u32::from_be_bytes(data[at - 4..at].try_into().unwrap()) as usize;
+            let body = &data[at + 4..at - 4 + size];
+            let mut broken: Vec<Vec<u8>> = (0..body.len()).map(|n| body[..n].to_vec()).collect();
+            for i in 0..body.len() {
+                for value in [0x00, 0xFF, body[i] ^ 0x01, body[i] ^ 0x80] {
+                    let mut changed = body.to_vec();
+                    changed[i] = value;
+                    broken.push(changed);
+                }
+            }
+            // Each try decodes the image, so they are shared between threads.
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            std::thread::scope(|scope| {
+                for share in broken.chunks(broken.len().div_ceil(threads)) {
+                    let data = &data;
+                    scope.spawn(move || {
+                        for body in share {
+                            let file = with_jbrd(data, body);
+                            let Ok(image) = JxlImage::builder().read(Cursor::new(&file)) else {
+                                continue;
+                            };
+                            let mut out = Vec::new();
+                            let _ = image.reconstruct_jpeg(&mut out);
+                        }
+                    });
+                }
+            });
+        }
+    }
+}
