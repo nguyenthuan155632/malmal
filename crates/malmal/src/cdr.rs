@@ -32,12 +32,16 @@
 //!
 //! | Input | Output |
 //! |---|---|
-//! | JPEG | JPEG, re-compressed at [`Options::jpeg_quality`], rotated as its Exif orientation says |
-//! | PNG | PNG; an animated one keeps every frame, at 8 bits a channel |
-//! | GIF | GIF, every frame |
-//! | WebP | lossless WebP, every frame of an animated one |
-//! | BMP, TIFF, ICO | PNG; of an icon, the largest image |
-//! | JPEG XL | PNG; of an animation, the first frame |
+//! | JPEG | JPEG of the same coefficients, rotated as its Exif orientation says; where that cannot be done without loss, re-compressed at [`Options::jpeg_quality`] at most |
+//! | PNG | PNG; an animated one keeps every frame, at its own depth |
+//! | GIF | GIF of the same palettes and indices, every frame |
+//! | WebP | lossy WebP of the same coded picture, every frame, with its orientation; lossless WebP of a lossless one |
+//! | BMP | PNG |
+//! | TIFF | PNG of its one page, or JPEG of the coefficients of its JPEG strips or tiles, or TIFF of samples of floating point; TIFF of every page if it has more |
+//! | ICO | ICO of every image, each a PNG |
+//! | PSD, PSB | PNG of the composite image Photoshop saves with the layers; a duotone in the colours of its inks |
+//! | JPEG XL | JPEG of the coefficients of one made from a JPEG; otherwise PNG, animated PNG of every frame of an animation |
+//! | AVIF | PNG of its primary image |
 //! | SVG, with the `cdr-svg` feature | SVG, filtered down to what draws a picture |
 //! | PDF, with the `cdr-pdf` feature | PDF in which every page is a picture of the page, with its text, which does not draw |
 //!
@@ -45,11 +49,64 @@
 //! Every other type is refused with [`Error::Unsupported`] rather than
 //! rebuilt in part.
 //!
+//! Where it can, the picture is written anew without being decoded and
+//! coded again, so nothing of it is lost:
+//!
+//! - A JPEG keeps its quantised coefficients: they are read and written
+//!   again with tables of their own. One whose colour profile has to be
+//!   applied, or whose rotation cuts through its blocks, is re-compressed
+//!   instead, at no coarser a quantisation than it had.
+//! - A lossy WebP keeps every symbol its VP8 coder coded: modes,
+//!   quantisers and coefficients are read and coded again at the same
+//!   probabilities, and the file is kept only if it decodes to every pixel
+//!   the original does. Its transparency is coded again without loss.
+//!   An Exif orientation is kept, as Exif of nothing else.
+//! - A GIF keeps its palettes, the indices of its pixels and how each
+//!   frame is drawn over the last; an animated PNG keeps them too, at its
+//!   own depth.
+//! - A TIFF whose strips or tiles are JPEG pictures becomes one JPEG of
+//!   their coefficients put together, kept only if it shows the page as
+//!   decoding the strips does.
+//! - A JPEG XL made from a JPEG gives back that JPEG, which is rebuilt as
+//!   any JPEG is; it is kept only if it shows what the JPEG XL does.
+//!
+//! A lossless WebP is written by an encoder of its own here (a colour
+//! table, prediction block by block, copies of what came before), and
+//! kept only where it decodes to every pixel and is smaller than what the
+//! `image` crate writes.
+//!
+//! A PNG of 256 colours or fewer is written indexed when that is smaller,
+//! and the pixel density of the original is kept. TIFF is read in every
+//! compression libtiff writes, CCITT fax, LZMA and Zstandard among them,
+//! and at any depth from 1 to 64 bits; reduced copies of a page and masks
+//! are left out. AVIF is decoded by `filmcraft-av1`, which gives the
+//! samples libdav1d gives, then put together from its grid, alpha image,
+//! clean aperture, rotation and mirroring.
+//!
 //! The new file has no colour profile, so it is read as sRGB. The pixels of
 //! an image with a profile are converted to keep their colours, as far as
 //! sRGB can show them: an RGB image with an RGB profile, a grey one with a
-//! grey profile, a CMYK JPEG with a CMYK profile. A profile that does not
-//! fit its image, or cannot be read, is dropped as it is.
+//! grey profile, a CMYK JPEG, TIFF or PSD with a CMYK profile, an AVIF with
+//! the primaries and transfer it names. CIE L*a*b* is converted from the
+//! white the file names, D50 otherwise. A profile that does not fit its
+//! image, or cannot be read, is dropped as it is.
+//!
+//! With [`Profiles::Keep`], the colours of a JPEG, PNG, TIFF, WebP, BMP,
+//! GIF, animated PNG, JPEG XL, PSD or AVIF under an RGB profile other than
+//! sRGB (Display P3, Adobe RGB), or the shades of a grey one, are kept as
+//! they are, with the profile written anew from the tags that say what its
+//! colours are, checked to give every colour of a grid of them as the
+//! original does; one that cannot be is turned into sRGB as before. An AVIF
+//! that names its primaries and transfer keeps them, named in the PNG
+//! (`cICP`). One for a display of high dynamic range always does: sRGB
+//! cannot show it.
+//!
+//! With [`Inks::Keep`], a CMYK JPEG, TIFF or PSD keeps its inks instead:
+//! a JPEG its coefficients, a TIFF or PSD its samples, written as a TIFF.
+//! Its profile is kept too, written anew from the tags that say what the
+//! inks look like, which are copied byte for byte and checked to print
+//! every ink as the original does; a profile that cannot be is turned into
+//! sRGB as before.
 //!
 //! What it does not do: pixels are kept, so anything encoded in them is too.
 //! That includes the bytes of another file. Where a format writes pixels
@@ -67,9 +124,8 @@ use std::time::Instant;
 use image::codecs::bmp::BmpDecoder;
 use image::codecs::gif::{GifDecoder, GifEncoder, Repeat};
 use image::codecs::ico::IcoDecoder;
-use image::codecs::jpeg::{JpegDecoder, JpegEncoder};
-use image::codecs::png::{CompressionType, FilterType, PngDecoder, PngEncoder};
-use image::codecs::tiff::TiffDecoder;
+use image::codecs::jpeg::JpegDecoder;
+use image::codecs::png::PngDecoder;
 use image::codecs::webp::{WebPDecoder, WebPEncoder};
 use image::metadata::{LoopCount, Orientation};
 use image::{
@@ -82,6 +138,26 @@ use moxcms::{ColorProfile, DataColorSpace, Layout, TransformExecutor, TransformO
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
+
+mod apng;
+mod avif;
+mod colour;
+mod fax;
+mod gif;
+mod ifd;
+mod jpeg;
+mod jxl;
+mod ojpeg;
+mod palette;
+mod profile;
+mod psd;
+mod strips;
+mod tif;
+mod tiff_jpeg;
+mod tiff_out;
+mod vp8;
+mod vp8l;
+mod webp;
 
 use crate::detect::{self, FileType};
 use crate::limits::Limits;
@@ -114,6 +190,46 @@ pub struct Options {
     /// Such text stays sharp at any size, and a page of it takes a fraction
     /// of the room. Other text stays in the picture.
     pub pdf_vector_text: bool,
+    /// What becomes of an image of printing inks (CMYK).
+    pub inks: Inks,
+    /// What becomes of an image in colours of an RGB or grey profile other
+    /// than sRGB, such as Display P3 or Adobe RGB.
+    pub profiles: Profiles,
+}
+
+/// What becomes of the colours of an image under an RGB or grey profile
+/// other than sRGB, or the primaries an AVIF names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Profiles {
+    /// Turned into sRGB, as far as sRGB can show them; the new file has no
+    /// profile.
+    #[default]
+    Srgb,
+    /// Kept as they are, with the profile, so that colours sRGB cannot show
+    /// are not lost: a JPEG of the same coefficients, the samples of the
+    /// others as they were. The profile is written anew from the tags that
+    /// describe its colours, which make exactly the colours the old one did
+    /// of a grid of every mix; if it cannot be, the colours are turned into
+    /// sRGB instead.
+    Keep,
+}
+
+/// What becomes of an image of printing inks: a CMYK JPEG, TIFF or PSD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Inks {
+    /// Turned into the sRGB colours they print as, under their colour
+    /// profile, and stored as the colours of a screen.
+    #[default]
+    Srgb,
+    /// Kept as inks, with their colour profile, so that they print as they
+    /// did: a JPEG of the same coefficients, a TIFF of the same samples.
+    /// The profile is written anew from the tags that describe its colours,
+    /// which make exactly the colours the old one did; if it cannot be, the
+    /// inks are turned into sRGB instead. Inks without a profile are kept
+    /// without one.
+    Keep,
 }
 
 /// How the picture of a page is kept in a rebuilt PDF.
@@ -139,6 +255,8 @@ impl Default for Options {
             pdf_pages: PageImage::Lossless,
             pdf_text: true,
             pdf_vector_text: true,
+            inks: Inks::Srgb,
+            profiles: Profiles::Srgb,
         }
     }
 }
@@ -156,7 +274,8 @@ pub struct Rebuilt {
     pub width: u32,
     /// Height in pixels, after any rotation; 0 for an SVG or a PDF.
     pub height: u32,
-    /// Number of frames of an animation or pages of a PDF; otherwise 1.
+    /// Number of frames of an animation, images of an icon or pages of a
+    /// PDF; otherwise 1.
     pub frames: u32,
 }
 
@@ -234,10 +353,11 @@ fn encode_error(error: ImageError) -> Error {
 }
 
 /// The format a still image is written in.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Output {
-    Jpeg(u8),
-    Png,
+    Jpeg(Box<jpeg::Settings>),
+    /// With the pixel density of the original, if it had one.
+    Png(Option<png::PixelDimensions>),
     Webp,
 }
 
@@ -1119,10 +1239,17 @@ impl PagesPdf {
             } else {
                 ExtendedColorType::Rgb8
             };
-            let mut lossy = Vec::new();
-            JpegEncoder::new_with_quality(&mut lossy, quality.clamp(1, 100))
-                .encode(&samples, wide.into(), high.into(), kind)
-                .map_err(encode_error)?;
+            let picture = match kind {
+                ExtendedColorType::L8 => {
+                    image::GrayImage::from_raw(wide.into(), high.into(), samples)
+                        .map(DynamicImage::from)
+                }
+                _ => image::RgbImage::from_raw(wide.into(), high.into(), samples)
+                    .map(DynamicImage::from),
+            }
+            .ok_or_else(|| Error::Encode("page picture of the wrong size".into()))?;
+            let settings = jpeg::Settings::new(quality);
+            let lossy = jpeg::encode(&picture, &settings, Deadline(None))?;
             if lossy.len() < packed.len() {
                 (filter, packed) = ("/DCTDecode", lossy);
             }
@@ -1339,19 +1466,79 @@ fn raster(
 ) -> Result<Rebuilt, Error> {
     let unsupported = |reason| Error::Unsupported { file_type, reason };
     let input = Cursor::new(data);
+    let density = palette::density_of(data, file_type);
     match file_type {
         FileType::Jpeg => {
-            let output = Output::Jpeg(options.jpeg_quality.clamp(1, 100));
+            let mut settings = jpeg::Settings::new(options.jpeg_quality);
+            match jpeg::read(data, limits, deadline) {
+                Ok(mut coefficients) => {
+                    settings.source = coefficients.source();
+                    // A profile that changes the colours is applied to the
+                    // pixels; the coefficients are only kept as they are,
+                    // and inks only if they are to stay inks, with a profile
+                    // that can be written anew.
+                    let icc = coefficients.icc.take();
+                    let profile = if coefficients.inks() {
+                        match (options.inks, icc) {
+                            (Inks::Keep, None) => Some(None),
+                            (Inks::Keep, Some(icc)) => colour::rewritten_cmyk(&icc).map(Some),
+                            (_, _) => None,
+                        }
+                    } else {
+                        match icc {
+                            // Colours of another profile are kept in it, if
+                            // they are to be and it can be written anew.
+                            Some(icc) if ToSrgb::new(Some(icc.clone())).is_some() => (options
+                                .profiles
+                                == Profiles::Keep)
+                                .then(|| colour::rewritten_screen(&icc, coefficients.channels()))
+                                .flatten()
+                                .map(Some),
+                            _ => Some(None),
+                        }
+                    };
+                    if let Some(profile) = profile
+                        && coefficients.orient()
+                        && let Some(data) = coefficients.write(profile.as_deref())
+                    {
+                        let (width, height) = coefficients.dimensions();
+                        return Ok(Rebuilt {
+                            data,
+                            file_type: FileType::Jpeg,
+                            width,
+                            height,
+                            frames: 1,
+                        });
+                    }
+                }
+                Err(refusal) => {
+                    if let Some(answer) = refusal.answer() {
+                        return Err(answer);
+                    }
+                }
+            }
+            let output = Output::Jpeg(Box::new(settings));
             if let Some(image) = cmyk_jpeg(data, limits)? {
                 return write(image, deadline, output);
             }
             let decoder = JpegDecoder::new(input).map_err(decode_error)?;
-            still(decoder, limits, deadline, output)
+            still(decoder, limits, deadline, output, options.profiles)
         }
         FileType::Png => {
             let mut decoder = PngDecoder::new(input).map_err(decode_error)?;
             if !decoder.is_apng().map_err(decode_error)? {
-                return still(decoder, limits, deadline, Output::Png);
+                return still(
+                    decoder,
+                    limits,
+                    deadline,
+                    Output::Png(density),
+                    options.profiles,
+                );
+            }
+            // Frame by frame as the file has them, where that can be done.
+            match apng::rebuild(data, limits, deadline, options.profiles == Profiles::Keep) {
+                Err(Error::Decode(_) | Error::Encode(_)) => {}
+                done => return done,
             }
             let canvas = Canvas::of(&mut decoder, limits)?;
             let deep = matches!(
@@ -1366,14 +1553,27 @@ fn raster(
             animation(decoder, canvas, limits, deadline, Animated::Png)
         }
         FileType::Webp => {
+            // A lossy picture keeps what its coder coded, if that shows
+            // every pixel as the original does.
+            match webp::rebuild(data, limits, deadline, options.profiles == Profiles::Keep) {
+                Ok(Some(rebuilt)) => return Ok(rebuilt),
+                Ok(None) | Err(Error::Decode(_) | Error::Encode(_)) => {}
+                Err(other) => return Err(other),
+            }
             let mut decoder = WebPDecoder::new(input).map_err(decode_error)?;
             if !decoder.has_animation() {
-                return still(decoder, limits, deadline, Output::Webp);
+                return still(decoder, limits, deadline, Output::Webp, options.profiles);
             }
             let canvas = Canvas::of(&mut decoder, limits)?;
             animation(decoder, canvas, limits, deadline, Animated::Webp)
         }
         FileType::Gif => {
+            // Pixels laid over pixels can show more than a GIF's 256
+            // colours, which full colour written back would have to lose.
+            match gif::rebuild(data, limits, deadline, options.profiles == Profiles::Keep) {
+                Err(Error::Decode(_) | Error::Encode(_)) => {}
+                done => return done,
+            }
             let mut decoder = GifDecoder::new(input).map_err(decode_error)?;
             let canvas = Canvas::of(&mut decoder, limits)?;
             animation(decoder, canvas, limits, deadline, Animated::Gif)
@@ -1382,27 +1582,100 @@ fn raster(
             BmpDecoder::new(input).map_err(decode_error)?,
             limits,
             deadline,
-            Output::Png,
+            Output::Png(density),
+            options.profiles,
         ),
-        FileType::Tiff => still(
-            TiffDecoder::new(input).map_err(decode_error)?,
-            limits,
-            deadline,
-            Output::Png,
-        ),
-        FileType::Ico => still(
-            IcoDecoder::new(input).map_err(decode_error)?,
-            limits,
-            deadline,
-            Output::Png,
-        ),
+        FileType::Tiff => {
+            // JPEG of the first kind is the JPEG it stands for, rebuilt as
+            // any JPEG is.
+            if let Some(jpeg) = ojpeg::jpeg(data, limits)
+                && detect::detect(&jpeg) == FileType::Jpeg
+            {
+                match raster(&jpeg, FileType::Jpeg, limits, options, deadline) {
+                    Err(Error::Decode(_) | Error::Encode(_)) => {}
+                    other => return other,
+                }
+            }
+            tif::rebuild(
+                data,
+                limits,
+                deadline,
+                options.inks == Inks::Keep,
+                options.profiles == Profiles::Keep,
+            )
+        }
+        FileType::Psd => {
+            let composite = psd::composite(
+                data,
+                limits,
+                deadline,
+                options.inks == Inks::Keep,
+                options.profiles == Profiles::Keep,
+            )?;
+            match composite {
+                psd::Composite::Colours(picture) => kept_in(
+                    picture.image,
+                    picture.icc,
+                    deadline,
+                    Output::Png(picture.density),
+                ),
+                psd::Composite::Inks(kept) => {
+                    let mut pages = tiff_out::Pages::new(limits)?;
+                    pages.add_inks(&kept, deadline)?;
+                    pages.finish()
+                }
+            }
+        }
+        FileType::Ico => match icon(data, limits, deadline) {
+            Err(Error::Decode(_) | Error::Encode(_)) => still(
+                // One image of it, if not all of them can be read.
+                IcoDecoder::new(input).map_err(decode_error)?,
+                limits,
+                deadline,
+                Output::Png(density),
+                options.profiles,
+            ),
+            other => other,
+        },
         // There is no encoder for it here; a PNG keeps every pixel.
-        FileType::Jxl => still(
-            JxlDecoder::new(input).map_err(decode_error)?,
-            limits,
-            deadline,
-            Output::Png,
-        ),
+        FileType::Jxl => {
+            // One made from a JPEG gives it back, which is rebuilt as any
+            // JPEG is: its coefficients kept, nothing else.
+            if let Some(jpeg) = jxl::original_jpeg(data, limits)
+                && detect::detect(&jpeg) == FileType::Jpeg
+            {
+                match raster(&jpeg, FileType::Jpeg, limits, options, deadline) {
+                    Err(Error::Decode(_) | Error::Encode(_)) => {}
+                    other => return other,
+                }
+            }
+            if let Some(animation) = jxl::rebuild(data, limits, deadline)? {
+                return Ok(animation);
+            }
+            still(
+                JxlDecoder::new(input).map_err(decode_error)?,
+                limits,
+                deadline,
+                Output::Png(density),
+                options.profiles,
+            )
+        }
+        // There is no AV1 encoder here; a PNG keeps every pixel.
+        FileType::Avif => {
+            let shown = avif::shown(data, limits, deadline, options.profiles == Profiles::Keep)?;
+            match shown.space {
+                avif::Space::Srgb => write(shown.image, deadline, Output::Png(None)),
+                avif::Space::Icc(icc) => {
+                    kept_in(shown.image, Some(icc), deadline, Output::Png(None))
+                }
+                avif::Space::Cicp(cicp) => {
+                    let rebuilt = write(shown.image, deadline, Output::Png(None))?;
+                    profile::cicp(rebuilt, cicp).ok_or_else(|| {
+                        Error::Encode("the PNG cannot say what its colours are".into())
+                    })
+                }
+            }
+        }
         _ => Err(unsupported("not a type this build rebuilds")),
     }
 }
@@ -1424,7 +1697,11 @@ impl ToSrgb {
     /// not parse or is neither RGB nor grey, or one that describes sRGB
     /// itself.
     fn new(icc: Option<Vec<u8>>) -> Option<Self> {
-        let profile = ColorProfile::new_from_slice(&icc?).ok()?;
+        Self::of(ColorProfile::new_from_slice(&icc?).ok()?)
+    }
+
+    /// As `new`, from a profile already read.
+    fn of(profile: ColorProfile) -> Option<Self> {
         let srgb = ColorProfile::new_srgb();
         let (srgb, grey) = match profile.color_space {
             DataColorSpace::Rgb => (srgb, false),
@@ -1473,6 +1750,16 @@ impl ToSrgb {
         Self::convert(&*transform, pixels, layout)
     }
 
+    /// Floating point, which may go past black and white and comes out so.
+    fn float(&self, pixels: &mut [f32], layout: Layout) -> Option<()> {
+        let options = TransformOptions::default();
+        let transform = self
+            .profile
+            .create_transform_f32(layout, &self.srgb, layout, options)
+            .ok()?;
+        Self::convert(&*transform, pixels, layout)
+    }
+
     fn convert<T: Copy + Default>(
         transform: &dyn TransformExecutor<T>,
         pixels: &mut [T],
@@ -1515,6 +1802,8 @@ impl ToSrgb {
             DynamicImage::ImageRgba8(pixels) => self.eight(pixels, Layout::Rgba),
             DynamicImage::ImageRgb16(pixels) => self.sixteen(pixels, Layout::Rgb),
             DynamicImage::ImageRgba16(pixels) => self.sixteen(pixels, Layout::Rgba),
+            DynamicImage::ImageRgb32F(pixels) => self.float(pixels, Layout::Rgb),
+            DynamicImage::ImageRgba32F(pixels) => self.float(pixels, Layout::Rgba),
             _ => None,
         };
     }
@@ -1644,63 +1933,178 @@ fn still(
     limits: &Limits,
     deadline: Deadline,
     output: Output,
+    profiles: Profiles,
 ) -> Result<Rebuilt, Error> {
+    // Colours of a profile other than sRGB's stay in it, if they are to
+    // and it can be written anew.
+    let channels = if decoder.color_type().has_color() {
+        3
+    } else {
+        1
+    };
+    let kept = match profiles {
+        Profiles::Keep => decoder
+            .icc_profile()
+            .ok()
+            .flatten()
+            .filter(|icc| ToSrgb::new(Some(icc.clone())).is_some())
+            .and_then(|icc| colour::rewritten_screen(&icc, channels)),
+        _ => None,
+    };
+    let Some(icc) = kept else {
+        return write(picture(decoder, limits, true)?, deadline, output);
+    };
+    kept_in(
+        picture(decoder, limits, false)?,
+        Some(icc),
+        deadline,
+        output,
+    )
+}
+
+/// `image` written as `output`, under the profile `icc` its pixels are in
+/// if there is one: converted to sRGB if the file cannot carry it.
+fn kept_in(
+    image: DynamicImage,
+    icc: Option<Vec<u8>>,
+    deadline: Deadline,
+    output: Output,
+) -> Result<Rebuilt, Error> {
+    let Some(icc) = icc else {
+        return write(image, deadline, output);
+    };
+    let rebuilt = write(image.clone(), deadline, output.clone())?;
+    match profile::attach(rebuilt, &icc) {
+        Some(rebuilt) => Ok(rebuilt),
+        // A file that cannot carry the profile has the colours converted.
+        None => {
+            let mut image = image;
+            if let Some(colors) = ToSrgb::new(Some(icc)) {
+                colors.image(&mut image);
+            }
+            write(image, deadline, output)
+        }
+    }
+}
+
+/// The pixels of a still image, the right way up, and in sRGB if
+/// `convert`.
+fn picture(
+    mut decoder: impl ImageDecoder,
+    limits: &Limits,
+    convert: bool,
+) -> Result<DynamicImage, Error> {
     let canvas = Canvas::of(&mut decoder, limits)?;
     // The orientation lives in metadata the new file will not have.
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     let mut image = DynamicImage::from_decoder(decoder).map_err(decode_error)?;
-    if let Some(colors) = &canvas.colors {
+    if convert && let Some(colors) = &canvas.colors {
         colors.image(&mut image);
     }
     image.apply_orientation(orientation);
-    write(image, deadline, output)
+    Ok(image)
+}
+
+/// An icon with every image of the original, each written anew as a PNG.
+fn icon(data: &[u8], limits: &Limits, deadline: Deadline) -> Result<Rebuilt, Error> {
+    use image::codecs::ico::{IcoEncoder, IcoFrame};
+
+    let broken = || Error::Decode("icon directory is out of bounds".into());
+    let le32 = |bytes: &[u8], at: usize| {
+        u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]) as usize
+    };
+    let count = u16::from_le_bytes(
+        data.get(4..6)
+            .ok_or_else(broken)?
+            .try_into()
+            .unwrap_or_default(),
+    );
+    let mut seen = std::collections::HashSet::new();
+    let mut pictures = Vec::new();
+    let mut pixels = 0u64;
+    for index in 0..count as usize {
+        let at = 6 + index * 16;
+        let entry = data.get(at..at + 16).ok_or_else(broken)?;
+        let (size, offset) = (le32(entry, 8), le32(entry, 12));
+        let image = offset
+            .checked_add(size)
+            .and_then(|end| data.get(offset..end))
+            .ok_or_else(broken)?;
+        // An entry that names an image another one does adds nothing.
+        if !seen.insert((offset, size)) {
+            continue;
+        }
+        // An icon of this one image alone, for the decoder to read.
+        let mut single = vec![0, 0, 1, 0, 1, 0];
+        single.extend_from_slice(&entry[..12]);
+        single.extend_from_slice(&22u32.to_le_bytes());
+        single.extend_from_slice(image);
+        let decoder = IcoDecoder::new(Cursor::new(&single[..])).map_err(decode_error)?;
+        let picture = picture(decoder, limits, true)?.into_rgba8();
+        pixels += picture.width() as u64 * picture.height() as u64;
+        if pixels > limits.max_pixels {
+            return Err(Error::TooLarge);
+        }
+        deadline.check()?;
+        pictures.push(picture);
+    }
+    let mut encoded = Vec::new();
+    for picture in &pictures {
+        let (width, height) = picture.dimensions();
+        let png = palette::smallest(&DynamicImage::from(picture.clone()), None)
+            .ok_or_else(|| Error::Encode("no PNG holds these pixels".into()))?;
+        encoded.push((png, width, height));
+    }
+    let frames = encoded
+        .iter()
+        .map(|(png, width, height)| {
+            IcoFrame::with_encoded(&png[..], *width, *height, ExtendedColorType::Rgba8)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(encode_error)?;
+    let mut out = Vec::new();
+    IcoEncoder::new(&mut out)
+        .encode_images(&frames)
+        .map_err(encode_error)?;
+    let largest = pictures
+        .iter()
+        .map(|p| p.dimensions())
+        .max_by_key(|&(w, h)| w as u64 * h as u64)
+        .ok_or_else(broken)?;
+    Ok(Rebuilt {
+        data: out,
+        file_type: FileType::Ico,
+        width: largest.0,
+        height: largest.1,
+        frames: pictures.len() as u32,
+    })
 }
 
 /// Write a still image in the format `output` names.
 fn write(image: DynamicImage, deadline: Deadline, output: Output) -> Result<Rebuilt, Error> {
     deadline.check()?;
     let (width, height) = (image.width(), image.height());
-    let mut data = Vec::new();
+    let data;
     // The pixels are held once: an image that has to be converted gives
     // way to what it is converted to, and one that has not is not copied.
     let file_type = match output {
-        Output::Jpeg(quality) => {
+        Output::Jpeg(settings) => {
             // The format stores 8-bit grey or colour and nothing else.
             let image: DynamicImage = match image {
                 DynamicImage::ImageLuma8(_) | DynamicImage::ImageRgb8(_) => image,
                 _ if image.color().has_color() => image.into_rgb8().into(),
                 _ => image.into_luma8().into(),
             };
-            JpegEncoder::new_with_quality(&mut data, quality)
-                .encode_image(&image)
-                .map_err(encode_error)?;
+            data = jpeg::encode(&image, &settings, deadline)?;
             FileType::Jpeg
         }
-        Output::Png => {
-            // Floating-point samples have no place in a PNG.
-            let image: DynamicImage = match image {
-                DynamicImage::ImageRgb32F(_) => image.into_rgb16().into(),
-                DynamicImage::ImageRgba32F(_) => image.into_rgba16().into(),
-                _ => image,
-            };
-            // The encoder's own default trades size for speed.
-            let encoder = PngEncoder::new_with_quality(
-                &mut data,
-                CompressionType::Default,
-                FilterType::Adaptive,
-            );
-            image.write_with_encoder(encoder).map_err(encode_error)?;
+        Output::Png(density) => {
+            data = palette::smallest(&image, density)
+                .ok_or_else(|| Error::Encode("no PNG holds these pixels".into()))?;
             FileType::Png
         }
         Output::Webp => {
-            let image: DynamicImage = if image.color().has_alpha() {
-                image.into_rgba8().into()
-            } else {
-                image.into_rgb8().into()
-            };
-            image
-                .write_with_encoder(WebPEncoder::new_lossless(&mut data))
-                .map_err(encode_error)?;
+            data = webp_bitstream(&image.into_rgba8(), deadline)?;
             FileType::Webp
         }
     };
@@ -1927,7 +2331,7 @@ fn animated(
         Animated::Webp => {
             let pictures = covering(&frames, width, height)?;
             let data = match pictures[..] {
-                [(picture, _)] => webp_bitstream(picture)?,
+                [(picture, _)] => webp_bitstream(picture, deadline)?,
                 _ => animated_webp(&pictures, width, height, plays, deadline)?,
             };
             (data, FileType::Webp)
@@ -1999,8 +2403,9 @@ fn apng(
     Ok(data)
 }
 
-/// A lossless WebP file of one picture.
-fn webp_bitstream(picture: &RgbaImage) -> Result<Vec<u8>, Error> {
+/// A lossless WebP file of one picture: as [`vp8l`] writes it, if that
+/// is smaller than the `image` crate's and decodes to every pixel.
+fn webp_bitstream(picture: &RgbaImage, deadline: Deadline) -> Result<Vec<u8>, Error> {
     let mut data = Vec::new();
     WebPEncoder::new_lossless(&mut data)
         .encode(
@@ -2010,7 +2415,31 @@ fn webp_bitstream(picture: &RgbaImage) -> Result<Vec<u8>, Error> {
             ExtendedColorType::Rgba8,
         )
         .map_err(encode_error)?;
-    Ok(data)
+    let Some(stream) = vp8l::encode(
+        picture.as_raw(),
+        picture.width(),
+        picture.height(),
+        deadline,
+    )?
+    else {
+        return Ok(data);
+    };
+    if stream.len() + 20 >= data.len() {
+        return Ok(data);
+    }
+    let mut body = b"WEBP".to_vec();
+    riff_chunk(&mut body, b"VP8L", &stream)?;
+    let mut file = Vec::with_capacity(body.len() + 8);
+    riff_chunk(&mut file, b"RIFF", &body)?;
+    let decoded = WebPDecoder::new(Cursor::new(&file))
+        .ok()
+        .and_then(|decoder| DynamicImage::from_decoder(decoder).ok())
+        .map(DynamicImage::into_rgba8);
+    Ok(if decoded.as_ref() == Some(picture) {
+        file
+    } else {
+        data
+    })
 }
 
 /// Append a RIFF chunk, padded to an even length.
@@ -2065,7 +2494,7 @@ fn animated_webp(
     for (picture, shown) in pictures {
         deadline.check()?;
         transparent |= picture.pixels().any(|pixel| pixel[3] != u8::MAX);
-        let file = webp_bitstream(picture)?;
+        let file = webp_bitstream(picture, deadline)?;
         let bitstream = vp8l_chunk(&file)
             .ok_or_else(|| Error::Encode("the encoder wrote no lossless picture".into()))?;
         // At the top left corner, replacing what was there, not blended with it.
@@ -2088,6 +2517,7 @@ fn animated_webp(
 #[cfg(test)]
 mod tests {
     use image::codecs::gif::GifEncoder;
+    use image::codecs::png::PngEncoder;
     use image::{Delay, Frame, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 
     use super::*;
@@ -2157,7 +2587,7 @@ mod tests {
             (ImageFormat::WebP, FileType::Webp),
             (ImageFormat::Bmp, FileType::Png),
             (ImageFormat::Tiff, FileType::Png),
-            (ImageFormat::Ico, FileType::Png),
+            (ImageFormat::Ico, FileType::Ico),
         ] {
             // An icon holds its image with an alpha channel.
             let source = match format {
@@ -2364,18 +2794,28 @@ mod tests {
         let rebuilt = run(&data).unwrap();
         assert_eq!((rebuilt.width, rebuilt.height, rebuilt.frames), (4, 4, 3));
         assert!(scans_clean(&rebuilt.data));
-        let decoder = PngDecoder::new(Cursor::new(&rebuilt.data[..])).unwrap();
-        let (frames, plays) = played(decoder.apng().unwrap());
-        assert_eq!(plays, Some(5));
-        let red = Rgba([255, 0, 0, 255]);
-        assert!(frames[0].0.pixels().all(|pixel| *pixel == red));
-        assert_eq!(frames[0].1, 250);
-        // Blended over the red, inside the square only.
-        assert_eq!(frames[1].0.get_pixel(1, 2), &Rgba([127, 0, 128, 255]));
-        assert_eq!(frames[1].0.get_pixel(0, 2), &red);
-        // The square is gone and the next one replaces what is under it.
-        assert_eq!(frames[2].0.get_pixel(1, 2), &Rgba([0, 0x12, 0, 0x40]));
-        assert_eq!(frames[2].0.get_pixel(3, 3), &red);
+        // Every frame as it was: 16 bits, its place, delay, blend and
+        // disposal, and the number of plays.
+        let frames = |data: &[u8]| {
+            let mut decoder = ::png::Decoder::new(Cursor::new(data));
+            decoder.set_transformations(::png::Transformations::IDENTITY);
+            let mut reader = decoder.read_info().unwrap();
+            let plays = reader.info().animation_control().unwrap().num_plays;
+            let mut buffer = vec![0; reader.output_buffer_size().unwrap()];
+            let mut frames = Vec::new();
+            for _ in 0..3 {
+                let read = reader.next_frame(&mut buffer).unwrap();
+                let mut control = *reader.info().frame_control().unwrap();
+                control.sequence_number = 0;
+                let depth = reader.info().bit_depth;
+                frames.push((control, depth, buffer[..read.buffer_size()].to_vec()));
+            }
+            (frames, plays)
+        };
+        let (before, after) = (frames(&data), frames(&rebuilt.data));
+        assert_eq!(after.1, 5);
+        assert_eq!(format!("{before:?}"), format!("{after:?}"));
+        assert_eq!(after.0[2].2[..8], [0, 0, 0x12, 0x34, 0, 0, 0x40, 0]);
     }
 
     #[test]
@@ -2898,6 +3338,744 @@ mod tests {
         // Nor does a profile that is not one.
         assert!(ToSrgb::new(Some(PAYLOAD.to_vec())).is_none());
         assert!(ToSrgb::new(None).is_none());
+    }
+
+    fn corpus(name: &str) -> Vec<u8> {
+        let clean = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/clean");
+        std::fs::read(format!("{clean}/{name}")).unwrap()
+    }
+
+    fn most_apart(one: &RgbImage, other: &RgbImage) -> u8 {
+        assert_eq!(one.dimensions(), other.dimensions());
+        one.as_raw()
+            .iter()
+            .zip(other.as_raw())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn jpeg_is_transcoded_without_loss() {
+        let data = corpus("progressive-restart.jpg");
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Jpeg);
+        let before = image::load_from_memory(&data).unwrap().to_rgb8();
+        let after = image::load_from_memory(&rebuilt.data).unwrap().to_rgb8();
+        assert_eq!(before, after);
+        // No larger than the file it came from, give or take its markers.
+        assert!(
+            rebuilt.data.len() <= data.len() + 64,
+            "{}",
+            rebuilt.data.len()
+        );
+    }
+
+    #[test]
+    fn jpeg_is_turned_in_its_coefficients() {
+        let data = corpus("rotated-422.jpg");
+        let rebuilt = run(&data).unwrap();
+        assert_eq!((rebuilt.width, rebuilt.height), (32, 48));
+        let turned = image::load_from_memory(&data).unwrap().rotate90().to_rgb8();
+        let after = image::load_from_memory(&rebuilt.data).unwrap().to_rgb8();
+        assert!(most_apart(&turned, &after) <= 6);
+
+        // Edges that cut through blocks are turned as pixels instead.
+        let odd = DynamicImage::from(RgbImage::from_fn(45, 29, |x, y| {
+            Rgb([x as u8 * 5, y as u8 * 7, (x + y) as u8])
+        }));
+        let jpeg = encoded(&odd, ImageFormat::Jpeg);
+        let mut exif = b"Exif\0\0MM\0\x2A\0\0\0\x08\0\x01".to_vec();
+        exif.extend_from_slice(b"\x01\x12\0\x03\0\0\0\x01\0\x06\0\0\0\0\0\0");
+        let mut segment = vec![0xFF, 0xE1];
+        segment.extend_from_slice(&(exif.len() as u16 + 2).to_be_bytes());
+        segment.extend_from_slice(&exif);
+        let rebuilt = run(&[&jpeg[..2], &segment, &jpeg[2..]].concat()).unwrap();
+        assert_eq!((rebuilt.width, rebuilt.height), (29, 45));
+        let turned = image::load_from_memory(&jpeg).unwrap().rotate90().to_rgb8();
+        let after = image::load_from_memory(&rebuilt.data).unwrap().to_rgb8();
+        assert!(most_apart(&turned, &after) <= 24);
+    }
+
+    #[test]
+    fn few_colours_stay_indexed() {
+        let colours = [[0, 0, 0], [255, 0, 0], [0, 255, 0], [9, 9, 200]];
+        let picture = RgbImage::from_fn(30, 20, |x, y| {
+            Rgb(colours[(((x * 7919) ^ (y * 104_729)) % 4) as usize])
+        });
+        let rebuilt = run(&encoded(&picture.clone().into(), ImageFormat::Png)).unwrap();
+        // Colour type 3 in the header.
+        assert_eq!(rebuilt.data[25], 3);
+        let pixels = image::load_from_memory(&rebuilt.data).unwrap().to_rgb8();
+        assert_eq!(pixels, picture);
+    }
+
+    #[test]
+    fn an_icon_keeps_every_image() {
+        use image::codecs::ico::{IcoEncoder, IcoFrame};
+
+        let sizes = [(16u32, 16u32), (32, 32), (48, 48)];
+        let pictures: Vec<RgbaImage> = sizes
+            .iter()
+            .map(|&(w, h)| {
+                RgbaImage::from_fn(w, h, |x, y| Rgba([x as u8 * 5, y as u8 * 5, 99, 200]))
+            })
+            .collect();
+        let frames: Vec<IcoFrame> = pictures
+            .iter()
+            .map(|p| {
+                IcoFrame::as_png(p.as_raw(), p.width(), p.height(), ExtendedColorType::Rgba8)
+                    .unwrap()
+            })
+            .collect();
+        let mut data = Vec::new();
+        IcoEncoder::new(&mut data).encode_images(&frames).unwrap();
+        data.extend_from_slice(PAYLOAD);
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Ico);
+        assert_eq!((rebuilt.width, rebuilt.height, rebuilt.frames), (48, 48, 3));
+        assert!(!contains(&rebuilt.data, PAYLOAD));
+        let largest = image::load_from_memory(&rebuilt.data).unwrap().to_rgba8();
+        assert_eq!(largest, pictures[2]);
+    }
+
+    fn near(found: [u8; 3], expected: [u8; 3], by: u8) -> bool {
+        found.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= by)
+    }
+
+    #[test]
+    fn tiff_of_every_kind_comes_back_as_it_looks() {
+        // Expected values are what ImageMagick makes of each file.
+        for (name, at, expected, by) in [
+            ("palette.tif", (5, 5), [222, 198, 100], 0),
+            ("palette.tif", (40, 25), [218, 186, 80], 0),
+            ("lab.tif", (5, 5), [222, 201, 114], 2),
+            ("lab.tif", (40, 25), [221, 191, 81], 2),
+            ("planar-300dpi.tif", (5, 5), [222, 201, 113], 0),
+            ("planar-300dpi.tif", (40, 25), [221, 191, 80], 0),
+        ] {
+            let rebuilt = run(&corpus(name)).unwrap();
+            assert_eq!(rebuilt.file_type, FileType::Png, "{name}");
+            assert_eq!((rebuilt.width, rebuilt.height), (48, 32), "{name}");
+            let pixels = image::load_from_memory(&rebuilt.data).unwrap().to_rgb8();
+            let Rgb(found) = *pixels.get_pixel(at.0, at.1);
+            assert!(near(found, expected, by), "{name} at {at:?}: {found:?}");
+        }
+        // Its map holds colours of 16 bits, and so does the picture.
+        let palette = run(&corpus("palette.tif")).unwrap();
+        assert_eq!((palette.data[24], palette.data[25]), (16, 2));
+        // 300 dots an inch, in a pHYs chunk.
+        let planar = run(&corpus("planar-300dpi.tif")).unwrap();
+        let mut phys = b"pHYs".to_vec();
+        phys.extend_from_slice(&11811u32.to_be_bytes());
+        phys.extend_from_slice(&11811u32.to_be_bytes());
+        phys.push(1);
+        assert!(contains(&planar.data, &phys));
+    }
+
+    #[test]
+    fn tiff_inks_get_the_colours_of_their_profile() {
+        let rebuilt = run(&corpus("cmyk-profile.tif")).unwrap();
+        assert_eq!((rebuilt.width, rebuilt.height), (24, 8));
+        assert!(!contains(&rebuilt.data, b"acsp"));
+        let pixels = image::load_from_memory(&rebuilt.data).unwrap().to_rgb8();
+        for (x, expected) in [(3, [255, 255, 255]), (12, [255, 0, 0]), (20, [0, 0, 0])] {
+            let Rgb(found) = *pixels.get_pixel(x, 4);
+            assert!(near(found, expected, 15), "at {x}: {found:?}");
+        }
+    }
+
+    /// Inks as a JPEG decoder gives them, and the profile embedded.
+    fn jpeg_inks(data: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+        use zune_core::colorspace::ColorSpace;
+        use zune_core::options::DecoderOptions;
+        // Samples as they are stored, YCCK or CMYK.
+        let mut decoder = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(data));
+        decoder.decode_headers().unwrap();
+        let stored = decoder.input_colorspace().unwrap();
+        let options = DecoderOptions::default().jpeg_set_out_colorspace(stored);
+        let mut decoder =
+            zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(data), options);
+        let inks = decoder.decode().unwrap();
+        assert!(matches!(stored, ColorSpace::CMYK | ColorSpace::YCCK));
+        (inks, decoder.icc_profile())
+    }
+
+    /// Every sample of the first page of a TIFF, and its profile.
+    fn tiff_samples(data: &[u8]) -> (tiff::ColorType, Vec<u8>, Option<Vec<u8>>) {
+        let mut decoder = tiff::decoder::Decoder::new(std::io::Cursor::new(data)).unwrap();
+        let colour = decoder.colortype().unwrap();
+        let icc = decoder.get_tag_u8_vec(tiff::tags::Tag::IccProfile).ok();
+        let tiff::decoder::DecodingResult::U8(samples) = decoder.read_image().unwrap() else {
+            panic!("not 8 bits");
+        };
+        (colour, samples, icc)
+    }
+
+    #[test]
+    fn inks_can_be_kept_with_their_profile() {
+        let keep = Options {
+            inks: Inks::Keep,
+            ..Options::default()
+        };
+        for name in ["cmyk-profile.jpg", "ycck-profile.jpg"] {
+            let data = corpus(name);
+            let rebuilt = rebuild(&data, &Limits::default(), &keep).unwrap();
+            assert_eq!(rebuilt.file_type, FileType::Jpeg, "{name}");
+            let (before, profile) = jpeg_inks(&data);
+            let (after, kept) = jpeg_inks(&rebuilt.data);
+            assert_eq!(before, after, "{name}");
+            let profile = profile.unwrap();
+            assert_eq!(kept, colour::rewritten_cmyk(&profile), "{name}");
+        }
+
+        let data = corpus("cmyk-profile.tif");
+        let rebuilt = rebuild(&data, &Limits::default(), &keep).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Tiff);
+        let (colour, before, profile) = tiff_samples(&data);
+        let (kept_colour, after, kept) = tiff_samples(&rebuilt.data);
+        assert_eq!(
+            (colour, kept_colour),
+            (tiff::ColorType::CMYK(8), tiff::ColorType::CMYK(8))
+        );
+        assert_eq!(before, after);
+        assert_eq!(kept, colour::rewritten_cmyk(&profile.unwrap()));
+        // Only what says how the inks look is left of the profile.
+        assert!(!contains(kept.as_deref().unwrap(), b"inks"));
+
+        // As sRGB, unless asked.
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Png);
+    }
+
+    /// Every page of a TIFF, as the samples the `tiff` crate reads.
+    fn tiff_pages(data: &[u8]) -> Vec<(tiff::ColorType, tiff::decoder::DecodingResult)> {
+        let mut decoder = tiff::decoder::Decoder::new(std::io::Cursor::new(data)).unwrap();
+        let mut pages = Vec::new();
+        loop {
+            pages.push((decoder.colortype().unwrap(), decoder.read_image().unwrap()));
+            if !decoder.more_images() {
+                return pages;
+            }
+            decoder.next_image().unwrap();
+        }
+    }
+
+    /// The samples of the fixtures, which follow a formula.
+    fn pattern(x: u32, y: u32) -> [u8; 3] {
+        [(x * 10) as u8, (y * 15) as u8, ((x + y) * 5) as u8]
+    }
+
+    #[test]
+    fn tiff_compressed_as_the_crate_does_not_read_is_read() {
+        // Zstandard, and LZMA after a delta filter.
+        for name in ["rgb-zstd.tif", "rgb-lzma.tif"] {
+            let rebuilt = run(&corpus(name)).unwrap();
+            assert_eq!(rebuilt.file_type, FileType::Png, "{name}");
+            let pixels = image::load_from_memory(&rebuilt.data).unwrap().to_rgb8();
+            for (x, y, &Rgb(found)) in pixels.enumerate_pixels() {
+                assert_eq!(found, pattern(x, y), "{name} at {x},{y}");
+            }
+        }
+        // Fax, coded one row at a time and from the row before.
+        for name in ["fax-g3-1d.tif", "fax-g3-2d.tif"] {
+            let rebuilt = run(&corpus(name)).unwrap();
+            let pixels = image::load_from_memory(&rebuilt.data).unwrap().to_luma8();
+            assert_eq!(pixels.dimensions(), (40, 20), "{name}");
+            for (x, y, &image::Luma([found])) in pixels.enumerate_pixels() {
+                let white = (x / 3 + y / 2) % 2 == 1;
+                assert_eq!(found, if white { 255 } else { 0 }, "{name} at {x},{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn tiff_of_12_bits_is_widened_to_16() {
+        let rebuilt = run(&corpus("rgb-12bit.tif")).unwrap();
+        let pixels = image::load_from_memory(&rebuilt.data).unwrap();
+        let DynamicImage::ImageRgb16(pixels) = pixels else {
+            panic!("not 16 bits: {:?}", pixels.color());
+        };
+        for (x, y, &Rgb(found)) in pixels.enumerate_pixels() {
+            let stored = [x * 170, y * 250, (x + y) * 100].map(|v| v as u16);
+            assert_eq!(found.map(|v| v >> 4), stored, "at {x},{y}");
+        }
+    }
+
+    #[test]
+    fn tiff_pages_are_kept_as_pages() {
+        let rebuilt = run(&corpus("pages.tif")).unwrap();
+        assert_eq!((rebuilt.file_type, rebuilt.frames), (FileType::Tiff, 2));
+        let pages = tiff_pages(&rebuilt.data);
+        let [(first, one), (second, two)] = &pages[..] else {
+            panic!("{} pages", pages.len());
+        };
+        // The crate reads grey with alpha as two samples of no kind.
+        assert_eq!(*first, tiff::ColorType::RGB(8));
+        assert!(matches!(
+            second,
+            tiff::ColorType::GrayA(16)
+                | tiff::ColorType::Multiband {
+                    bit_depth: 16,
+                    num_samples: 2
+                }
+        ));
+        let (tiff::decoder::DecodingResult::U8(one), tiff::decoder::DecodingResult::U16(two)) =
+            (one, two)
+        else {
+            panic!("samples of the wrong kind");
+        };
+        for i in 0..24 * 16 {
+            let (x, y) = (i % 24, i / 24);
+            assert_eq!(
+                one[i as usize * 3..][..3],
+                pattern(x, y),
+                "page 1 at {x},{y}"
+            );
+            let found = &two[i as usize * 2..][..2];
+            assert_eq!(
+                found,
+                [(x * 2000) as u16, (y * 4000) as u16],
+                "page 2 at {x},{y}"
+            );
+        }
+    }
+
+    /// Made by `cjxl -d 0` from `animation-16bit.png`: four frames of 16
+    /// bits with alpha, the last three drawn over part of the one before.
+    #[test]
+    fn jpeg_xl_animation_keeps_every_frame() {
+        let rebuilt = run(&corpus("animation-16bit.jxl")).unwrap();
+        assert_eq!((rebuilt.file_type, rebuilt.frames), (FileType::Png, 4));
+        let frames = |data: &[u8]| {
+            let decoder = ::png::Decoder::new(std::io::Cursor::new(data.to_vec()));
+            let mut reader = decoder.read_info().unwrap();
+            let info = reader.info();
+            assert_eq!(
+                (info.bit_depth, info.color_type),
+                (::png::BitDepth::Sixteen, ::png::ColorType::Rgba)
+            );
+            let mut frame = vec![0; reader.output_buffer_size().unwrap()];
+            reader.next_frame(&mut frame).unwrap();
+            let control = reader.info().frame_control.unwrap();
+            (frame, (control.delay_num, control.delay_den))
+        };
+        let (original, _) = frames(&corpus("animation-16bit.png"));
+        let (first, shown) = frames(&rebuilt.data);
+        assert_eq!(first, original);
+        assert_eq!(shown, (500, 1000));
+    }
+
+    /// `data` with `extra` after the coded data of its `VP8 ` chunk, inside it.
+    fn padded_vp8(data: &[u8], extra: &[u8]) -> Vec<u8> {
+        let at = data.windows(4).position(|w| w == b"VP8 ").unwrap();
+        let length = u32::from_le_bytes(data[at + 4..at + 8].try_into().unwrap()) as usize;
+        let end = at + 8 + length;
+        let mut out = [&data[..end], extra, &data[end + length % 2..]].concat();
+        let grown = (length + extra.len()) as u32;
+        out[at + 4..at + 8].copy_from_slice(&grown.to_le_bytes());
+        if grown % 2 == 1 {
+            out.insert(at + 8 + grown as usize, 0);
+        }
+        let riff = (out.len() - 8) as u32;
+        out[4..8].copy_from_slice(&riff.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn lossy_webp_stays_lossy_and_loses_what_is_not_coded() {
+        let data = padded_vp8(&corpus("lossy-alpha.webp"), PAYLOAD);
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Webp);
+        assert!(contains(&rebuilt.data, b"VP8 ") && contains(&rebuilt.data, b"ALPH"));
+        assert!(!contains(&rebuilt.data, PAYLOAD));
+        // About the size of what it came from, not of a lossless picture.
+        assert!(
+            rebuilt.data.len() < data.len() + 64,
+            "{}",
+            rebuilt.data.len()
+        );
+        let before = image::load_from_memory(&data).unwrap().to_rgba8();
+        let after = image::load_from_memory(&rebuilt.data).unwrap().to_rgba8();
+        assert_eq!(before, after);
+
+        let data = corpus("lossy-animation.webp");
+        let rebuilt = run(&data).unwrap();
+        assert_eq!((rebuilt.file_type, rebuilt.frames), (FileType::Webp, 2));
+        assert!(contains(&rebuilt.data, b"VP8 ") && !contains(&rebuilt.data, b"VP8L"));
+        let frames = |data: &[u8]| {
+            WebPDecoder::new(Cursor::new(data.to_vec()))
+                .unwrap()
+                .into_frames()
+                .map(|frame| {
+                    let frame = frame.unwrap();
+                    (frame.delay(), frame.into_buffer())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(frames(&data), frames(&rebuilt.data));
+    }
+
+    /// Strips and tiles of JPEG pictures are put together as one JPEG of
+    /// their coefficients, which shows the page as decoding them does.
+    #[test]
+    fn tiff_of_jpeg_pictures_keeps_their_coefficients() {
+        for name in ["jpeg-tiles.tif", "jpeg-rgb-strips.tif"] {
+            let data = corpus(name);
+            let rebuilt = run(&data).unwrap();
+            assert_eq!(rebuilt.file_type, FileType::Jpeg, "{name}");
+            assert_eq!((rebuilt.width, rebuilt.height), (72, 40));
+            let jpeg = image::load_from_memory(&rebuilt.data).unwrap().to_rgb8();
+            let page = image::load_from_memory(&tif::pages_for_test(&data))
+                .unwrap()
+                .to_rgb8();
+            assert!(most_apart(&jpeg, &page) <= 16, "{name}");
+        }
+    }
+
+    /// A TIFF of several pages of JPEG pictures stays one, each page its
+    /// coefficients put together into one strip; so does one of inks when
+    /// they are kept.
+    #[test]
+    fn tiff_of_jpeg_pages_keeps_their_coefficients() {
+        let strips = |data: &[u8]| {
+            let mut decoder = tiff::decoder::Decoder::new(Cursor::new(data)).unwrap();
+            let mut pages = Vec::new();
+            loop {
+                let compression = decoder
+                    .find_tag_unsigned::<u16>(tiff::tags::Tag::Compression)
+                    .unwrap()
+                    .unwrap();
+                let photometric = decoder
+                    .find_tag_unsigned::<u16>(tiff::tags::Tag::PhotometricInterpretation)
+                    .unwrap()
+                    .unwrap();
+                pages.push((compression, photometric));
+                if !decoder.more_images() {
+                    break;
+                }
+                decoder.next_image().unwrap();
+            }
+            pages
+        };
+        for (name, pages, photometric) in [("pages-jpeg.tif", 3, 2), ("ycbcr-pages-jpeg.tif", 2, 6)]
+        {
+            let data = corpus(name);
+            let rebuilt = run(&data).unwrap();
+            assert_eq!(rebuilt.file_type, FileType::Tiff, "{name}");
+            assert_eq!(rebuilt.frames, pages, "{name}");
+            assert_eq!(
+                strips(&rebuilt.data),
+                vec![(7, photometric); pages as usize],
+                "{name}"
+            );
+            assert!(rebuilt.data.len() < data.len() * 2, "{name}");
+        }
+        let data = corpus("cmyk-jpeg.tif");
+        let options = Options {
+            inks: Inks::Keep,
+            ..Options::default()
+        };
+        let rebuilt = rebuild(&data, &Limits::default(), &options).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Tiff);
+        assert_eq!(strips(&rebuilt.data), [(7, 5)]);
+        // Without keeping the inks, they become colours as before.
+        assert_eq!(run(&data).unwrap().file_type, FileType::Png);
+    }
+
+    fn keeping_profiles(data: &[u8]) -> Rebuilt {
+        let options = Options {
+            profiles: Profiles::Keep,
+            ..Options::default()
+        };
+        rebuild(data, &Limits::default(), &options).unwrap()
+    }
+
+    /// The profile of a decoded file, and its pixels as they are.
+    fn profile_and_pixels(data: &[u8]) -> (Option<Vec<u8>>, RgbImage) {
+        let mut decoder = image::ImageReader::new(Cursor::new(data))
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        let icc = decoder.icc_profile().unwrap();
+        (icc, DynamicImage::from_decoder(decoder).unwrap().to_rgb8())
+    }
+
+    /// Colours of Display P3 and Adobe RGB stay in them, under a profile
+    /// written anew, when they are to be kept; otherwise they become sRGB.
+    #[test]
+    fn rgb_profiles_are_kept_when_asked() {
+        for name in ["p3.jpg", "adobe-rgb.png", "p3-lossy.webp"] {
+            let data = corpus(name);
+            let (icc, pixels) = profile_and_pixels(&data);
+            let icc = icc.unwrap();
+            let kept = keeping_profiles(&data);
+            assert_eq!(kept.file_type, detect::detect(&data), "{name}");
+            let (new_icc, new_pixels) = profile_and_pixels(&kept.data);
+            let new_icc = new_icc.unwrap();
+            assert_eq!(new_icc, colour::rewritten_rgb(&icc).unwrap(), "{name}");
+            assert!(!contains(&new_icc, b"CC0"), "{name}");
+            // The samples are those of the original, down to the bit.
+            assert_eq!(new_pixels, pixels, "{name}");
+
+            let converted = run(&data).unwrap();
+            let (none, converted) = profile_and_pixels(&converted.data);
+            assert!(none.is_none(), "{name}");
+            assert!(most_apart(&converted, &pixels) > 8, "{name}");
+        }
+        // A lossy WebP stays lossy.
+        let kept = keeping_profiles(&corpus("p3-lossy.webp"));
+        assert!(contains(&kept.data, b"VP8 "));
+        // A TIFF becomes a PNG, or a JPEG of the coefficients of its strips,
+        // in the profile.
+        for (name, file_type) in [("p3.tif", FileType::Png), ("p3-jpeg.tif", FileType::Jpeg)] {
+            let data = corpus(name);
+            let kept = keeping_profiles(&data);
+            assert_eq!(kept.file_type, file_type, "{name}");
+            let (icc, _) = profile_and_pixels(&kept.data);
+            let icc = ColorProfile::new_from_slice(&icc.unwrap()).unwrap();
+            assert_eq!(icc.color_space, DataColorSpace::Rgb, "{name}");
+            // Colours turned into sRGB are a PNG of them.
+            assert_eq!(run(&data).unwrap().file_type, FileType::Png, "{name}");
+        }
+    }
+
+    /// The profile a GIF, an animated PNG, a JPEG XL, a PSD or a PNG of
+    /// an AVIF ends up with when colours are kept, if any.
+    fn kept_profile(rebuilt: &Rebuilt) -> Option<Vec<u8>> {
+        match rebuilt.file_type {
+            FileType::Gif => {
+                let at = rebuilt.data.windows(11).position(|w| w == b"ICCRGBG1012")?;
+                // Blocks of up to 255 bytes, each after its length, to an
+                // empty one.
+                let mut rest = &rebuilt.data[at + 11..];
+                let mut icc = Vec::new();
+                while let Some((&length, after)) = rest.split_first() {
+                    if length == 0 {
+                        break;
+                    }
+                    icc.extend_from_slice(after.get(..length as usize)?);
+                    rest = &after[length as usize..];
+                }
+                Some(icc)
+            }
+            _ => profile_and_pixels(&rebuilt.data).0,
+        }
+    }
+
+    /// Colours of Adobe RGB in a GIF, an animated PNG, a JPEG XL and a PSD
+    /// stay in it when they are to be kept, the samples as they are.
+    #[test]
+    fn rgb_profiles_of_other_formats_are_kept_when_asked() {
+        let icc = profile_and_pixels(&corpus("adobe-rgb.png")).0.unwrap();
+        let rewritten = colour::rewritten_rgb(&icc).unwrap();
+        for name in [
+            "adobe-rgb.gif",
+            "adobe-rgb-animation.png",
+            "adobe-rgb.jxl",
+            "adobe-rgb.psd",
+        ] {
+            let data = corpus(name);
+            let kept = keeping_profiles(&data);
+            let new = kept_profile(&kept).unwrap_or_else(|| panic!("{name}: no profile"));
+            let new = ColorProfile::new_from_slice(&new).unwrap();
+            assert_eq!(new.color_space, DataColorSpace::Rgb, "{name}");
+            let converted = run(&data).unwrap();
+            assert!(kept_profile(&converted).is_none(), "{name}");
+            if !name.ends_with(".gif") {
+                // The first picture, as it was.
+                let first = |data: &[u8]| image::load_from_memory(data).unwrap().to_rgb8();
+                let reference = corpus(if name.ends_with(".psd") || name.ends_with(".jxl") {
+                    "adobe-rgb.png"
+                } else {
+                    name
+                });
+                assert_eq!(first(&kept.data), first(&reference), "{name}");
+            }
+        }
+        // The GIF's profile is the one written anew.
+        let gif = keeping_profiles(&corpus("adobe-rgb.gif"));
+        assert_eq!(kept_profile(&gif).unwrap(), rewritten);
+    }
+
+    /// Shades of grey under a profile of grey other than sRGB's stay in it
+    /// when they are to be kept: a PNG as a PNG of grey, a JPEG as its
+    /// coefficients.
+    #[test]
+    fn grey_profiles_are_kept_when_asked() {
+        for name in ["grey-gamma.png", "grey-gamma.jpg"] {
+            let data = corpus(name);
+            let (icc, pixels) = profile_and_pixels(&data);
+            let kept = keeping_profiles(&data);
+            assert_eq!(kept.file_type, detect::detect(&data), "{name}");
+            let (new_icc, new_pixels) = profile_and_pixels(&kept.data);
+            let new_icc = new_icc.unwrap();
+            assert_eq!(
+                new_icc,
+                colour::rewritten_grey(&icc.unwrap()).unwrap(),
+                "{name}"
+            );
+            assert!(!contains(&new_icc, b"Public Domain"), "{name}");
+            assert_eq!(new_pixels, pixels, "{name}");
+            let converted = run(&data).unwrap();
+            let (none, converted) = profile_and_pixels(&converted.data);
+            assert!(none.is_none(), "{name}");
+            assert!(most_apart(&converted, &pixels) > 8, "{name}");
+        }
+    }
+
+    /// A lossy WebP turned by its Exif stays lossy, with Exif of nothing
+    /// but that.
+    #[test]
+    fn lossy_webp_keeps_its_orientation() {
+        let data = corpus("turned-lossy.webp");
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Webp);
+        assert!(contains(&rebuilt.data, b"VP8 "));
+        assert!(!contains(&rebuilt.data, b"holiday camera"));
+        let mut decoder = WebPDecoder::new(Cursor::new(&rebuilt.data)).unwrap();
+        assert_eq!(decoder.orientation().unwrap(), Orientation::Rotate90);
+        let (_, pixels) = profile_and_pixels(&data);
+        assert_eq!(
+            DynamicImage::from_decoder(decoder).unwrap().to_rgb8(),
+            pixels
+        );
+    }
+
+    /// Samples of floating point stay so, past black and white too.
+    #[test]
+    fn float_tiff_stays_float() {
+        let floats = |data: &[u8]| {
+            let mut decoder = tiff::decoder::Decoder::new(Cursor::new(data)).unwrap();
+            match decoder.read_image().unwrap() {
+                tiff::decoder::DecodingResult::F32(v) => v,
+                _ => panic!("not floating point"),
+            }
+        };
+        let data = corpus("float-hdr.tif");
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Tiff);
+        assert_eq!(floats(&rebuilt.data), floats(&data));
+        assert!(floats(&rebuilt.data).contains(&2.5));
+        // Grey stays grey.
+        let data = corpus("float-grey.tif");
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Tiff);
+        assert_eq!(floats(&rebuilt.data), floats(&data));
+        let mut decoder = tiff::decoder::Decoder::new(Cursor::new(&rebuilt.data)).unwrap();
+        assert_eq!(decoder.colortype().unwrap(), tiff::ColorType::Gray(32));
+    }
+
+    /// Made by `cjxl` from a JPEG, which it keeps the means to give back.
+    #[test]
+    fn jpeg_xl_made_from_a_jpeg_gives_it_back() {
+        let data = corpus("from-jpeg.jxl");
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Jpeg);
+        assert_eq!((rebuilt.width, rebuilt.height), (48, 32));
+        // Its metadata goes as any JPEG's does.
+        let given_back = jxl::original_jpeg(&data, &Limits::default()).unwrap();
+        assert!(contains(&given_back, b"holiday camera"));
+        assert!(!contains(&rebuilt.data, b"holiday camera"));
+        let jpeg = image::load_from_memory(&rebuilt.data).unwrap().to_rgb8();
+        let shown = DynamicImage::from_decoder(JxlDecoder::new(Cursor::new(&data)).unwrap())
+            .unwrap()
+            .to_rgb8();
+        assert!(most_apart(&jpeg, &shown) <= 8);
+
+        // A comment, and a progressive JPEG with a scan of each subsampled
+        // component on its own and restart markers, which `jxl-oxide` 0.12.6
+        // put together wrong or panicked on (see third_party/README.md).
+        for name in ["from-jpeg-comment.jxl", "from-progressive-jpeg.jxl"] {
+            let data = corpus(name);
+            let given_back = jxl::original_jpeg(&data, &Limits::default()).unwrap();
+            let rebuilt = run(&data).unwrap();
+            assert_eq!(rebuilt.file_type, FileType::Jpeg, "{name}");
+            assert!(!contains(&rebuilt.data, b"holiday snapshot"), "{name}");
+            let jpeg = image::load_from_memory(&rebuilt.data).unwrap().to_rgb8();
+            let original = image::load_from_memory(&given_back).unwrap().to_rgb8();
+            // The same coefficients decode to the same pixels.
+            assert_eq!(jpeg, original, "{name}");
+        }
+    }
+
+    #[test]
+    fn avif_comes_back_as_png() {
+        let data = [&corpus("colours.avif")[..], PAYLOAD].concat();
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Png);
+        assert_eq!((rebuilt.width, rebuilt.height), (48, 32));
+        assert!(!contains(&rebuilt.data, PAYLOAD));
+    }
+
+    /// The composite has the colours matted with white; the file says it is
+    /// transparent by a negative layer count.
+    #[test]
+    fn psd_transparency_is_taken_off_its_white() {
+        let rebuilt = run(&corpus("transparent-composite.psd")).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Png);
+        assert_eq!((rebuilt.width, rebuilt.height), (40, 30));
+        let pixels = image::load_from_memory(&rebuilt.data).unwrap().to_rgba8();
+        for (x, y) in [(10, 3), (20, 17), (37, 29), (39, 0)] {
+            let Rgba([r, g, b, a]) = *pixels.get_pixel(x, y);
+            let expected = [(x * 6) as u8, (y * 8) as u8, (x * y) as u8];
+            assert_eq!(a as u32, (x * 7).min(255), "alpha at {x},{y}");
+            assert!(near([r, g, b], expected, 2), "at {x},{y}: {:?}", [r, g, b]);
+        }
+    }
+
+    /// Two frames of 256 colours each, the second over part of the first:
+    /// together more than a GIF frame can hold, which a rebuild from full
+    /// colour would have to quantise.
+    #[test]
+    fn gif_keeps_its_palettes_and_indices() {
+        let mut data = Vec::new();
+        {
+            let mut encoder = ::gif::Encoder::new(&mut data, 64, 32, &[]).unwrap();
+            encoder.set_repeat(::gif::Repeat::Finite(3)).unwrap();
+            let palette = |seed: u8| -> Vec<u8> {
+                (0..=255u8)
+                    .flat_map(|i| [i, i.wrapping_mul(seed), 255 - i])
+                    .collect()
+            };
+            let mut first = ::gif::Frame::default();
+            (first.width, first.height, first.delay) = (64, 32, 7);
+            first.palette = Some(palette(3));
+            first.buffer = (0..64 * 32)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<_>>()
+                .into();
+            encoder.write_frame(&first).unwrap();
+            let mut second = ::gif::Frame::default();
+            (second.left, second.top, second.width, second.height) = (8, 4, 20, 16);
+            second.palette = Some(palette(5));
+            second.transparent = Some(0);
+            second.buffer = (0..20 * 16)
+                .map(|i| (i * 7 % 256) as u8)
+                .collect::<Vec<_>>()
+                .into();
+            encoder.write_frame(&second).unwrap();
+        }
+        let original = data.clone();
+        data.splice(data.len() - 1..data.len() - 1, *b"\x21\xFE\x05hello\x00");
+        let rebuilt = run(&data).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Gif);
+        assert_eq!((rebuilt.width, rebuilt.height, rebuilt.frames), (64, 32, 2));
+        assert!(!contains(&rebuilt.data, b"hello"));
+        assert!(rebuilt.data.len() <= original.len());
+        let frames = |data: &[u8]| -> Vec<RgbaImage> {
+            let decoder = GifDecoder::new(Cursor::new(data.to_vec())).unwrap();
+            decoder
+                .into_frames()
+                .map(|frame| frame.unwrap().into_buffer())
+                .collect()
+        };
+        let (before, after) = (frames(&original), frames(&rebuilt.data));
+        let colours: std::collections::HashSet<_> = before[1].pixels().collect();
+        assert!(colours.len() > 256);
+        assert_eq!(before, after);
+        assert!(contains(&rebuilt.data, b"NETSCAPE2.0\x03\x01\x03\x00"));
     }
 
     #[test]

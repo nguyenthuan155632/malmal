@@ -81,6 +81,25 @@ cargo publish --locked --workspace
 This publishes `malmal`, then `malmal-ffi` and `malmal-cli`. Publishing is permanent:
 a version can be yanked but never published again.
 
+`malmal` depends on patched copies of other crates in `third_party/` (see its
+README), published as `malmal-<crate>`. They are outside the workspace, so the
+command above does not publish them. If one is not yet on crates.io at the version
+its manifest gives, or its code changed since, publish it first, in this order
+(each needs the one before it):
+
+```bash
+cargo search malmal-jxl --limit 5
+cargo search malmal-filmcraft --limit 5
+cargo publish --manifest-path third_party/jxl-jbr/Cargo.toml
+cargo publish --manifest-path third_party/jxl-render/Cargo.toml
+cargo publish --manifest-path third_party/jxl-oxide/Cargo.toml
+cargo publish --manifest-path third_party/filmcraft-av1/Cargo.toml
+```
+
+A copy that changed needs a new version (for example `0.2.1-malmal.2`), here and
+in the `version` of the dependency on it. Until these are on crates.io,
+`cargo publish --dry-run --workspace` fails for `malmal`.
+
 ## 6. PyPI and RubyGems come from the workflow
 
 The variables `PYPI_PUBLISH` and `RUBYGEMS_PUBLISH` are `true` and both registries use

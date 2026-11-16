@@ -81,7 +81,7 @@ module Malmal
                      ?max_pixels: Integer, ?max_depth: Integer, ?scan_timeout: Numeric) -> void
     def scan: (input data, ?filename: String?, ?content_type: String?) -> Report
     def sanitize: (input data, ?filename: String?, ?content_type: String?, ?jpeg_quality: Integer?,
-                   ?types: Array[Symbol | String], ?pdf_dpi: Integer, ?pdf_jpeg: bool, ?pdf_text: bool,
+                   ?types: Array[Symbol | String], ?keep_cmyk: bool, ?keep_profile: bool, ?pdf_dpi: Integer, ?pdf_jpeg: bool, ?pdf_text: bool,
                    ?pdf_vector_text: bool) -> Sanitized
     def overdue: () -> Integer
     def library_version: () -> String

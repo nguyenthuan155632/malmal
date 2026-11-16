@@ -355,10 +355,9 @@ Done after the first release, from the list of known limits and what a deploymen
 
 Not done:
 
-- AVIF. `zenavif` and `rav1d-safe`, the decoders in safe Rust, are AGPL-3.0, which this
-  project cannot link. `avif-decode` is BSD but builds `rav1d` with its hand-written
-  assembly on x86-64 (it needs `nasm`, and cannot be told not to), and `rav1d` has no
-  safe API of its own.
+- AVIF, until `filmcraft-av1` (MIT or Apache-2.0, safe Rust, written from the
+  specification): `zenavif` and `rav1d-safe` are AGPL-3.0, which this project cannot
+  link, and `avif-decode` builds `rav1d` with its assembly. Done since; see below.
 - HEIC: no HEVC decoder in Rust.
 - A rebuilt PDF that keeps its links and forms. Its text it keeps, since M13, and draws
   from the outlines of its glyphs where the page shows it plainly; text over a picture,
@@ -602,6 +601,45 @@ extension would have to be rebuilt for each Ruby minor version, a shared library
 
 Not planned: Shrine and CarrierWave plugins (the `malmal` gem is enough for them; added if
 asked), a Rack middleware that scans every multipart upload, Windows.
+
+### M16 — Rebuilt as close to the original as can be
+
+- [x] JPEG: the quantised coefficients kept, Exif rotations done on them; CMYK and YCCK
+      with an Adobe transform kept as inks on request.
+- [x] GIF: palettes and indices kept frame by frame; APNG: frames as laid out, 16 bits.
+- [x] Lossy WebP: every VP8 symbol coded again at the same probabilities (`cdr/vp8.rs`),
+      alpha coded again without loss, animations frame by frame; kept only if every pixel
+      decodes as the original's.
+- [x] TIFF: several pages to TIFF; CCITT fax, LZMA (with the delta filter), Zstandard and
+      WebP; depths 1 to 64 bits, integer and floating point.
+- [x] PSD: ZIP composites, with prediction; multichannel documents in their inks.
+- [x] JPEG XL animations as animated PNG.
+- [x] AVIF with `filmcraft-av1`, checked sample for sample against libdav1d on aom, SVT
+      and rav1e streams, 8 and 10 bits, 4:2:0 and 4:4:4.
+- [x] `Inks::Keep` / `--keep-cmyk`: inks and their profile, rewritten from its colour
+      tags and checked on a 17⁴ grid of inks at 16 bits.
+
+- [x] JPEG XL made from a JPEG gives the JPEG back (`jbrd`), checked against its render.
+- [x] TIFF of JPEG strips or tiles: one JPEG of their coefficients.
+- [x] `Profiles::Keep` / `--keep-profile`: RGB profiles rewritten from their colour tags,
+      checked on a 17³ grid; JPEG, PNG, TIFF, WebP, BMP.
+- [x] Lossy WebP keeps its profile (on request) and its orientation (Exif of it alone).
+- [x] Float TIFF of one page stays float.
+- [x] Lossless WebP encoder of our own (`cdr/vp8l.rs`); WebP alpha filtered.
+- [x] PSD duotone in its inks.
+- [x] AVIF on threads for large images, not waited for past the deadline.
+- [x] Fuzz targets for WebP, AVIF, TIFF, PSD and JPEG XL.
+- [x] `third_party/`: jxl-oxide with its JPEG reconstruction fixed (#507, #508, #510,
+      #511, #512), filmcraft-av1 with a cancel flag; published as `malmal-*`.
+- [x] `--keep-profile` for GIF, APNG, JPEG XL, PSD, AVIF (ICC or `cICP`), and grey profiles.
+- [x] AVIF PQ/HLG as a 16-bit PNG with `cICP`.
+- [x] TIFF of several JPEG pages, and of CMYK JPEG with `--keep-cmyk`: a TIFF of JPEG
+      pages, coefficients kept (`cdr/tiff_jpeg.rs`); old-style JPEG in TIFF
+      (`cdr/ojpeg.rs`).
+- [x] Grey float TIFF stays grey; duotone overprint colours.
+- [x] Lossless WebP: colour transform, colour cache, meta Huffman codes.
+
+Not done: HEIC (no HEVC decoder in Rust); AVIF image sequences without a still image.
 
 ## Order and dependencies
 

@@ -36,6 +36,14 @@ sanitize  Scans INPUT and, if it is clean and of a type that can be, writes
 Options:
   --json               scan: print one JSON object per file
   --jpeg-quality <N>   sanitize: quality of a rebuilt JPEG, 1-100 [default: 90]
+  --keep-cmyk          sanitize: keep the inks of a CMYK JPEG, TIFF or PSD as
+                       inks, with the colour profile they print by, rather
+                       than turning them into sRGB colours
+  --keep-profile       sanitize: keep the colours of an image under an RGB or
+                       grey profile other than sRGB (Display P3, Adobe RGB),
+                       or the primaries an AVIF names, as they are, with the
+                       profile written anew, rather than turning them into
+                       sRGB
   --pdf-dpi <N>        sanitize: dots per inch of a rebuilt PDF's pages,
                        36-600 [default: 150]
   --pdf-jpeg           sanitize: keep a page of a rebuilt PDF as a JPEG, at
@@ -59,6 +67,8 @@ struct Args {
     sanitize: bool,
     json: bool,
     jpeg_quality: u8,
+    keep_cmyk: bool,
+    keep_profile: bool,
     pdf_dpi: u16,
     pdf_jpeg: bool,
     pdf_text: bool,
@@ -104,6 +114,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
         sanitize,
         json: false,
         jpeg_quality: 90,
+        keep_cmyk: false,
+        keep_profile: false,
         pdf_dpi: 150,
         pdf_jpeg: false,
         pdf_text: true,
@@ -127,6 +139,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, String> {
                 .and_then(|value| value.parse().ok())
                 .filter(|quality| (1..=100).contains(quality))
                 .ok_or("--jpeg-quality needs a number from 1 to 100")?;
+        } else if arg == "--keep-cmyk" && sanitize {
+            parsed.keep_cmyk = true;
+        } else if arg == "--keep-profile" && sanitize {
+            parsed.keep_profile = true;
         } else if arg == "--pdf-jpeg" && sanitize {
             parsed.pdf_jpeg = true;
         } else if arg == "--pdf-no-text" && sanitize {
@@ -305,6 +321,12 @@ fn sanitize(args: &Args, scanner: &malmal::Scanner) -> ExitCode {
     options.pdf_dpi = args.pdf_dpi;
     options.pdf_text = args.pdf_text;
     options.pdf_vector_text = args.pdf_vector_text;
+    if args.keep_cmyk {
+        options.inks = malmal::cdr::Inks::Keep;
+    }
+    if args.keep_profile {
+        options.profiles = malmal::cdr::Profiles::Keep;
+    }
     if args.pdf_jpeg {
         options.pdf_pages = malmal::cdr::PageImage::Jpeg;
     }

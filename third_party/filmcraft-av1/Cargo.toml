@@ -1,0 +1,41 @@
+[package]
+edition = "2024"
+rust-version = "1.95"
+name = "malmal-filmcraft-av1"
+version = "0.9.0"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Clean-room AV1 decoder (AV1 Bitstream & Decoding Process Specification v1.0.0 with Errata 1): filmcraft-av1 with the fixes malmal needs, until they are released upstream"
+repository = "https://github.com/nguyenthuan155632/malmal"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["threads"]
+threads = ["dep:rayon"]
+
+[lib]
+name = "filmcraft_av1"
+path = "src/lib.rs"
+
+
+[dependencies.rayon]
+version = "1"
+optional = true
+
+[dependencies.thiserror]
+version = "2"
+
+[lints.clippy]
+dbg_macro = "warn"
+needless_range_loop = "allow"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+[lints.rust]
+unsafe_code = "forbid"

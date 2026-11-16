@@ -126,3 +126,38 @@ path = "fuzz_targets/cdr.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "cdr-webp"
+path = "fuzz_targets/cdr-webp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cdr-avif"
+path = "fuzz_targets/cdr-avif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cdr-tiff"
+path = "fuzz_targets/cdr-tiff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cdr-psd"
+path = "fuzz_targets/cdr-psd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cdr-jxl"
+path = "fuzz_targets/cdr-jxl.rs"
+test = false
+doc = false
+bench = false

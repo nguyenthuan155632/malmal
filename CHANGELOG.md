@@ -1,5 +1,86 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- A rebuilt JPEG keeps the quantised coefficients of the original, with Huffman tables
+  of its own: its pixels do not change and it is about the size it was. Exif rotations
+  are done on the coefficients where the image is whole blocks. Where a JPEG has to be
+  encoded again (a colour profile or inks to convert, a rotation that cuts through
+  blocks) it is encoded at 4:4:4 with no coarser a quantisation than it had.
+- An ICO is rebuilt as an ICO with every image, not as a PNG of the largest.
+- A PNG of 256 colours or fewer is written indexed when that is smaller, and rebuilt
+  images keep their pixel density (PNG, BMP, TIFF, PSD, JPEG).
+- TIFF: palette, CIE L*a*b* (with its white point), planar, CMYK through its profile,
+  and associated alpha are read as they look.
+- A lossy WebP stays lossy: every symbol of its VP8 stream is coded again at the same
+  probabilities, so it decodes to the same pixels and is about the size it was, where it
+  used to come out as a lossless WebP many times larger. Its alpha is coded again
+  without loss, and animations keep every frame as it was placed and blended. The file
+  is kept only if it decodes to exactly the pixels the original does.
+- A GIF keeps its palettes and the indices of its pixels, frame by frame, instead of
+  being quantised again from full colour; an animated PNG keeps its frames as they were
+  laid out, at 16 bits when it has them.
+- A TIFF of several pages is rebuilt as a TIFF of all of them (Deflate), not as a PNG
+  of the first. CCITT fax (Modified Huffman, T.4 one- and two-dimensional), LZMA,
+  Zstandard and WebP compression are read, and samples of any depth from 1 to 64 bits,
+  integer or floating point.
+- An animated JPEG XL is rebuilt as an animated PNG of every frame, with its delays.
+- PSD: composites compressed with ZIP, with or without prediction, and multichannel
+  documents, drawn in the colours of their inks; duotones in the colours of their inks,
+  through their curves.
+- A JPEG XL made from a JPEG gives back the JPEG, rebuilt with its coefficients kept,
+  where it shows what the JPEG XL does.
+- A TIFF whose strips or tiles are JPEG pictures is rebuilt as one JPEG of their
+  coefficients, without decoding them.
+- A lossy WebP turned by its Exif stays lossy, with Exif of nothing but its orientation.
+- A TIFF of one page of floating-point samples stays a TIFF of them, past black and
+  white too, instead of a PNG clipped to 16 bits.
+- Lossless WebP is written by an encoder of malmal's own (colour table, prediction block
+  by block, the colour transform, a colour cache, codes for groups of blocks, copies of
+  earlier pixels), about 5 to 60% smaller; the alpha of a lossy WebP is filtered the way
+  that codes smallest. Each is decoded again and kept only if every pixel comes back.
+- AVIF is decoded on up to four threads for large images, and stops at `max_duration`
+  instead of running on unwatched.
+- A TIFF of several pages of JPEG pictures stays a TIFF of them, each page its
+  coefficients put together in one strip; with `--keep-cmyk` so does one of inks.
+  Every page is checked against what its pixels show.
+- JPEG in a TIFF of the old kind (compression 6), whole or as tables and a scan, is
+  rebuilt as the JPEG it stands for.
+- A TIFF of grey floating-point samples stays grey.
+- A duotone's overprint colours are used where its inks print over one another.
+- AVIF for high dynamic range displays (PQ, HLG) is rebuilt as a PNG of 16 bits a
+  channel that names its primaries and transfer (`cICP`), instead of being refused.
+
+### Added
+
+- PSD and PSB files are rebuilt as a PNG of their composite image, with transparency
+  where Photoshop says there is any.
+- AVIF files are rebuilt as a PNG of their primary image, decoded by `filmcraft-av1`
+  (safe Rust, the same samples as libdav1d): grids of tiles, an alpha image, clean
+  aperture, rotation and mirroring, and colours brought into sRGB from an ICC profile or
+  the primaries and transfer the file names. Images for high dynamic range displays
+  are refused.
+- `Options::inks` (`Inks::Keep`), `malmal sanitize --keep-cmyk` and `keep_cmyk` in the C,
+  Python and Ruby interfaces: a CMYK JPEG, TIFF or PSD keeps its inks, a JPEG its
+  coefficients and a TIFF or PSD its samples (written as a TIFF), with its colour
+  profile rebuilt from the tags that define its colours, copied byte for byte and
+  checked to print every ink as the original does.
+
+- `Options::profiles` (`Profiles::Keep`), `malmal sanitize --keep-profile` and
+  `keep_profile` in the C, Python and Ruby interfaces: colours under an RGB profile
+  other than sRGB (Display P3, Adobe RGB) stay as they are in a JPEG (its coefficients),
+  PNG, TIFF, WebP (lossy too), BMP, GIF, animated PNG, JPEG XL, PSD or AVIF, with the
+  profile rebuilt from the tags that define its colours and checked on a 17³ grid at 16
+  bits; shades under a grey profile likewise, checked at 257 levels. An AVIF that names
+  its primaries and transfer keeps them in a `cICP` chunk.
+- `third_party/`: jxl-oxide with the fixes to JPEG reconstruction of its open pull
+  requests (tirr-c/jxl-oxide#508, #510, #511) and of issues #507 and #512, and
+  filmcraft-av1 with a flag that stops decoding, published as `malmal-*` crates until
+  upstream releases them. A progressive JPEG with subsampled chroma made into a JPEG XL
+  now gives back its JPEG instead of panicking.
+
 ## 0.4.2
 
 ### Added

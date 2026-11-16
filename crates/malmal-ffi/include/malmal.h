@@ -154,6 +154,12 @@ int malmal_sanitize(const malmal_scanner *scanner, const uint8_t *data,
  *   "jpeg_quality"     1 to 100 [90]
  *   "types"            the types to rebuild: ["jpeg", "png"]; others are
  *                      MALMAL_NOT_REBUILT before any decoder runs
+ *   "keep_cmyk"        true to keep the inks of a CMYK JPEG, TIFF or PSD,
+ *                      with their colour profile, rather than as sRGB
+ *   "keep_profile"     true to keep the colours of an image under an RGB
+ *                      or grey profile other than sRGB (Display P3, Adobe
+ *                      RGB) in it, with the profile written anew, rather
+ *                      than as sRGB
  *   "pdf_dpi"          36 to 600 [150]
  *   "pdf_jpeg"         true to keep a page as JPEG where that is smaller
  *   "pdf_text"         false to leave out the text layer of a rebuilt PDF

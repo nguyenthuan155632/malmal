@@ -40,14 +40,14 @@ protocol, ICAP), a C library and a Python package.
 | JPEG | `jpeg` | yes | JPEG |
 | PNG, APNG | `png` | yes | PNG |
 | GIF | `gif` | yes | GIF |
-| WebP | `webp` | yes | lossless WebP |
+| WebP | `webp` | yes | WebP (lossy stays lossy) |
 | BMP | `bmp` | yes | PNG |
-| TIFF, BigTIFF | `tiff` | yes | PNG |
-| ICO | `ico` | yes | PNG |
+| TIFF, BigTIFF | `tiff` | yes | PNG; TIFF if it has several pages |
+| ICO | `ico` | yes | ICO |
 | JPEG XL | `jxl` | yes | PNG |
-| PSD, PSB | `psd` | yes | no |
+| PSD, PSB | `psd` | yes | PNG |
 | HEIC | `heif` | yes | no |
-| AVIF | `avif` | yes | no |
+| AVIF | `avif` | yes | PNG |
 | SVG | `svg` | yes | SVG |
 | PDF | `pdf` | yes | PDF of page images (optional `cdr-pdf` feature) |
 | PostScript, EPS, Illustrator (PS-based) | `postscript` | yes | no |
@@ -457,6 +457,8 @@ The Python and C interfaces use the default limits. Embedded files are scanned u
 | Option | Default | Effect |
 |---|---|---|
 | `--jpeg-quality <N>` | 90 | Quality of rebuilt JPEG files, 1–100 |
+| `--keep-cmyk` | off | Keep the inks of a CMYK JPEG, TIFF or PSD, with their profile, rather than turn them into sRGB |
+| `--keep-profile` | off | Keep the colors of an image under an RGB or grey profile other than sRGB (or the primaries an AVIF names), with the profile rewritten, rather than turn them into sRGB |
 | `--pdf-dpi <N>` | 150 | Resolution of rebuilt PDF pages, 36–600 |
 | `--pdf-jpeg` | off | Store a PDF page as JPEG when that is smaller |
 | `--pdf-no-text` | off | Leave out the invisible text layer of a rebuilt PDF |
@@ -611,9 +613,43 @@ else:
 In C, use `malmal_sanitize`. In every interface, if rebuilding fails, store nothing.
 
 - **Images** keep their pixels, animation frames, frame delays and loop count. Colors are
-  converted to sRGB and the color profile is dropped. JPEG is re-encoded at the chosen
-  quality and rotated as its Exif orientation says. BMP, TIFF, ICO and JPEG XL become PNG,
-  so store the file under the type the result reports.
+  converted to sRGB and the color profile is dropped. Where it can, the picture is copied
+  as it was coded rather than decoded and encoded again, so nothing of it is lost:
+  - JPEG keeps its coefficients and is rotated as its Exif orientation says; one that
+    cannot be rotated or converted that way is re-encoded at the chosen quality at most.
+  - Lossy WebP keeps every symbol of its VP8 stream, coded again at the same
+    probabilities, and is kept only if it decodes to exactly the same pixels; it comes out
+    the size it went in. Its alpha is coded again without loss, and its Exif orientation is
+    kept, as Exif of nothing else.
+  - GIF keeps its palettes and pixel indices; APNG keeps its frames as they were laid out,
+    at their own depth.
+  - A TIFF of JPEG strips or tiles becomes one JPEG of their coefficients, or a TIFF of
+    such pages if it has several (or inks kept with `--keep-cmyk`); a JPEG XL made from a
+    JPEG gives back that JPEG. Each is checked against the pixels it shows. JPEG in a
+    TIFF of the old kind (compression 6) becomes the JPEG it stands for.
+
+  BMP, PSD (the composite image saved with the layers; a duotone in the colors of its
+  inks, overprints included), JPEG XL and AVIF become PNG, a JPEG XL animation an animated PNG, and a TIFF a
+  PNG of its one page (a TIFF if its samples are floating point) or a TIFF of all of
+  them, so store the file under the type the result reports. Lossless WebP is written by
+  an encoder of malmal's own and checked pixel for pixel. TIFF is read in every
+  compression libtiff writes (CCITT fax, LZMA and Zstandard among them) and at any depth;
+  AVIF is decoded by [filmcraft-av1](https://crates.io/crates/filmcraft-av1), safe Rust
+  that matches libdav1d sample for sample, with its grid, alpha, crop, rotation and
+  mirroring. An ICO keeps every image. A PNG of few colors stays indexed, and the pixel
+  density is kept.
+- **CMYK** JPEG, TIFF and PSD are converted to sRGB through their profile. With
+  `--keep-cmyk` (`Inks::Keep`, `keep_cmyk` in the bindings) they keep their inks
+  instead: a JPEG its coefficients, a TIFF or PSD its samples, written as a TIFF. The
+  profile is kept with them, rebuilt from only the tags that define its colors, copied
+  byte for byte and checked to print every ink exactly as the original does.
+- **Wide-gamut RGB** (Display P3, Adobe RGB) images are converted to sRGB, which clips
+  colors sRGB cannot show, and grey under a profile of its own to sRGB's curve. With
+  `--keep-profile` (`Profiles::Keep`, `keep_profile` in the bindings) a JPEG, PNG, TIFF,
+  WebP, BMP, GIF, animated PNG, JPEG XL, PSD or AVIF keeps its samples (a JPEG its
+  coefficients, a lossy WebP its VP8 stream) and its profile, rebuilt the same way and
+  checked on a grid of every color mix; an AVIF that names its primaries and transfer
+  keeps them in the PNG's `cICP` chunk.
 - **SVG** is filtered through an allowlist
   ([svg-hush](https://github.com/cloudflare/svg-hush)) that keeps only what draws.
   The result is scanned again and refused if it is not clean.
@@ -744,10 +780,14 @@ goes to the SHA-256 hash; `--no-hash` skips it when you do not need it.
   malicious site is clean, unless the link covers a fifth of a page (`pdf.link_lure`) or
   hides where it leads (`pdf.disguised_link`).
 - **Pixel data is not decoded during a scan.** For HEIC and AVIF the container is checked,
-  not the HEVC or AV1 stream.
+  not the HEVC or AV1 stream (rebuilding an AVIF does decode it).
 - **Encrypted PDFs** support the standard security handler only, not certificate
   encryption.
-- **HEIC, AVIF and PSD** are scanned but not rebuilt.
+- **HEIC** is scanned but not rebuilt (there is no HEVC decoder in Rust), nor is a PSD
+  saved without a composite image ("Maximize compatibility" off). AVIF in a range for
+  high dynamic range displays (PQ, HLG) becomes a 16-bit PNG that names its primaries and
+  transfer (`cICP`): viewers that do not read that chunk show it wrong. An AVIF image
+  sequence without a still image is refused.
 - **Rebuilt images keep their pixels**, and anything encoded in them. Rebuilt files are
   scanned again for that reason; if you call `malmal::cdr::rebuild` directly, scan the
   result yourself.

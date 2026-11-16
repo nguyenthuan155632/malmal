@@ -304,7 +304,9 @@ class Scanner:
         file to keep in place of the upload.
 
         ``options`` are those of the rebuild: ``types`` (the types to
-        rebuild), ``pdf_dpi``, ``pdf_jpeg``, ``pdf_text`` and
+        rebuild), ``keep_cmyk`` (keep the inks of a CMYK image, with their
+        profile), ``keep_profile`` (keep colours of an RGB or grey profile
+        other than sRGB in it), ``pdf_dpi``, ``pdf_jpeg``, ``pdf_text`` and
         ``pdf_vector_text``. An unknown option raises :class:`ValueError`.
 
         Raises :class:`Rejected` if the scan of the upload, or of the file
