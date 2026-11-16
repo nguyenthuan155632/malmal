@@ -629,9 +629,17 @@ asked), a Rack middleware that scans every multipart upload, Windows.
 - [x] PSD duotone in its inks.
 - [x] AVIF on threads for large images, not waited for past the deadline.
 - [x] Fuzz targets for WebP, AVIF, TIFF, PSD and JPEG XL.
+- [x] `third_party/`: jxl-oxide with its JPEG reconstruction fixed (#507, #508, #510,
+      #511, #512), filmcraft-av1 with a cancel flag; published as `malmal-*`.
+- [x] `--keep-profile` for GIF, APNG, JPEG XL, PSD, AVIF (ICC or `cICP`), and grey profiles.
+- [x] AVIF PQ/HLG as a 16-bit PNG with `cICP`.
+- [x] TIFF of several JPEG pages, and of CMYK JPEG with `--keep-cmyk`: a TIFF of JPEG
+      pages, coefficients kept (`cdr/tiff_jpeg.rs`); old-style JPEG in TIFF
+      (`cdr/ojpeg.rs`).
+- [x] Grey float TIFF stays grey; duotone overprint colours.
+- [x] Lossless WebP: colour transform, colour cache, meta Huffman codes.
 
-Not done: HEIC (no HEVC decoder in Rust); AVIF for HDR displays (PQ, HLG) and AVIF image
-sequences without a still image.
+Not done: HEIC (no HEVC decoder in Rust); AVIF image sequences without a still image.
 
 ## Order and dependencies
 

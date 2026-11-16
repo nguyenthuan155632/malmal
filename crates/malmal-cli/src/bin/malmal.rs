@@ -39,10 +39,11 @@ Options:
   --keep-cmyk          sanitize: keep the inks of a CMYK JPEG, TIFF or PSD as
                        inks, with the colour profile they print by, rather
                        than turning them into sRGB colours
-  --keep-profile       sanitize: keep the colours of a JPEG, PNG, TIFF, WebP
-                       or BMP under an RGB profile other than sRGB (Display
-                       P3, Adobe RGB) as they are, with the profile written
-                       anew, rather than turning them into sRGB
+  --keep-profile       sanitize: keep the colours of an image under an RGB or
+                       grey profile other than sRGB (Display P3, Adobe RGB),
+                       or the primaries an AVIF names, as they are, with the
+                       profile written anew, rather than turning them into
+                       sRGB
   --pdf-dpi <N>        sanitize: dots per inch of a rebuilt PDF's pages,
                        36-600 [default: 150]
   --pdf-jpeg           sanitize: keep a page of a rebuilt PDF as a JPEG, at

@@ -152,7 +152,7 @@ pub struct SanitizeOptions {
     /// Keep the inks of a CMYK image as inks.
     #[serde(default)]
     keep_cmyk: bool,
-    /// Keep colours of an RGB profile other than sRGB in it.
+    /// Keep colours of an RGB or grey profile other than sRGB in it.
     #[serde(default)]
     keep_profile: bool,
     pdf_dpi: Option<u16>,

@@ -11,7 +11,7 @@ use std::io::Cursor;
 use moxcms::Layout;
 use png::{BitDepth, ColorType, Transformations};
 
-use super::{Deadline, Error, Limits, Rebuilt, ToSrgb};
+use super::{Deadline, Error, Limits, Rebuilt, ToSrgb, colour, profile};
 use crate::detect::FileType;
 
 fn decode_error(error: png::DecodingError) -> Error {
@@ -86,8 +86,14 @@ fn convert(
     }
 }
 
-/// The animated PNG in `data`, rebuilt.
-pub(super) fn rebuild(data: &[u8], limits: &Limits, deadline: Deadline) -> Result<Rebuilt, Error> {
+/// The animated PNG in `data`, rebuilt; its colours or shades kept in a
+/// profile other than sRGB's if `keep_profile` and it can be written anew.
+pub(super) fn rebuild(
+    data: &[u8],
+    limits: &Limits,
+    deadline: Deadline,
+    keep_profile: bool,
+) -> Result<Rebuilt, Error> {
     let mut decoder = png::Decoder::new_with_limits(
         Cursor::new(data),
         png::Limits {
@@ -115,7 +121,16 @@ pub(super) fn rebuild(data: &[u8], limits: &Limits, deadline: Deadline) -> Resul
     let pixel_dims = info.pixel_dims;
     let mut palette = info.palette.as_ref().map(|p| p.to_vec());
     let trns = info.trns.as_ref().map(|t| t.to_vec());
-    let profile = profile(info)?;
+    let grey = matches!(color, ColorType::Grayscale | ColorType::GrayscaleAlpha);
+    let kept = info
+        .icc_profile
+        .as_ref()
+        .filter(|icc| keep_profile && ToSrgb::new(Some(icc.to_vec())).is_some())
+        .and_then(|icc| colour::rewritten_screen(icc, if grey { 1 } else { 3 }));
+    let profile = match kept {
+        Some(_) => Profile::None,
+        None => profile(info)?,
+    };
     if let (Profile::Palette(colors), Some(palette)) = (&profile, palette.as_mut()) {
         let whole = palette.len() / 3 * 3;
         colors
@@ -191,11 +206,16 @@ pub(super) fn rebuild(data: &[u8], limits: &Limits, deadline: Deadline) -> Resul
         writer.write_image_data(samples).map_err(encode_error)?;
     }
     writer.finish().map_err(encode_error)?;
-    Ok(Rebuilt {
+    let rebuilt = Rebuilt {
         data: out,
         file_type: FileType::Png,
         width,
         height,
         frames: count,
-    })
+    };
+    match kept {
+        Some(icc) => profile::attach(rebuilt, &icc)
+            .ok_or_else(|| Error::Encode("the PNG cannot carry the profile".into())),
+        None => Ok(rebuilt),
+    }
 }

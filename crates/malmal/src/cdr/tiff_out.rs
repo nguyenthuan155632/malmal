@@ -222,6 +222,14 @@ impl Pages {
             DynamicImage::ImageRgba16(i) => {
                 self.page::<colortype::RGB16>(size, i.as_raw(), density, alpha, icc)
             }
+            // Grey of floating point, which is read as colours of it, is
+            // written as grey again.
+            DynamicImage::ImageRgb32F(i)
+                if icc.is_none() && i.pixels().all(|p| p[0] == p[1] && p[1] == p[2]) =>
+            {
+                let grey: Vec<f32> = i.pixels().map(|p| p[0]).collect();
+                self.page::<colortype::Gray32Float>(size, &grey, density, None, None)
+            }
             DynamicImage::ImageRgb32F(i) => {
                 self.page::<colortype::RGB32Float>(size, i.as_raw(), density, None, icc)
             }

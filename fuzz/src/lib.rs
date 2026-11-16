@@ -41,8 +41,8 @@ fn fail(what: std::fmt::Arguments<'_>) -> ! {
 /// Rebuild `data` and check what comes out: a file the scanner finds
 /// nothing in, apart from what the pixels themselves spell (that is for the
 /// scan `sanitize` makes of the rebuilt file, which this leaves out to
-/// reach further), and of the type it says it is. Inks are kept as inks
-/// when `keep_inks`.
+/// reach further), and of the type it says it is. Inks are kept as inks,
+/// and colours in their profile, when `keep_inks`.
 pub fn rebuild_checked(data: &[u8], keep_inks: bool) {
     // `rebuild` catches a panic in a codec and answers with an error. The
     // fuzzer's own hook would stop at the first one, long before anything

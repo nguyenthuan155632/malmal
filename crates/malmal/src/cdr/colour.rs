@@ -236,6 +236,41 @@ pub(super) fn rewritten_rgb(icc: &[u8]) -> Option<Vec<u8>> {
     (through(&original, &grid, Layout::Rgb)? == through(&again, &grid, Layout::Rgb)?).then_some(out)
 }
 
+/// Tags of a profile of shades of grey that say what they are.
+const GREY_TAGS: [&[u8; 4]; 5] = [b"kTRC", b"wtpt", b"bkpt", b"chad", b"cicp"];
+
+/// A grey profile written anew as [`rewritten_rgb`] writes one of colours.
+/// `None` unless the new profile makes the same colour as the old of every
+/// one of 257 shades.
+pub(super) fn rewritten_grey(icc: &[u8]) -> Option<Vec<u8>> {
+    let grey = |icc: &[u8]| {
+        ColorProfile::new_from_slice(icc)
+            .ok()
+            .filter(|p| p.color_space == DataColorSpace::Gray)
+    };
+    let original = grey(icc)?;
+    let out = rewritten(icc, &GREY_TAGS, "Grey")?;
+    let again = grey(&out)?;
+    let shades: Vec<u16> = (0..=256u32).map(|i| (i * 65535 / 256) as u16).collect();
+    (through(&original, &shades, Layout::Gray)? == through(&again, &shades, Layout::Gray)?)
+        .then_some(out)
+}
+
+/// A profile of colours or of grey written anew, for pixels of `channels`
+/// samples (1 or 3, alpha aside) that it is the right kind for.
+pub(super) fn rewritten_screen(icc: &[u8], channels: usize) -> Option<Vec<u8>> {
+    match channels {
+        1 => rewritten_grey(icc),
+        3 => rewritten_rgb(icc),
+        _ => None,
+    }
+}
+
+/// Whether `icc` says it is a profile of grey.
+pub(super) fn is_grey(icc: &[u8]) -> bool {
+    icc.get(16..20) == Some(b"GRAY")
+}
+
 /// The header of profile `icc`, the tags of it named in `tags` byte for
 /// byte, and a description `name` and a copyright of its own.
 fn rewritten(icc: &[u8], tags_kept: &[&[u8; 4]], name: &str) -> Option<Vec<u8>> {

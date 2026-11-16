@@ -140,7 +140,7 @@ const DISTANCE_MAP: [(i8, i8); 120] = [
 ];
 
 /// Bits, the first of each value in the lowest place.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Bits {
     out: Vec<u8>,
     word: u64,
@@ -160,6 +160,11 @@ impl Bits {
             self.word >>= 8;
             self.count -= 8;
         }
+    }
+
+    /// How many bits have been put.
+    fn len(&self) -> usize {
+        self.out.len() * 8 + self.count as usize
     }
 
     fn finish(mut self) -> Vec<u8> {
@@ -395,9 +400,25 @@ fn prefix(value: u32) -> (u32, u32, u32) {
     (2 * high + second, extra, d & ((1 << extra) - 1))
 }
 
+#[derive(Clone, Copy)]
 enum Token {
     Literal(u32),
-    Copy { length: u32, code: u32 },
+    /// A pixel at this place in the colour cache.
+    Cache(u32),
+    Copy {
+        length: u32,
+        code: u32,
+    },
+}
+
+impl Token {
+    /// How many pixels it stands for.
+    fn pixels(&self) -> usize {
+        match *self {
+            Token::Copy { length, .. } => length as usize,
+            _ => 1,
+        }
+    }
 }
 
 const MAX_LENGTH: usize = 4096;
@@ -482,59 +503,313 @@ fn tokens(pixels: &[u32], xsize: usize, deadline: Deadline) -> Result<Vec<Token>
     Ok(found)
 }
 
-/// An image of `pixels` `xsize` across, coded; with the bit that says it
-/// has no meta codes if it is the `main` one.
+/// Literals that are in a colour cache of `cache_bits` when they come, as
+/// their place in it; every pixel goes into it as it comes.
+fn cached(tokens: &[Token], pixels: &[u32], cache_bits: u32) -> Vec<Token> {
+    if cache_bits == 0 {
+        return tokens.to_vec();
+    }
+    let key = |p: u32| (p.wrapping_mul(0x1E35_A7BD) >> (32 - cache_bits)) as usize;
+    let mut cache: Vec<Option<u32>> = vec![None; 1 << cache_bits];
+    let mut at = 0;
+    let mut out = Vec::with_capacity(tokens.len());
+    for &token in tokens {
+        match token {
+            Token::Literal(p) => {
+                let k = key(p);
+                out.push(match cache[k] == Some(p) {
+                    true => Token::Cache(k as u32),
+                    false => token,
+                });
+                cache[k] = Some(p);
+            }
+            _ => {
+                for &p in &pixels[at..at + token.pixels()] {
+                    cache[key(p)] = Some(p);
+                }
+                out.push(token);
+            }
+        }
+        at += token.pixels();
+    }
+    out
+}
+
+/// How often each symbol of each of the five codes is used: green with
+/// lengths and cache places, red, blue, alpha, distances.
+#[derive(Clone)]
+struct Histogram([Vec<u32>; 5]);
+
+impl Histogram {
+    fn new(cache_bits: u32) -> Self {
+        let cache = if cache_bits > 0 { 1 << cache_bits } else { 0 };
+        Self([
+            vec![0; 256 + 24 + cache],
+            vec![0; 256],
+            vec![0; 256],
+            vec![0; 256],
+            vec![0; 40],
+        ])
+    }
+
+    fn add(&mut self, token: Token) {
+        let h = &mut self.0;
+        match token {
+            Token::Literal(p) => {
+                h[0][(p >> 8 & 0xFF) as usize] += 1;
+                h[1][(p >> 16 & 0xFF) as usize] += 1;
+                h[2][(p & 0xFF) as usize] += 1;
+                h[3][(p >> 24) as usize] += 1;
+            }
+            Token::Cache(k) => h[0][280 + k as usize] += 1,
+            Token::Copy { length, code } => {
+                h[0][256 + prefix(length).0 as usize] += 1;
+                h[4][prefix(code).0 as usize] += 1;
+            }
+        }
+    }
+
+    fn merge(&mut self, other: &Histogram) {
+        for (to, from) in self.0.iter_mut().zip(&other.0) {
+            for (a, b) in to.iter_mut().zip(from) {
+                *a += b;
+            }
+        }
+    }
+}
+
+fn put(codes: &[Code], bits: &mut Bits, token: Token) {
+    match token {
+        Token::Literal(p) => {
+            codes[0].put(bits, (p >> 8 & 0xFF) as usize);
+            codes[1].put(bits, (p >> 16 & 0xFF) as usize);
+            codes[2].put(bits, (p & 0xFF) as usize);
+            codes[3].put(bits, (p >> 24) as usize);
+        }
+        Token::Cache(k) => codes[0].put(bits, 280 + k as usize),
+        Token::Copy { length, code } => {
+            let (symbol, extra, value) = prefix(length);
+            codes[0].put(bits, 256 + symbol as usize);
+            bits.put(value, extra);
+            let (symbol, extra, value) = prefix(code);
+            codes[4].put(bits, symbol as usize);
+            bits.put(value, extra);
+        }
+    }
+}
+
+/// An image of a transform, `pixels` `xsize` across, coded with one code
+/// of each kind and no colour cache.
 fn write_image(
     bits: &mut Bits,
     pixels: &[u32],
     xsize: usize,
-    main: bool,
     deadline: Deadline,
 ) -> Result<(), Error> {
     let tokens = tokens(pixels, xsize, deadline)?;
-    // No colour cache.
     bits.put(0, 1);
-    if main {
-        bits.put(0, 1);
-    }
-    let mut green = vec![0u32; 256 + 24];
-    let mut red = vec![0u32; 256];
-    let mut blue = vec![0u32; 256];
-    let mut alpha = vec![0u32; 256];
-    let mut distance = vec![0u32; 40];
-    for token in &tokens {
-        match *token {
-            Token::Literal(p) => {
-                green[(p >> 8 & 0xFF) as usize] += 1;
-                red[(p >> 16 & 0xFF) as usize] += 1;
-                blue[(p & 0xFF) as usize] += 1;
-                alpha[(p >> 24) as usize] += 1;
-            }
-            Token::Copy { length, code } => {
-                green[256 + prefix(length).0 as usize] += 1;
-                distance[prefix(code).0 as usize] += 1;
-            }
-        }
-    }
-    let codes = [&green, &red, &blue, &alpha, &distance].map(|f| write_code(bits, f));
+    let mut histogram = Histogram::new(0);
+    tokens.iter().for_each(|&t| histogram.add(t));
+    let codes = histogram.0.map(|f| write_code(bits, &f));
     for token in tokens {
-        match token {
-            Token::Literal(p) => {
-                codes[0].put(bits, (p >> 8 & 0xFF) as usize);
-                codes[1].put(bits, (p >> 16 & 0xFF) as usize);
-                codes[2].put(bits, (p & 0xFF) as usize);
-                codes[3].put(bits, (p >> 24) as usize);
+        put(&codes, bits, token);
+    }
+    Ok(())
+}
+
+/// The block of each token, of `1 << block_bits` pixels a side.
+fn blocks_of(tokens: &[Token], xsize: usize, block_bits: u32) -> Vec<usize> {
+    let across = xsize.div_ceil(1 << block_bits);
+    let mut at = 0;
+    tokens
+        .iter()
+        .map(|t| {
+            let (x, y) = (at % xsize, at / xsize);
+            at += t.pixels();
+            (y >> block_bits) * across + (x >> block_bits)
+        })
+        .collect()
+}
+
+/// Blocks put in groups that code alike: the group of each block, and how
+/// many groups there are.
+fn grouped(
+    tokens: &[Token],
+    blocks: &[usize],
+    count: usize,
+    cache_bits: u32,
+    deadline: Deadline,
+) -> Result<(Vec<u32>, usize), Error> {
+    // The symbols of each block, by code.
+    let mut used: Vec<Histogram> = vec![Histogram::new(cache_bits); count];
+    for (&token, &block) in tokens.iter().zip(blocks) {
+        used[block].add(token);
+    }
+    let sparse: Vec<Vec<(u8, u16, u32)>> = used
+        .iter()
+        .map(|h| {
+            h.0.iter()
+                .enumerate()
+                .flat_map(|(code, f)| {
+                    f.iter()
+                        .enumerate()
+                        .filter(|&(_, &c)| c > 0)
+                        .map(move |(s, &c)| (code as u8, s as u16, c))
+                })
+                .collect()
+        })
+        .collect();
+    let wanted = count.min(16);
+    // Begin from blocks spread over the picture.
+    let mut group: Vec<u32> = (0..count).map(|b| (b * wanted / count) as u32).collect();
+    for _ in 0..6 {
+        deadline.check()?;
+        let mut totals = vec![Histogram::new(cache_bits); wanted];
+        for (block, &g) in group.iter().enumerate() {
+            totals[g as usize].merge(&used[block]);
+        }
+        // What each symbol costs in each group, a symbol never seen there
+        // as if it were seen once.
+        let costs: Vec<[Vec<f32>; 5]> = totals
+            .iter()
+            .map(|h| {
+                h.0.clone().map(|f| {
+                    let total = f.iter().map(|&c| u64::from(c) + 1).sum::<u64>() as f32;
+                    f.iter().map(|&c| (total / (c + 1) as f32).log2()).collect()
+                })
+            })
+            .collect();
+        let mut changed = false;
+        for (block, symbols) in sparse.iter().enumerate() {
+            if symbols.is_empty() {
+                continue;
             }
-            Token::Copy { length, code } => {
-                let (symbol, extra, value) = prefix(length);
-                codes[0].put(bits, 256 + symbol as usize);
-                bits.put(value, extra);
-                let (symbol, extra, value) = prefix(code);
-                codes[4].put(bits, symbol as usize);
-                bits.put(value, extra);
+            let cost = |g: usize| -> f32 {
+                symbols
+                    .iter()
+                    .map(|&(code, s, c)| costs[g][code as usize][s as usize] * c as f32)
+                    .sum()
+            };
+            let best = (0..wanted)
+                .filter(|&g| totals[g].0[0].iter().any(|&c| c > 0) || g == group[block] as usize)
+                .min_by(|&a, &b| cost(a).total_cmp(&cost(b)))
+                .unwrap_or(0) as u32;
+            if best != group[block] {
+                group[block] = best;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Groups numbered from 0 as they are used.
+    let mut number = vec![u32::MAX; wanted];
+    let mut next = 0;
+    for g in &mut group {
+        if number[*g as usize] == u32::MAX {
+            number[*g as usize] = next;
+            next += 1;
+        }
+        *g = number[*g as usize];
+    }
+    Ok((group, next as usize))
+}
+
+/// The main image of `pixels` `xsize` across, coded in whichever of the
+/// ways tried takes the fewest bits: with a colour cache of some size or
+/// none, with one code of each kind or with codes for groups of blocks.
+fn write_main(
+    bits: &mut Bits,
+    pixels: &[u32],
+    xsize: usize,
+    deadline: Deadline,
+) -> Result<(), Error> {
+    let plain = tokens(pixels, xsize, deadline)?;
+    let ysize = pixels.len() / xsize;
+
+    let write = |bits: &mut Bits,
+                 tokens: &[Token],
+                 cache_bits: u32,
+                 grouping: Option<(u32, Vec<u32>, usize, Vec<usize>)>| {
+        bits.put(u32::from(cache_bits > 0), 1);
+        if cache_bits > 0 {
+            bits.put(cache_bits, 4);
+        }
+        let (groups, of_token) = match grouping {
+            None => {
+                bits.put(0, 1);
+                (1, None)
+            }
+            Some((block_bits, group, count, blocks)) => {
+                bits.put(1, 1);
+                bits.put(block_bits - 2, 3);
+                let image: Vec<u32> = group.iter().map(|&g| 0xFF00_0000 | g << 8).collect();
+                write_image(bits, &image, xsize.div_ceil(1 << block_bits), deadline)?;
+                (count, Some((group, blocks)))
+            }
+        };
+        let mut histograms = vec![Histogram::new(cache_bits); groups];
+        for (index, &token) in tokens.iter().enumerate() {
+            let g = of_token
+                .as_ref()
+                .map_or(0, |(group, blocks)| group[blocks[index]] as usize);
+            histograms[g].add(token);
+        }
+        let codes: Vec<Vec<Code>> = histograms
+            .iter()
+            .map(|h| h.0.iter().map(|f| write_code(bits, f)).collect())
+            .collect();
+        for (index, &token) in tokens.iter().enumerate() {
+            let g = of_token
+                .as_ref()
+                .map_or(0, |(group, blocks)| group[blocks[index]] as usize);
+            put(&codes[g], bits, token);
+        }
+        Ok::<(), Error>(())
+    };
+
+    // The size of colour cache, or none, that comes out smallest.
+    let mut best: Option<(Bits, u32, Vec<Token>)> = None;
+    for cache_bits in [0, 2, 4, 6, 8, 10] {
+        deadline.check()?;
+        let tokens = cached(&plain, pixels, cache_bits);
+        let mut written = bits.clone();
+        write(&mut written, &tokens, cache_bits, None)?;
+        if best
+            .as_ref()
+            .is_none_or(|(b, _, _)| written.len() < b.len())
+        {
+            best = Some((written, cache_bits, tokens));
+        }
+    }
+    drop(plain);
+    let Some((single, cache_bits, tokens)) = best else {
+        return Ok(());
+    };
+    // Blocks of a size that makes a few thousand of them at most.
+    if pixels.len() >= 1 << 14 {
+        let block_bits = (3..=9)
+            .find(|&b| xsize.div_ceil(1 << b) * ysize.div_ceil(1 << b) <= 2048)
+            .unwrap_or(9);
+        let count = xsize.div_ceil(1 << block_bits) * ysize.div_ceil(1 << block_bits);
+        let blocks = blocks_of(&tokens, xsize, block_bits);
+        let (group, groups) = grouped(&tokens, &blocks, count, cache_bits, deadline)?;
+        if groups > 1 {
+            let mut split = bits.clone();
+            write(
+                &mut split,
+                &tokens,
+                cache_bits,
+                Some((block_bits, group, groups, blocks)),
+            )?;
+            if split.len() < single.len() {
+                *bits = split;
+                return Ok(());
             }
         }
     }
+    *bits = single;
     Ok(())
 }
 
@@ -605,6 +880,7 @@ fn predicted(
     argb: &[u32],
     width: usize,
     height: usize,
+    cross: bool,
     deadline: Deadline,
 ) -> Result<(), Error> {
     let pixels: Vec<u32> = argb
@@ -674,9 +950,108 @@ fn predicted(
         .iter()
         .map(|&m| 0xFF00_0000 | u32::from(m) << 8)
         .collect();
-    write_image(bits, &mode_image, across, false, deadline)?;
+    write_image(bits, &mode_image, across, deadline)?;
+    // Then, if asked, red and blue taken in part from the others.
+    if cross {
+        let multipliers = crossed(&mut residuals, width, height, deadline)?;
+        bits.put(1, 1);
+        bits.put(1, 2);
+        bits.put(CROSS_BITS - 2, 3);
+        write_image(
+            bits,
+            &multipliers,
+            width.div_ceil(1 << CROSS_BITS),
+            deadline,
+        )?;
+    }
     bits.put(0, 1);
-    write_image(bits, &residuals, width, true, deadline)
+    write_main(bits, &residuals, width, deadline)
+}
+
+const CROSS_BITS: u32 = 5;
+
+/// What the colour transform takes away: `t` times `c`, both as signed
+/// bytes, over 32.
+fn delta(t: i32, c: u32) -> i32 {
+    (t * i32::from(c as u8 as i8)) >> 5
+}
+
+/// The residuals with red taken in part from green and blue in part from
+/// green and red, block by block, by the multipliers that leave them
+/// smallest; the image of those multipliers.
+fn crossed(
+    residuals: &mut [u32],
+    width: usize,
+    height: usize,
+    deadline: Deadline,
+) -> Result<Vec<u32>, Error> {
+    let block = 1usize << CROSS_BITS;
+    let (across, down) = (width.div_ceil(block), height.div_ceil(block));
+    let mut image = Vec::with_capacity(across * down);
+    let signed = |v: u32| i64::from(v as u8 as i8);
+    for by in 0..down {
+        deadline.check()?;
+        for bx in 0..across {
+            let at: Vec<usize> = (by * block..((by + 1) * block).min(height))
+                .flat_map(|y| {
+                    (bx * block..((bx + 1) * block).min(width)).map(move |x| y * width + x)
+                })
+                .collect();
+            let part = |p: u32, shift: u32| p >> shift & 0xFF;
+            // The multiplier of `from` that best takes it out of `to`,
+            // as the least squares give it and those next to it.
+            let best = |to: &dyn Fn(u32) -> u32, from: &dyn Fn(u32) -> u32| -> i32 {
+                let (mut cross, mut square) = (0i64, 0i64);
+                for &i in &at {
+                    let (t, f) = (signed(to(residuals[i])), signed(from(residuals[i])));
+                    cross += t * f;
+                    square += f * f;
+                }
+                if square == 0 {
+                    return 0;
+                }
+                let guess = ((cross * 32) as f64 / square as f64)
+                    .round()
+                    .clamp(-128.0, 127.0) as i32;
+                let cost = |m: i32| -> u64 {
+                    at.iter()
+                        .map(|&i| {
+                            let left = to(residuals[i]) as i32 - delta(m, from(residuals[i]));
+                            u64::from((left as u8 as i8).unsigned_abs())
+                        })
+                        .sum()
+                };
+                [0, guess - 1, guess, guess + 1]
+                    .into_iter()
+                    .filter(|m| (-128..=127).contains(m))
+                    .min_by_key(|&m| (cost(m), m.unsigned_abs()))
+                    .unwrap_or(0)
+            };
+            let green_to_red = best(&|p| part(p, 16), &|p| part(p, 8));
+            let green_to_blue = best(&|p| part(p, 0), &|p| part(p, 8));
+            // Blue with green taken out, against red.
+            let red_to_blue = best(
+                &|p| (part(p, 0) as i32 - delta(green_to_blue, part(p, 8))) as u32 & 0xFF,
+                &|p| part(p, 16),
+            );
+            for &i in &at {
+                let p = residuals[i];
+                let (r, g, b) = (part(p, 16), part(p, 8), part(p, 0));
+                let red = (r as i32 - delta(green_to_red, g)) as u32 & 0xFF;
+                let blue =
+                    (b as i32 - delta(green_to_blue, g) - delta(red_to_blue, r)) as u32 & 0xFF;
+                residuals[i] = (p & 0xFF00_FF00) | red << 16 | blue;
+            }
+            let byte = |m: i32| m as u8 as u32;
+            image.push(
+                0xFF00_0000
+                    | byte(red_to_blue) << 16
+                    | byte(green_to_blue) << 8
+                    | byte(green_to_red),
+            );
+        }
+    }
+    Ok(image)
 }
 
 /// The stream after the header with a table of the colours, if there are
@@ -731,9 +1106,9 @@ fn indexed(
             }
         })
         .collect();
-    write_image(bits, &deltas, table.len(), false, deadline)?;
+    write_image(bits, &deltas, table.len(), deadline)?;
     bits.put(0, 1);
-    write_image(bits, &packed, packed_width, true, deadline)?;
+    write_main(bits, &packed, packed_width, deadline)?;
     Ok(true)
 }
 
@@ -773,11 +1148,21 @@ pub(super) fn encode(
     if indexed(&mut bits, &argb, w, h, deadline)? {
         best = Some(bits.finish());
     }
-    let mut bits = header();
-    predicted(&mut bits, &argb, w, h, deadline)?;
-    let stream = bits.finish();
-    if best.as_ref().is_none_or(|b| stream.len() < b.len()) {
-        best = Some(stream);
+    // Grey has nothing for the colour transform to take out.
+    let colours = argb.iter().any(|&p| {
+        let (r, g, b) = (p >> 16 & 0xFF, p >> 8 & 0xFF, p & 0xFF);
+        r != g || g != b
+    });
+    for cross in [false, true] {
+        if cross && !colours {
+            continue;
+        }
+        let mut bits = header();
+        predicted(&mut bits, &argb, w, h, cross, deadline)?;
+        let stream = bits.finish();
+        if best.as_ref().is_none_or(|b| stream.len() < b.len()) {
+            best = Some(stream);
+        }
     }
     Ok(best)
 }
@@ -830,6 +1215,28 @@ mod size {
             .unwrap()
             .into_rgba8();
         (file.len(), decoded.into_raw())
+    }
+
+    /// A picture large enough for codes of groups of blocks, with parts
+    /// that code differently, comes back exact.
+    #[test]
+    fn large_pictures_with_parts_unlike_each_other_are_exact() {
+        let (w, h) = (300u32, 200u32);
+        let rgba: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let (x, y) = (i % w, i / w);
+                let noise = (x.wrapping_mul(2_654_435_761) ^ y.wrapping_mul(40_503)) >> 27;
+                if x < w / 2 {
+                    [(x + noise) as u8, (y * 2) as u8, (x ^ y) as u8, 255]
+                } else {
+                    let stripe = [[200, 30, 30, 255], [30, 200, 30, 128], [10, 10, 250, 255]];
+                    stripe[((x / 7 + y / 5) % 3) as usize]
+                }
+            })
+            .collect();
+        let (size, decoded) = ours(&rgba, w, h);
+        assert!(decoded == rgba);
+        println!("{size}");
     }
 
     #[test]

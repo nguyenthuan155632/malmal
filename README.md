@@ -458,7 +458,7 @@ The Python and C interfaces use the default limits. Embedded files are scanned u
 |---|---|---|
 | `--jpeg-quality <N>` | 90 | Quality of rebuilt JPEG files, 1–100 |
 | `--keep-cmyk` | off | Keep the inks of a CMYK JPEG, TIFF or PSD, with their profile, rather than turn them into sRGB |
-| `--keep-profile` | off | Keep the colors of a JPEG, PNG, TIFF, WebP or BMP under an RGB profile other than sRGB, with the profile rewritten, rather than turn them into sRGB |
+| `--keep-profile` | off | Keep the colors of an image under an RGB or grey profile other than sRGB (or the primaries an AVIF names), with the profile rewritten, rather than turn them into sRGB |
 | `--pdf-dpi <N>` | 150 | Resolution of rebuilt PDF pages, 36–600 |
 | `--pdf-jpeg` | off | Store a PDF page as JPEG when that is smaller |
 | `--pdf-no-text` | off | Leave out the invisible text layer of a rebuilt PDF |
@@ -623,11 +623,13 @@ In C, use `malmal_sanitize`. In every interface, if rebuilding fails, store noth
     kept, as Exif of nothing else.
   - GIF keeps its palettes and pixel indices; APNG keeps its frames as they were laid out,
     at their own depth.
-  - A TIFF of JPEG strips or tiles becomes one JPEG of their coefficients; a JPEG XL made
-    from a JPEG gives back that JPEG. Both are checked against the pixels they show.
+  - A TIFF of JPEG strips or tiles becomes one JPEG of their coefficients, or a TIFF of
+    such pages if it has several (or inks kept with `--keep-cmyk`); a JPEG XL made from a
+    JPEG gives back that JPEG. Each is checked against the pixels it shows. JPEG in a
+    TIFF of the old kind (compression 6) becomes the JPEG it stands for.
 
   BMP, PSD (the composite image saved with the layers; a duotone in the colors of its
-  inks), JPEG XL and AVIF become PNG, a JPEG XL animation an animated PNG, and a TIFF a
+  inks, overprints included), JPEG XL and AVIF become PNG, a JPEG XL animation an animated PNG, and a TIFF a
   PNG of its one page (a TIFF if its samples are floating point) or a TIFF of all of
   them, so store the file under the type the result reports. Lossless WebP is written by
   an encoder of malmal's own and checked pixel for pixel. TIFF is read in every
@@ -641,11 +643,13 @@ In C, use `malmal_sanitize`. In every interface, if rebuilding fails, store noth
   instead: a JPEG its coefficients, a TIFF or PSD its samples, written as a TIFF. The
   profile is kept with them, rebuilt from only the tags that define its colors, copied
   byte for byte and checked to print every ink exactly as the original does.
-- **Wide-gamut RGB** (Display P3, Adobe RGB) JPEG, PNG, TIFF, WebP and BMP are converted
-  to sRGB, which clips colors sRGB cannot show. With `--keep-profile`
-  (`Profiles::Keep`, `keep_profile` in the bindings) they keep their samples (a JPEG its
-  coefficients, a lossy WebP its VP8 stream) and their profile, rebuilt the same way and
-  checked on a grid of every color mix.
+- **Wide-gamut RGB** (Display P3, Adobe RGB) images are converted to sRGB, which clips
+  colors sRGB cannot show, and grey under a profile of its own to sRGB's curve. With
+  `--keep-profile` (`Profiles::Keep`, `keep_profile` in the bindings) a JPEG, PNG, TIFF,
+  WebP, BMP, GIF, animated PNG, JPEG XL, PSD or AVIF keeps its samples (a JPEG its
+  coefficients, a lossy WebP its VP8 stream) and its profile, rebuilt the same way and
+  checked on a grid of every color mix; an AVIF that names its primaries and transfer
+  keeps them in the PNG's `cICP` chunk.
 - **SVG** is filtered through an allowlist
   ([svg-hush](https://github.com/cloudflare/svg-hush)) that keeps only what draws.
   The result is scanned again and refused if it is not clean.
@@ -781,8 +785,9 @@ goes to the SHA-256 hash; `--no-hash` skips it when you do not need it.
   encryption.
 - **HEIC** is scanned but not rebuilt (there is no HEVC decoder in Rust), nor is a PSD
   saved without a composite image ("Maximize compatibility" off). AVIF in a range for
-  high dynamic range displays (PQ, HLG) is refused rather than shown wrong, and so is an
-  AVIF image sequence without a still image.
+  high dynamic range displays (PQ, HLG) becomes a 16-bit PNG that names its primaries and
+  transfer (`cICP`): viewers that do not read that chunk show it wrong. An AVIF image
+  sequence without a still image is refused.
 - **Rebuilt images keep their pixels**, and anything encoded in them. Rebuilt files are
   scanned again for that reason; if you call `malmal::cdr::rebuild` directly, scan the
   result yourself.

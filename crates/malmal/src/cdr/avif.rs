@@ -6,16 +6,19 @@
 //! the file gives, at 8 bits a channel or, if it holds more, at 16, with
 //! the auxiliary alpha image if there is one. The picture is then cut,
 //! turned and mirrored as its properties say, and its colours brought into
-//! sRGB from its ICC profile or from the primaries and transfer it names.
+//! sRGB from its ICC profile or from the primaries and transfer it names;
+//! or, when they are to be kept, left as they are under the profile written
+//! anew, or with the primaries and transfer named in the PNG (`cICP`).
 //! Pictures in a range only a display for high dynamic range shows (PQ,
-//! HLG) are refused rather than shown wrong.
+//! HLG) cannot be brought into sRGB: they are always left as they are, at
+//! 16 bits a channel, with what they are named in the PNG.
 
 use image::{DynamicImage, ImageBuffer, Luma, LumaA, Rgb, Rgba};
 use moxcms::{
     CicpColorPrimaries, CicpProfile, ColorProfile, MatrixCoefficients, TransferCharacteristics,
 };
 
-use super::{Deadline, Error, ToSrgb};
+use super::{Deadline, Error, ToSrgb, colour};
 use crate::detect::FileType;
 use crate::limits::Limits;
 
@@ -506,9 +509,17 @@ fn av1(
     } else {
         1
     };
+    // Set when the answer is no longer waited for, so that the decoder
+    // stops at its next row of superblocks instead of running on.
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = cancel.clone();
     let run = move || -> Result<Vec<filmcraft_av1::Picture>, Error> {
-        let failed = |e: filmcraft_av1::Error| broken(&format!("AV1 image: {e}"));
+        let failed = |e: filmcraft_av1::Error| match e {
+            filmcraft_av1::Error::Cancelled => Error::TimedOut,
+            e => broken(&format!("AV1 image: {e}")),
+        };
         let mut decoder = filmcraft_av1::Decoder::with_threads(threads);
+        decoder.set_cancel(flag);
         let mut pictures = decoder.decode(&stream).map_err(failed)?;
         pictures.extend(decoder.flush_result().map_err(failed)?);
         Ok(pictures)
@@ -525,7 +536,10 @@ fn av1(
         .map_err(|e| broken(&format!("no thread for the AV1 decoder: {e}")))?;
     match receiver.recv_timeout(at.saturating_duration_since(std::time::Instant::now())) {
         Ok(answer) => answer,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Error::TimedOut),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            Err(Error::TimedOut)
+        }
         // It stopped without an answer: it panicked.
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(broken("AV1 decoder failed")),
     }
@@ -840,58 +854,112 @@ fn aperture(body: &[u8], width: u32, height: u32) -> Result<(u32, u32, u32, u32)
     Ok((left as u32, top as u32, w as u32, h as u32))
 }
 
-/// The colour profile of the picture, if it says it is other than sRGB.
-fn profile(colour: Option<&[u8]>) -> Result<Option<ToSrgb>, Error> {
+/// What the colours of the picture are, as the file says.
+enum Described {
+    Srgb,
+    Icc(Vec<u8>),
+    /// Primaries and transfer, as ITU-T H.273 numbers them.
+    Cicp(u8, u8),
+}
+
+fn described(colour: Option<&[u8]>) -> Result<Described, Error> {
     let Some(body) = colour else {
-        return Ok(None);
+        return Ok(Described::Srgb);
     };
     let mut fields = Fields::new(body);
     match &fields.four()? {
-        b"prof" | b"rICC" => Ok(ToSrgb::new(Some(fields.rest().to_vec()))),
+        b"prof" | b"rICC" => Ok(Described::Icc(fields.rest().to_vec())),
         b"nclx" => {
             let primaries = fields.u16()?;
             let transfer = fields.u16()?;
             // Those of sRGB, or close enough that every viewer shows them
             // as sRGB, or not given.
             if matches!(primaries, 1 | 2) && matches!(transfer, 1 | 2 | 6 | 13 | 14 | 15) {
-                return Ok(None);
+                return Ok(Described::Srgb);
             }
-            let hdr = || refused("its colours are for a display of high dynamic range");
-            if matches!(transfer, 16 | 18) {
-                return Err(hdr());
-            }
-            let primaries = CicpColorPrimaries::try_from(primaries as u8)
-                .map_err(|_| refused("its colour primaries are unknown"))?;
-            let transfer = TransferCharacteristics::try_from(match transfer {
-                2 => 13,
-                t => t as u8,
-            })
-            .map_err(|_| refused("its transfer function is unknown"))?;
-            let mut profile = ColorProfile::new_srgb();
-            let cicp = CicpProfile {
-                color_primaries: primaries,
-                transfer_characteristics: transfer,
-                matrix_coefficients: MatrixCoefficients::Identity,
-                full_range: true,
+            let known = |v: u16| u8::try_from(v).map_err(|_| refused("its colours are unknown"));
+            // Not given is taken to be sRGB's.
+            let primaries = match primaries {
+                2 => 1,
+                p => known(p)?,
             };
-            // What it returns says nothing; the description is kept only
-            // when the colours were set from it.
-            profile.update_rgb_colorimetry_from_cicp(cicp);
-            if profile.cicp.is_none() || profile.red_trc.is_none() {
-                return Err(refused("its colours cannot be brought into sRGB"));
-            }
-            Ok(ToSrgb::of(profile))
+            let transfer = match transfer {
+                2 => 13,
+                t => known(t)?,
+            };
+            CicpColorPrimaries::try_from(primaries)
+                .map_err(|_| refused("its colour primaries are unknown"))?;
+            TransferCharacteristics::try_from(transfer)
+                .map_err(|_| refused("its transfer function is unknown"))?;
+            Ok(Described::Cicp(primaries, transfer))
         }
-        _ => Ok(None),
+        _ => Ok(Described::Srgb),
     }
 }
 
-/// The AVIF in `data`: its primary image, as it is shown.
+/// What turns colours of `primaries` and `transfer` into sRGB.
+fn cicp_to_srgb(primaries: u8, transfer: u8) -> Result<Option<ToSrgb>, Error> {
+    let primaries = CicpColorPrimaries::try_from(primaries)
+        .map_err(|_| refused("its colour primaries are unknown"))?;
+    let transfer = TransferCharacteristics::try_from(transfer)
+        .map_err(|_| refused("its transfer function is unknown"))?;
+    let mut profile = ColorProfile::new_srgb();
+    let cicp = CicpProfile {
+        color_primaries: primaries,
+        transfer_characteristics: transfer,
+        matrix_coefficients: MatrixCoefficients::Identity,
+        full_range: true,
+    };
+    // What it returns says nothing; the description is kept only when the
+    // colours were set from it.
+    profile.update_rgb_colorimetry_from_cicp(cicp);
+    if profile.cicp.is_none() || profile.red_trc.is_none() {
+        return Err(refused("its colours cannot be brought into sRGB"));
+    }
+    Ok(ToSrgb::of(profile))
+}
+
+/// What the colours of a picture read are in.
+pub(super) enum Space {
+    Srgb,
+    /// A profile written anew.
+    Icc(Vec<u8>),
+    /// Primaries, transfer, matrix and range, as a PNG `cICP` chunk has
+    /// them.
+    Cicp([u8; 4]),
+}
+
+/// The picture of an AVIF, and what its colours are in.
+pub(super) struct Shown {
+    pub(super) image: DynamicImage,
+    pub(super) space: Space,
+}
+
+/// The AVIF in `data`: its primary image, as it is shown, in sRGB.
+#[cfg(test)]
 pub(super) fn read(
     data: &[u8],
     limits: &Limits,
     deadline: Deadline,
 ) -> Result<DynamicImage, Error> {
+    let shown = shown(data, limits, deadline, false)?;
+    match shown.space {
+        Space::Srgb => Ok(shown.image),
+        _ => Err(refused(
+            "its colours are for a display of high dynamic range",
+        )),
+    }
+}
+
+/// The AVIF in `data`: its primary image, as it is shown, its colours
+/// left in what they are if `keep_profile` and that can be said in a PNG,
+/// in sRGB otherwise.
+pub(super) fn shown(
+    data: &[u8],
+    limits: &Limits,
+    deadline: Deadline,
+    keep_profile: bool,
+) -> Result<Shown, Error> {
     let heif = Heif::parse(data)?;
     let primary = heif.item(heif.primary)?;
     let planes = decode(&heif, heif.primary, limits, deadline, false)?;
@@ -938,15 +1006,49 @@ pub(super) fn read(
         unpremultiply(&mut image);
     }
 
-    if let Some(colors) = profile(
+    let description = described(
         colours
             .iter()
             .find(|b| b.starts_with(b"prof") || b.starts_with(b"rICC"))
             .or(nclx.as_ref())
             .copied(),
-    )? {
-        colors.image(&mut image);
-    }
+    )?;
+    let channels = if image.color().has_color() { 3 } else { 1 };
+    let space = match description {
+        Described::Srgb => Space::Srgb,
+        Described::Icc(icc) => match ToSrgb::new(Some(icc.clone())) {
+            None => Space::Srgb,
+            Some(colors) => match keep_profile
+                .then(|| colour::rewritten_screen(&icc, channels))
+                .flatten()
+            {
+                Some(icc) => Space::Icc(icc),
+                None => {
+                    colors.image(&mut image);
+                    Space::Srgb
+                }
+            },
+        },
+        // PQ and HLG: sRGB cannot show them, so they stay as they are, at
+        // 16 bits whatever the stream has.
+        Described::Cicp(primaries, transfer @ (16 | 18)) => {
+            image = if image.color().has_alpha() {
+                image.into_rgba16().into()
+            } else {
+                image.into_rgb16().into()
+            };
+            Space::Cicp([primaries, transfer, 0, 1])
+        }
+        Described::Cicp(primaries, transfer) if keep_profile => {
+            Space::Cicp([primaries, transfer, 0, 1])
+        }
+        Described::Cicp(primaries, transfer) => {
+            if let Some(colors) = cicp_to_srgb(primaries, transfer)? {
+                colors.image(&mut image);
+            }
+            Space::Srgb
+        }
+    };
 
     // Cut, turned and mirrored in the order the file gives.
     for (kind, body) in heif.properties(primary)? {
@@ -971,7 +1073,7 @@ pub(super) fn read(
             _ => image,
         };
     }
-    Ok(image)
+    Ok(Shown { image, space })
 }
 
 /// Colours divided by their alpha.
@@ -1024,7 +1126,17 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(60),
         ));
         assert_eq!(av1(stream.clone(), 1, later).unwrap().len(), 1);
-        assert_eq!(av1(stream, 1, Deadline(None)).unwrap().len(), 1);
+        assert_eq!(av1(stream.clone(), 1, Deadline(None)).unwrap().len(), 1);
+        // A decoder told to stop does, with no picture.
+        let mut decoder = filmcraft_av1::Decoder::with_threads(1);
+        decoder.set_cancel(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            true,
+        )));
+        let decoded = decoder.decode(&stream).and_then(|mut pictures| {
+            pictures.extend(decoder.flush_result()?);
+            Ok(pictures)
+        });
+        assert!(matches!(decoded, Err(filmcraft_av1::Error::Cancelled)));
     }
 
     fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
@@ -1286,6 +1398,57 @@ mod tests {
             read(&with("colours.avif", &[nclx(9, 16)])),
             Err(Error::Unsupported { .. })
         ));
+    }
+
+    /// Colours to be kept stay as they are, under what the file says they
+    /// are in; those of high dynamic range always do, at 16 bits.
+    #[test]
+    fn colours_are_kept_in_what_they_are_in() {
+        let nclx = |primaries: u16, transfer: u16| {
+            boxed(
+                b"colr",
+                &[
+                    &b"nclx"[..],
+                    &primaries.to_be_bytes(),
+                    &transfer.to_be_bytes(),
+                    &[0, 2, 0],
+                ]
+                .concat(),
+            )
+        };
+        let shown =
+            |data: &[u8], keep| shown(data, &Limits::default(), Deadline(None), keep).unwrap();
+        let plain = read(&with("colours.avif", &[])).unwrap();
+        let p3 = shown(&with("colours.avif", &[nclx(12, 13)]), true);
+        assert!(matches!(p3.space, Space::Cicp([12, 13, 0, 1])));
+        assert_eq!(p3.image, plain);
+        let pq = shown(&with("colours.avif", &[nclx(9, 16)]), false);
+        assert!(matches!(pq.space, Space::Cicp([9, 16, 0, 1])));
+        assert_eq!(pq.image.to_rgb8(), plain.to_rgb8());
+        assert!(matches!(pq.image, DynamicImage::ImageRgb16(_)));
+
+        let jpeg = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/corpus/clean/p3.jpg"
+        ))
+        .unwrap();
+        let mut decoder =
+            image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(&jpeg)).unwrap();
+        let icc = image::ImageDecoder::icc_profile(&mut decoder)
+            .unwrap()
+            .unwrap();
+        let profiled = with(
+            "colours.avif",
+            &[boxed(b"colr", &[&b"prof"[..], &icc].concat())],
+        );
+        let kept = shown(&profiled, true);
+        assert!(
+            matches!(&kept.space, Space::Icc(new) if *new == colour::rewritten_rgb(&icc).unwrap())
+        );
+        assert_eq!(kept.image, plain);
+        let converted = shown(&profiled, false);
+        assert!(matches!(converted.space, Space::Srgb));
+        assert_ne!(converted.image, plain);
     }
 
     #[test]

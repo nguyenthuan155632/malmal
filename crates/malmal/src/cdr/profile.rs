@@ -21,40 +21,71 @@ fn crc32(bytes: &[u8]) -> u32 {
 }
 
 /// `rebuilt` with the profile `icc` in it, or `None` if its file cannot
-/// carry one for its pixels: a PNG of grey, or a type other than these.
+/// carry one for its pixels: a profile of grey for pixels in colour, or of
+/// colours for grey ones, a WebP (always in colour) under one of grey, or
+/// a type other than these.
 pub(super) fn attach(rebuilt: Rebuilt, icc: &[u8]) -> Option<Rebuilt> {
+    let grey = super::colour::is_grey(icc);
     let data = match rebuilt.file_type {
-        FileType::Png => png(&rebuilt.data, icc)?,
-        FileType::Jpeg => jpeg(&rebuilt.data, icc)?,
-        FileType::Webp => webp(&rebuilt.data, icc, rebuilt.width, rebuilt.height)?,
+        FileType::Png => png(&rebuilt.data, icc, grey)?,
+        FileType::Jpeg => jpeg(&rebuilt.data, icc, grey)?,
+        FileType::Webp if !grey => webp(&rebuilt.data, icc, rebuilt.width, rebuilt.height)?,
         _ => return None,
     };
     Some(Rebuilt { data, ..rebuilt })
 }
 
-/// An `iCCP` chunk after the header, which has to say the pixels are in
-/// colour: an RGB profile says nothing of grey.
-fn png(data: &[u8], icc: &[u8]) -> Option<Vec<u8>> {
+/// `rebuilt`, a PNG, with a `cICP` chunk after its header: primaries,
+/// transfer, matrix and range, as ITU-T H.273 numbers them.
+pub(super) fn cicp(rebuilt: Rebuilt, cicp: [u8; 4]) -> Option<Rebuilt> {
+    if rebuilt.file_type != FileType::Png {
+        return None;
+    }
+    let data = png_chunk(&rebuilt.data, b"cICP", &cicp)?;
+    Some(Rebuilt { data, ..rebuilt })
+}
+
+/// The PNG `data` with a chunk `name` of `body` after its header.
+fn png_chunk(data: &[u8], name: &[u8; 4], body: &[u8]) -> Option<Vec<u8>> {
     // Signature, then the header chunk of 13 bytes and its length, name
     // and CRC.
     let header_end = 8 + 8 + 13 + 4;
-    if data.get(12..16)? != b"IHDR" || !matches!(data.get(25)?, 2 | 3 | 6) {
+    if data.get(12..16)? != b"IHDR" {
         return None;
     }
-    let mut body = b"ICC Profile\0\0".to_vec();
-    body.extend_from_slice(&miniz_oxide::deflate::compress_to_vec_zlib(icc, 9));
     let mut chunk = u32::try_from(body.len()).ok()?.to_be_bytes().to_vec();
-    chunk.extend_from_slice(b"iCCP");
-    chunk.extend_from_slice(&body);
+    chunk.extend_from_slice(name);
+    chunk.extend_from_slice(body);
     let crc = crc32(&chunk[4..]);
     chunk.extend_from_slice(&crc.to_be_bytes());
     Some([data.get(..header_end)?, &chunk, &data[header_end..]].concat())
 }
 
+/// An `iCCP` chunk after the header, which has to say the pixels are of
+/// the kind the profile is for: an RGB profile says nothing of grey, nor a
+/// grey one of colours.
+fn png(data: &[u8], icc: &[u8], grey: bool) -> Option<Vec<u8>> {
+    let fits = match data.get(25)? {
+        0 | 4 => grey,
+        2 | 3 | 6 => !grey,
+        _ => false,
+    };
+    if !fits {
+        return None;
+    }
+    let mut body = b"ICC Profile\0\0".to_vec();
+    body.extend_from_slice(&miniz_oxide::deflate::compress_to_vec_zlib(icc, 9));
+    png_chunk(data, b"iCCP", &body)
+}
+
 /// `APP2` segments after the first segment, which is the `JFIF` or
 /// `Adobe` one the encoders here write.
-fn jpeg(data: &[u8], icc: &[u8]) -> Option<Vec<u8>> {
+fn jpeg(data: &[u8], icc: &[u8], grey: bool) -> Option<Vec<u8>> {
     if data.get(..2)? != [0xFF, 0xD8] || !matches!(data.get(3)?, 0xE0 | 0xEE) {
+        return None;
+    }
+    // One component for a profile of grey, three for one of colours.
+    if (components(data)? == 1) != grey {
         return None;
     }
     let first = 4 + usize::from(u16::from_be_bytes([*data.get(4)?, *data.get(5)?]));
@@ -70,6 +101,22 @@ fn jpeg(data: &[u8], icc: &[u8]) -> Option<Vec<u8>> {
     }
     out.extend_from_slice(&data[first..]);
     Some(out)
+}
+
+/// The number of components of the frame of a JPEG.
+fn components(data: &[u8]) -> Option<u8> {
+    let mut at = 2;
+    loop {
+        if *data.get(at)? != 0xFF {
+            return None;
+        }
+        let marker = *data.get(at + 1)?;
+        let length = usize::from(u16::from_be_bytes([*data.get(at + 2)?, *data.get(at + 3)?]));
+        if matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+            return data.get(at + 9).copied();
+        }
+        at += 2 + length;
+    }
 }
 
 /// The chunks of a WebP file after its header, by name.

@@ -91,11 +91,15 @@
 //! white the file names, D50 otherwise. A profile that does not fit its
 //! image, or cannot be read, is dropped as it is.
 //!
-//! With [`Profiles::Keep`], the colours of a JPEG, PNG, TIFF, WebP or BMP
-//! under an RGB profile other than sRGB (Display P3, Adobe RGB) are kept as
+//! With [`Profiles::Keep`], the colours of a JPEG, PNG, TIFF, WebP, BMP,
+//! GIF, animated PNG, JPEG XL, PSD or AVIF under an RGB profile other than
+//! sRGB (Display P3, Adobe RGB), or the shades of a grey one, are kept as
 //! they are, with the profile written anew from the tags that say what its
 //! colours are, checked to give every colour of a grid of them as the
-//! original does; one that cannot be is turned into sRGB as before.
+//! original does; one that cannot be is turned into sRGB as before. An AVIF
+//! that names its primaries and transfer keeps them, named in the PNG
+//! (`cICP`). One for a display of high dynamic range always does: sRGB
+//! cannot show it.
 //!
 //! With [`Inks::Keep`], a CMYK JPEG, TIFF or PSD keeps its inks instead:
 //! a JPEG its coefficients, a TIFF or PSD its samples, written as a TIFF.
@@ -143,11 +147,13 @@ mod gif;
 mod ifd;
 mod jpeg;
 mod jxl;
+mod ojpeg;
 mod palette;
 mod profile;
 mod psd;
 mod strips;
 mod tif;
+mod tiff_jpeg;
 mod tiff_out;
 mod vp8;
 mod vp8l;
@@ -186,13 +192,13 @@ pub struct Options {
     pub pdf_vector_text: bool,
     /// What becomes of an image of printing inks (CMYK).
     pub inks: Inks,
-    /// What becomes of an image in colours of an RGB profile other than
-    /// sRGB, such as Display P3 or Adobe RGB.
+    /// What becomes of an image in colours of an RGB or grey profile other
+    /// than sRGB, such as Display P3 or Adobe RGB.
     pub profiles: Profiles,
 }
 
-/// What becomes of the colours of an RGB image under a profile other than
-/// sRGB: a JPEG, PNG, TIFF, WebP or BMP.
+/// What becomes of the colours of an image under an RGB or grey profile
+/// other than sRGB, or the primaries an AVIF names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Profiles {
@@ -1482,12 +1488,12 @@ fn raster(
                         match icc {
                             // Colours of another profile are kept in it, if
                             // they are to be and it can be written anew.
-                            Some(icc) if ToSrgb::new(Some(icc.clone())).is_some() => {
-                                (coefficients.colours() && options.profiles == Profiles::Keep)
-                                    .then(|| colour::rewritten_rgb(&icc))
-                                    .flatten()
-                                    .map(Some)
-                            }
+                            Some(icc) if ToSrgb::new(Some(icc.clone())).is_some() => (options
+                                .profiles
+                                == Profiles::Keep)
+                                .then(|| colour::rewritten_screen(&icc, coefficients.channels()))
+                                .flatten()
+                                .map(Some),
                             _ => Some(None),
                         }
                     };
@@ -1530,7 +1536,7 @@ fn raster(
                 );
             }
             // Frame by frame as the file has them, where that can be done.
-            match apng::rebuild(data, limits, deadline) {
+            match apng::rebuild(data, limits, deadline, options.profiles == Profiles::Keep) {
                 Err(Error::Decode(_) | Error::Encode(_)) => {}
                 done => return done,
             }
@@ -1564,7 +1570,7 @@ fn raster(
         FileType::Gif => {
             // Pixels laid over pixels can show more than a GIF's 256
             // colours, which full colour written back would have to lose.
-            match gif::rebuild(data, limits, deadline) {
+            match gif::rebuild(data, limits, deadline, options.profiles == Profiles::Keep) {
                 Err(Error::Decode(_) | Error::Encode(_)) => {}
                 done => return done,
             }
@@ -1579,18 +1585,40 @@ fn raster(
             Output::Png(density),
             options.profiles,
         ),
-        FileType::Tiff => tif::rebuild(
-            data,
-            limits,
-            deadline,
-            options.inks == Inks::Keep,
-            options.profiles == Profiles::Keep,
-        ),
-        FileType::Psd => {
-            match psd::composite(data, limits, deadline, options.inks == Inks::Keep)? {
-                psd::Composite::Colours(picture) => {
-                    write(picture.image, deadline, Output::Png(picture.density))
+        FileType::Tiff => {
+            // JPEG of the first kind is the JPEG it stands for, rebuilt as
+            // any JPEG is.
+            if let Some(jpeg) = ojpeg::jpeg(data, limits)
+                && detect::detect(&jpeg) == FileType::Jpeg
+            {
+                match raster(&jpeg, FileType::Jpeg, limits, options, deadline) {
+                    Err(Error::Decode(_) | Error::Encode(_)) => {}
+                    other => return other,
                 }
+            }
+            tif::rebuild(
+                data,
+                limits,
+                deadline,
+                options.inks == Inks::Keep,
+                options.profiles == Profiles::Keep,
+            )
+        }
+        FileType::Psd => {
+            let composite = psd::composite(
+                data,
+                limits,
+                deadline,
+                options.inks == Inks::Keep,
+                options.profiles == Profiles::Keep,
+            )?;
+            match composite {
+                psd::Composite::Colours(picture) => kept_in(
+                    picture.image,
+                    picture.icc,
+                    deadline,
+                    Output::Png(picture.density),
+                ),
                 psd::Composite::Inks(kept) => {
                     let mut pages = tiff_out::Pages::new(limits)?;
                     pages.add_inks(&kept, deadline)?;
@@ -1634,8 +1662,19 @@ fn raster(
         }
         // There is no AV1 encoder here; a PNG keeps every pixel.
         FileType::Avif => {
-            let image = avif::read(data, limits, deadline)?;
-            write(image, deadline, Output::Png(None))
+            let shown = avif::shown(data, limits, deadline, options.profiles == Profiles::Keep)?;
+            match shown.space {
+                avif::Space::Srgb => write(shown.image, deadline, Output::Png(None)),
+                avif::Space::Icc(icc) => {
+                    kept_in(shown.image, Some(icc), deadline, Output::Png(None))
+                }
+                avif::Space::Cicp(cicp) => {
+                    let rebuilt = write(shown.image, deadline, Output::Png(None))?;
+                    profile::cicp(rebuilt, cicp).ok_or_else(|| {
+                        Error::Encode("the PNG cannot say what its colours are".into())
+                    })
+                }
+            }
         }
         _ => Err(unsupported("not a type this build rebuilds")),
     }
@@ -1898,19 +1937,42 @@ fn still(
 ) -> Result<Rebuilt, Error> {
     // Colours of a profile other than sRGB's stay in it, if they are to
     // and it can be written anew.
+    let channels = if decoder.color_type().has_color() {
+        3
+    } else {
+        1
+    };
     let kept = match profiles {
-        Profiles::Keep if decoder.color_type().has_color() => decoder
+        Profiles::Keep => decoder
             .icc_profile()
             .ok()
             .flatten()
             .filter(|icc| ToSrgb::new(Some(icc.clone())).is_some())
-            .and_then(|icc| colour::rewritten_rgb(&icc)),
+            .and_then(|icc| colour::rewritten_screen(&icc, channels)),
         _ => None,
     };
     let Some(icc) = kept else {
         return write(picture(decoder, limits, true)?, deadline, output);
     };
-    let image = picture(decoder, limits, false)?;
+    kept_in(
+        picture(decoder, limits, false)?,
+        Some(icc),
+        deadline,
+        output,
+    )
+}
+
+/// `image` written as `output`, under the profile `icc` its pixels are in
+/// if there is one: converted to sRGB if the file cannot carry it.
+fn kept_in(
+    image: DynamicImage,
+    icc: Option<Vec<u8>>,
+    deadline: Deadline,
+    output: Output,
+) -> Result<Rebuilt, Error> {
+    let Some(icc) = icc else {
+        return write(image, deadline, output);
+    };
     let rebuilt = write(image.clone(), deadline, output.clone())?;
     match profile::attach(rebuilt, &icc) {
         Some(rebuilt) => Ok(rebuilt),
@@ -3671,6 +3733,56 @@ mod tests {
         }
     }
 
+    /// A TIFF of several pages of JPEG pictures stays one, each page its
+    /// coefficients put together into one strip; so does one of inks when
+    /// they are kept.
+    #[test]
+    fn tiff_of_jpeg_pages_keeps_their_coefficients() {
+        let strips = |data: &[u8]| {
+            let mut decoder = tiff::decoder::Decoder::new(Cursor::new(data)).unwrap();
+            let mut pages = Vec::new();
+            loop {
+                let compression = decoder
+                    .find_tag_unsigned::<u16>(tiff::tags::Tag::Compression)
+                    .unwrap()
+                    .unwrap();
+                let photometric = decoder
+                    .find_tag_unsigned::<u16>(tiff::tags::Tag::PhotometricInterpretation)
+                    .unwrap()
+                    .unwrap();
+                pages.push((compression, photometric));
+                if !decoder.more_images() {
+                    break;
+                }
+                decoder.next_image().unwrap();
+            }
+            pages
+        };
+        for (name, pages, photometric) in [("pages-jpeg.tif", 3, 2), ("ycbcr-pages-jpeg.tif", 2, 6)]
+        {
+            let data = corpus(name);
+            let rebuilt = run(&data).unwrap();
+            assert_eq!(rebuilt.file_type, FileType::Tiff, "{name}");
+            assert_eq!(rebuilt.frames, pages, "{name}");
+            assert_eq!(
+                strips(&rebuilt.data),
+                vec![(7, photometric); pages as usize],
+                "{name}"
+            );
+            assert!(rebuilt.data.len() < data.len() * 2, "{name}");
+        }
+        let data = corpus("cmyk-jpeg.tif");
+        let options = Options {
+            inks: Inks::Keep,
+            ..Options::default()
+        };
+        let rebuilt = rebuild(&data, &Limits::default(), &options).unwrap();
+        assert_eq!(rebuilt.file_type, FileType::Tiff);
+        assert_eq!(strips(&rebuilt.data), [(7, 5)]);
+        // Without keeping the inks, they become colours as before.
+        assert_eq!(run(&data).unwrap().file_type, FileType::Png);
+    }
+
     fn keeping_profiles(data: &[u8]) -> Rebuilt {
         let options = Options {
             profiles: Profiles::Keep,
@@ -3729,6 +3841,90 @@ mod tests {
         }
     }
 
+    /// The profile a GIF, an animated PNG, a JPEG XL, a PSD or a PNG of
+    /// an AVIF ends up with when colours are kept, if any.
+    fn kept_profile(rebuilt: &Rebuilt) -> Option<Vec<u8>> {
+        match rebuilt.file_type {
+            FileType::Gif => {
+                let at = rebuilt.data.windows(11).position(|w| w == b"ICCRGBG1012")?;
+                // Blocks of up to 255 bytes, each after its length, to an
+                // empty one.
+                let mut rest = &rebuilt.data[at + 11..];
+                let mut icc = Vec::new();
+                while let Some((&length, after)) = rest.split_first() {
+                    if length == 0 {
+                        break;
+                    }
+                    icc.extend_from_slice(after.get(..length as usize)?);
+                    rest = &after[length as usize..];
+                }
+                Some(icc)
+            }
+            _ => profile_and_pixels(&rebuilt.data).0,
+        }
+    }
+
+    /// Colours of Adobe RGB in a GIF, an animated PNG, a JPEG XL and a PSD
+    /// stay in it when they are to be kept, the samples as they are.
+    #[test]
+    fn rgb_profiles_of_other_formats_are_kept_when_asked() {
+        let icc = profile_and_pixels(&corpus("adobe-rgb.png")).0.unwrap();
+        let rewritten = colour::rewritten_rgb(&icc).unwrap();
+        for name in [
+            "adobe-rgb.gif",
+            "adobe-rgb-animation.png",
+            "adobe-rgb.jxl",
+            "adobe-rgb.psd",
+        ] {
+            let data = corpus(name);
+            let kept = keeping_profiles(&data);
+            let new = kept_profile(&kept).unwrap_or_else(|| panic!("{name}: no profile"));
+            let new = ColorProfile::new_from_slice(&new).unwrap();
+            assert_eq!(new.color_space, DataColorSpace::Rgb, "{name}");
+            let converted = run(&data).unwrap();
+            assert!(kept_profile(&converted).is_none(), "{name}");
+            if !name.ends_with(".gif") {
+                // The first picture, as it was.
+                let first = |data: &[u8]| image::load_from_memory(data).unwrap().to_rgb8();
+                let reference = corpus(if name.ends_with(".psd") || name.ends_with(".jxl") {
+                    "adobe-rgb.png"
+                } else {
+                    name
+                });
+                assert_eq!(first(&kept.data), first(&reference), "{name}");
+            }
+        }
+        // The GIF's profile is the one written anew.
+        let gif = keeping_profiles(&corpus("adobe-rgb.gif"));
+        assert_eq!(kept_profile(&gif).unwrap(), rewritten);
+    }
+
+    /// Shades of grey under a profile of grey other than sRGB's stay in it
+    /// when they are to be kept: a PNG as a PNG of grey, a JPEG as its
+    /// coefficients.
+    #[test]
+    fn grey_profiles_are_kept_when_asked() {
+        for name in ["grey-gamma.png", "grey-gamma.jpg"] {
+            let data = corpus(name);
+            let (icc, pixels) = profile_and_pixels(&data);
+            let kept = keeping_profiles(&data);
+            assert_eq!(kept.file_type, detect::detect(&data), "{name}");
+            let (new_icc, new_pixels) = profile_and_pixels(&kept.data);
+            let new_icc = new_icc.unwrap();
+            assert_eq!(
+                new_icc,
+                colour::rewritten_grey(&icc.unwrap()).unwrap(),
+                "{name}"
+            );
+            assert!(!contains(&new_icc, b"Public Domain"), "{name}");
+            assert_eq!(new_pixels, pixels, "{name}");
+            let converted = run(&data).unwrap();
+            let (none, converted) = profile_and_pixels(&converted.data);
+            assert!(none.is_none(), "{name}");
+            assert!(most_apart(&converted, &pixels) > 8, "{name}");
+        }
+    }
+
     /// A lossy WebP turned by its Exif stays lossy, with Exif of nothing
     /// but that.
     #[test]
@@ -3762,12 +3958,13 @@ mod tests {
         assert_eq!(rebuilt.file_type, FileType::Tiff);
         assert_eq!(floats(&rebuilt.data), floats(&data));
         assert!(floats(&rebuilt.data).contains(&2.5));
-        // Grey comes as colours of the same values.
+        // Grey stays grey.
         let data = corpus("float-grey.tif");
         let rebuilt = run(&data).unwrap();
         assert_eq!(rebuilt.file_type, FileType::Tiff);
-        let grey: Vec<f32> = floats(&data).into_iter().flat_map(|v| [v; 3]).collect();
-        assert_eq!(floats(&rebuilt.data), grey);
+        assert_eq!(floats(&rebuilt.data), floats(&data));
+        let mut decoder = tiff::decoder::Decoder::new(Cursor::new(&rebuilt.data)).unwrap();
+        assert_eq!(decoder.colortype().unwrap(), tiff::ColorType::Gray(32));
     }
 
     /// Made by `cjxl` from a JPEG, which it keeps the means to give back.
@@ -3787,10 +3984,20 @@ mod tests {
             .to_rgb8();
         assert!(most_apart(&jpeg, &shown) <= 8);
 
-        // `jxl-oxide` puts a JPEG with a comment together wrong: it is not
-        // given back, and the picture comes as a PNG instead.
-        let rebuilt = run(&corpus("from-jpeg-comment.jxl")).unwrap();
-        assert_eq!(rebuilt.file_type, FileType::Png);
+        // A comment, and a progressive JPEG with a scan of each subsampled
+        // component on its own and restart markers, which `jxl-oxide` 0.12.6
+        // put together wrong or panicked on (see third_party/README.md).
+        for name in ["from-jpeg-comment.jxl", "from-progressive-jpeg.jxl"] {
+            let data = corpus(name);
+            let given_back = jxl::original_jpeg(&data, &Limits::default()).unwrap();
+            let rebuilt = run(&data).unwrap();
+            assert_eq!(rebuilt.file_type, FileType::Jpeg, "{name}");
+            assert!(!contains(&rebuilt.data, b"holiday snapshot"), "{name}");
+            let jpeg = image::load_from_memory(&rebuilt.data).unwrap().to_rgb8();
+            let original = image::load_from_memory(&given_back).unwrap().to_rgb8();
+            // The same coefficients decode to the same pixels.
+            assert_eq!(jpeg, original, "{name}");
+        }
     }
 
     #[test]

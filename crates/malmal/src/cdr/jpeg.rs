@@ -1151,6 +1151,19 @@ impl Coefficients {
         (self.width, self.height)
     }
 
+    /// How many pixels across and down each sample of the chroma stands
+    /// for, as TIFF's `YCbCrSubSampling` says: `None` unless both chroma
+    /// components are sampled alike, by whole numbers the luma's is.
+    pub(super) fn subsampling(&self) -> Option<(u16, u16)> {
+        let [luma, cb, cr] = self.components.as_slice() else {
+            return None;
+        };
+        if (cb.h, cb.v) != (cr.h, cr.v) || luma.h % cb.h != 0 || luma.v % cb.v != 0 {
+            return None;
+        }
+        Some((u16::from(luma.h / cb.h), u16::from(luma.v / cb.v)))
+    }
+
     /// Pictures that are pieces of one `width` by `height`, each at the
     /// place in it given in pixels, put together as that one picture:
     /// red, green and blue if `rgb`, otherwise luma and chroma. `None`
@@ -1432,11 +1445,9 @@ impl Coefficients {
         Some(())
     }
 
-    /// Write the coefficients as a baseline JPEG; `None` if they do not fit
-    /// in one.
-    /// Whether there are three components of colour.
-    pub(super) fn colours(&self) -> bool {
-        self.components.len() == 3
+    /// The number of components: 1 of grey, 3 of colour, 4 of inks.
+    pub(super) fn channels(&self) -> usize {
+        self.components.len()
     }
 
     /// Whether the components are four inks, or three and black.

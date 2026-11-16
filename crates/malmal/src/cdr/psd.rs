@@ -18,6 +18,8 @@ use crate::limits::Limits;
 pub(super) struct Picture {
     pub(super) image: DynamicImage,
     pub(super) density: Option<png::PixelDimensions>,
+    /// The profile the colours or shades are kept in, written anew.
+    pub(super) icc: Option<Vec<u8>>,
 }
 
 fn broken(what: &str) -> Error {
@@ -379,19 +381,21 @@ pub(super) enum Composite {
 /// The composite as sRGB colours.
 #[cfg(test)]
 pub(super) fn read(data: &[u8], limits: &Limits, deadline: Deadline) -> Result<Picture, Error> {
-    match composite(data, limits, deadline, false)? {
+    match composite(data, limits, deadline, false, false)? {
         Composite::Colours(picture) => Ok(picture),
         Composite::Inks(_) => Err(broken("inks were kept")),
     }
 }
 
 /// The composite, inks kept as inks if `keep_inks` and the profile they
-/// print by can be written anew exactly.
+/// print by can be written anew exactly; colours and shades of grey kept in
+/// a profile other than sRGB's if `keep_profile` and it can be.
 pub(super) fn composite(
     data: &[u8],
     limits: &Limits,
     deadline: Deadline,
     keep_inks: bool,
+    keep_profile: bool,
 ) -> Result<Composite, Error> {
     if !data.starts_with(b"8BPS") {
         return Err(broken("signature is missing"));
@@ -782,10 +786,19 @@ pub(super) fn composite(
             image.into_rgb8().into()
         };
     }
+    let mut kept = None;
     if matches!(mode, 1 | 3 | 8)
         && let Some(colors) = ToSrgb::new(found.icc.map(<[u8]>::to_vec))
     {
-        colors.image(&mut image);
+        // Grey shown in inks is in their colours, not the profile's.
+        let channels = if mode == 3 { 3 } else { 1 };
+        kept = found
+            .icc
+            .filter(|_| keep_profile && mode != 8)
+            .and_then(|icc| colour::rewritten_screen(icc, channels));
+        if kept.is_none() {
+            colors.image(&mut image);
+        }
     }
     // A duotone is grey printed in up to four inks, each through its own
     // curve; it is shown in the colours they make.
@@ -797,6 +810,7 @@ pub(super) fn composite(
     Ok(Composite::Colours(Picture {
         image,
         density: found.density,
+        icc: kept,
     }))
 }
 
@@ -808,6 +822,10 @@ struct Duotone {
     /// The colour of each ink, and how much of it each amount of the grey
     /// prints, at 1024 steps.
     inks: Vec<([f32; 3], Vec<f32>)>,
+    /// The colour each mix of inks prints where all of them cover the
+    /// paper, by the mask of the inks in it: white for none, an ink's own
+    /// colour for one, the overprint colour the file gives for more.
+    mixes: Vec<[f32; 3]>,
 }
 
 impl Duotone {
@@ -877,20 +895,72 @@ impl Duotone {
                 .collect();
             inks.push((colour, amounts));
         }
-        Some(Self { inks })
+        // Mixes of two inks or more, fewest first and then in the order of
+        // their inks (1+2, 1+3, 2+3, 1+2+3 for three), each a colour of 10
+        // bytes after the dot gain. A mix the file does not give is the
+        // product of its inks.
+        let mut mixes: Vec<[f32; 3]> = (0..1usize << count)
+            .map(|mask| {
+                let mut out = [1.0f32; 3];
+                for (i, (colour, _)) in inks.iter().enumerate() {
+                    if mask >> i & 1 == 1 {
+                        for (o, c) in out.iter_mut().zip(colour) {
+                            *o *= c;
+                        }
+                    }
+                }
+                out
+            })
+            .collect();
+        let mut overprints: Vec<usize> = (0..1usize << count)
+            .filter(|mask| mask.count_ones() >= 2)
+            .collect();
+        let indexes = |mask: usize| {
+            (0..count)
+                .filter(|i| mask >> i & 1 == 1)
+                .collect::<Vec<_>>()
+        };
+        overprints.sort_by_key(|&mask| (mask.count_ones(), indexes(mask)));
+        let overprint_at = 4 + 40 + 256 + 4 * 28 + 2;
+        for (index, mask) in overprints.into_iter().enumerate() {
+            let spec = overprint_at + index * 10;
+            let Some(c) = (|| {
+                Some([
+                    be16(spec + 2)?,
+                    be16(spec + 4)?,
+                    be16(spec + 6)?,
+                    be16(spec + 8)?,
+                ])
+            })() else {
+                break;
+            };
+            mixes[mask] = Ink::of(be16(spec)?, c, 100).colour;
+        }
+        Some(Self { inks, mixes })
     }
 
     /// The colour of grey `level`, 0 for black (all ink) to 1 for white.
+    ///
+    /// Each mix of inks covers as much of the paper as its inks cover
+    /// together and the others leave bare, and shows its colour there.
     fn colour(&self, level: f32) -> [f32; 3] {
         let step = ((1.0 - level.clamp(0.0, 1.0)) * (Self::STEPS - 1) as f32).round() as usize;
-        let mut out = [1.0f32; 3];
-        for (colour, amounts) in &self.inks {
-            let amount = amounts[step];
-            for (o, c) in out.iter_mut().zip(colour) {
-                *o *= 1.0 - amount * (1.0 - c);
+        let mut out = [0.0f32; 3];
+        for (mask, mix) in self.mixes.iter().enumerate() {
+            let share: f32 = self
+                .inks
+                .iter()
+                .enumerate()
+                .map(|(i, (_, amounts))| match mask >> i & 1 {
+                    1 => amounts[step],
+                    _ => 1.0 - amounts[step],
+                })
+                .product();
+            for (o, c) in out.iter_mut().zip(mix) {
+                *o += share * c;
             }
         }
-        out
+        out.map(|o| o.clamp(0.0, 1.0))
     }
 
     /// Grey, with or without transparency, in the colours of the inks, at
@@ -1002,7 +1072,7 @@ mod tests {
         data.extend_from_slice(&spec);
         data.extend_from_slice(&plain[30..]);
         let Composite::Colours(picture) =
-            composite(&data, &Limits::default(), Deadline(None), false).unwrap()
+            composite(&data, &Limits::default(), Deadline(None), false, false).unwrap()
         else {
             panic!("not colours");
         };
@@ -1014,9 +1084,32 @@ mod tests {
             r.abs_diff(128) <= 2 && g.abs_diff(64) <= 2 && b.abs_diff(64) <= 2,
             "{r} {g} {b}"
         );
+        // Where both cover the paper, the overprint colour shows: here
+        // blue, nothing like black.
+        let mut blue = spec.clone();
+        let at = 4 + 40 + 256 + 4 * 28 + 2;
+        blue[at..at + 10].copy_from_slice(&[0, 0, 0, 0, 0, 0, 255, 255, 0, 0]);
+        let mut data = plain[..26].to_vec();
+        data.extend_from_slice(&(blue.len() as u32).to_be_bytes());
+        data.extend_from_slice(&blue);
+        data.extend_from_slice(&plain[30..]);
+        let Composite::Colours(picture) =
+            composite(&data, &Limits::default(), Deadline(None), false, false).unwrap()
+        else {
+            panic!("not colours");
+        };
+        let rgb = picture.image.to_rgb8();
+        assert_eq!(rgb.get_pixel(0, 0).0, [255, 255, 255]);
+        assert_eq!(rgb.get_pixel(1, 0).0, [0, 0, 255]);
+        // A quarter each of paper, black, red and blue.
+        let [r, g, b] = rgb.get_pixel(2, 0).0;
+        assert!(
+            r.abs_diff(128) <= 2 && g.abs_diff(64) <= 2 && b.abs_diff(128) <= 2,
+            "{r} {g} {b}"
+        );
         // Without the specification it is grey.
         let Composite::Colours(grey) =
-            composite(&plain, &Limits::default(), Deadline(None), false).unwrap()
+            composite(&plain, &Limits::default(), Deadline(None), false, false).unwrap()
         else {
             panic!("not colours");
         };
@@ -1032,7 +1125,7 @@ mod tests {
             .collect();
         let data = psd((3, 2), (4, 8), &planes, 0, &[]);
         let Composite::Inks(kept) =
-            composite(&data, &Limits::default(), Deadline(None), true).unwrap()
+            composite(&data, &Limits::default(), Deadline(None), true, false).unwrap()
         else {
             panic!("inks were not kept");
         };
@@ -1052,7 +1145,7 @@ mod tests {
             .collect();
         let data = psd((3, 2), (4, 16), &wide, 0, &[]);
         let Composite::Inks(kept) =
-            composite(&data, &Limits::default(), Deadline(None), true).unwrap()
+            composite(&data, &Limits::default(), Deadline(None), true, false).unwrap()
         else {
             panic!("inks were not kept");
         };
@@ -1061,7 +1154,7 @@ mod tests {
         };
         assert_eq!(samples[1], 65535 - u16::from_be_bytes([215, 0x12]));
         assert!(matches!(
-            composite(&data, &Limits::default(), Deadline(None), false).unwrap(),
+            composite(&data, &Limits::default(), Deadline(None), false, false).unwrap(),
             Composite::Colours(_)
         ));
     }

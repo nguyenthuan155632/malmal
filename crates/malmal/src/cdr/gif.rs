@@ -6,7 +6,8 @@
 //! loop count, plain text extensions, bytes after the trailer. Decoding a
 //! GIF to full colour and quantising it again would change pixels wherever
 //! frames laid over one another show more than 256 colours, and would store
-//! every frame whole.
+//! every frame whole. A colour profile is applied to the colour tables, or
+//! kept, written anew, if it is to be.
 
 use std::io::Cursor;
 use std::num::NonZeroU64;
@@ -14,7 +15,7 @@ use std::num::NonZeroU64;
 use gif::{ColorOutput, DecodeOptions, Encoder, MemoryLimit, Repeat};
 use moxcms::Layout;
 
-use super::{Deadline, Error, Limits, Rebuilt, ToSrgb};
+use super::{Deadline, Error, Limits, Rebuilt, ToSrgb, colour};
 use crate::detect::FileType;
 
 fn decode_error(error: gif::DecodingError) -> Error {
@@ -28,8 +29,14 @@ fn encode_error(error: gif::EncodingError) -> Error {
     Error::Encode(error.to_string())
 }
 
-/// The GIF in `data`, rebuilt.
-pub(super) fn rebuild(data: &[u8], limits: &Limits, deadline: Deadline) -> Result<Rebuilt, Error> {
+/// The GIF in `data`, rebuilt; its colours kept in a profile other than
+/// sRGB's if `keep_profile` and it can be written anew.
+pub(super) fn rebuild(
+    data: &[u8],
+    limits: &Limits,
+    deadline: Deadline,
+    keep_profile: bool,
+) -> Result<Rebuilt, Error> {
     let mut options = DecodeOptions::new();
     options.set_color_output(ColorOutput::Indexed);
     options.set_memory_limit(match NonZeroU64::new(limits.max_decompressed) {
@@ -65,7 +72,14 @@ pub(super) fn rebuild(data: &[u8], limits: &Limits, deadline: Deadline) -> Resul
     // A colour profile is applied to the colour tables, which hold every
     // colour the pixels can have.
     let mut global = decoder.global_palette().map(<[u8]>::to_vec);
-    if let Some(colors) = ToSrgb::new(decoder.icc_profile().map(<[u8]>::to_vec)) {
+    let icc = decoder.icc_profile().map(<[u8]>::to_vec);
+    let kept = icc
+        .as_deref()
+        .filter(|icc| keep_profile && ToSrgb::new(Some(icc.to_vec())).is_some())
+        .and_then(colour::rewritten_rgb);
+    if kept.is_none()
+        && let Some(colors) = ToSrgb::new(icc)
+    {
         if colors.grey {
             return Err(Error::Decode("a GIF with a grey colour profile".into()));
         }
@@ -89,6 +103,14 @@ pub(super) fn rebuild(data: &[u8], limits: &Limits, deadline: Deadline) -> Resul
         match decoder.repeat() {
             Repeat::Finite(0) => {}
             repeat => encoder.set_repeat(repeat).map_err(encode_error)?,
+        }
+        // The profile as an application extension, in blocks of 255.
+        if let Some(icc) = &kept {
+            let mut blocks: Vec<&[u8]> = vec![b"ICCRGBG1012"];
+            blocks.extend(icc.chunks(255));
+            encoder
+                .write_raw_extension(gif::Extension::Application.into(), &blocks)
+                .map_err(encode_error)?;
         }
         for frame in &frames {
             deadline.check()?;

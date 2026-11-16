@@ -994,23 +994,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
-name = "filmcraft-av1"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d744740c41da5bf31222130b3a44e27c8dc6d0bf58fd0dd7174419042d626bdd"
-dependencies = [
- "filmcraft-bitstream",
- "rayon",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "filmcraft-bitstream"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08f8be9fae696d78e233591b4d57871c39f15ac0ac7445168356cda705efa499"
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1739,24 +1722,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jxl-jbr"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e35d032bcec660647828527ff42c6f5776d2fd44b8357f9f6d9ac6dc07218e46"
-dependencies = [
- "brotli-decompressor 5.0.3",
- "jxl-bitstream",
- "jxl-frame",
- "jxl-grid",
- "jxl-image",
- "jxl-modular",
- "jxl-oxide-common",
- "jxl-threadpool",
- "jxl-vardct",
- "tracing",
-]
-
-[[package]]
 name = "jxl-modular"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1771,53 +1736,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "jxl-oxide"
-version = "0.12.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d36c662923f47586880211f3bc7c0d83fb3a9b410d278c7bde93450748abeef3"
-dependencies = [
- "brotli-decompressor 5.0.3",
- "bytemuck",
- "image",
- "jxl-bitstream",
- "jxl-color",
- "jxl-frame",
- "jxl-grid",
- "jxl-image",
- "jxl-jbr",
- "jxl-oxide-common",
- "jxl-render",
- "jxl-threadpool",
- "tracing",
-]
-
-[[package]]
 name = "jxl-oxide-common"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b62394c5021b3a9e7e0dbb2d639d555d019090c9946c39f6d3b09d390db4157b"
 dependencies = [
  "jxl-bitstream",
-]
-
-[[package]]
-name = "jxl-render"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d34386bfdb6a19b5a30cc9beb4d475d537422c31ae8c39bb69640fcce3fcaf19"
-dependencies = [
- "bytemuck",
- "jxl-bitstream",
- "jxl-coding",
- "jxl-color",
- "jxl-frame",
- "jxl-grid",
- "jxl-image",
- "jxl-modular",
- "jxl-oxide-common",
- "jxl-threadpool",
- "jxl-vardct",
- "tracing",
 ]
 
 [[package]]
@@ -1976,12 +1900,12 @@ dependencies = [
  "aes",
  "base64 0.22.1",
  "brotli-decompressor 6.3.1",
- "filmcraft-av1",
  "gif",
  "hayro",
  "image",
- "jxl-oxide",
  "lzma-rs",
+ "malmal-filmcraft-av1",
+ "malmal-jxl-oxide",
  "md-5 0.10.6",
  "memchr",
  "miniz_oxide 0.9.1",
@@ -2021,6 +1945,67 @@ dependencies = [
  "malmal",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "malmal-filmcraft-av1"
+version = "0.9.0"
+dependencies = [
+ "rayon",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "malmal-jxl-jbr"
+version = "0.2.1"
+dependencies = [
+ "brotli-decompressor 5.0.3",
+ "jxl-bitstream",
+ "jxl-frame",
+ "jxl-grid",
+ "jxl-image",
+ "jxl-modular",
+ "jxl-oxide-common",
+ "jxl-threadpool",
+ "jxl-vardct",
+ "tracing",
+]
+
+[[package]]
+name = "malmal-jxl-oxide"
+version = "0.12.6"
+dependencies = [
+ "brotli-decompressor 5.0.3",
+ "bytemuck",
+ "image",
+ "jxl-bitstream",
+ "jxl-color",
+ "jxl-frame",
+ "jxl-grid",
+ "jxl-image",
+ "jxl-oxide-common",
+ "jxl-threadpool",
+ "malmal-jxl-jbr",
+ "malmal-jxl-render",
+ "tracing",
+]
+
+[[package]]
+name = "malmal-jxl-render"
+version = "0.12.4"
+dependencies = [
+ "bytemuck",
+ "jxl-bitstream",
+ "jxl-coding",
+ "jxl-color",
+ "jxl-frame",
+ "jxl-grid",
+ "jxl-image",
+ "jxl-modular",
+ "jxl-oxide-common",
+ "jxl-threadpool",
+ "jxl-vardct",
+ "tracing",
 ]
 
 [[package]]
