@@ -641,6 +641,19 @@ asked), a Rack middleware that scans every multipart upload, Windows.
 
 Not done: HEIC (no HEVC decoder in Rust); AVIF image sequences without a still image.
 
+Known limits of what is done:
+
+- Old-style JPEG in TIFF (compression 6): one page in strips only; tiles or more pages
+  are refused as before.
+- A TIFF of JPEG pages keeps its coefficients only if every page can; one page that
+  cannot (another compression, extra samples, a profile not kept) sends the whole file
+  through its pixels (Deflate).
+- Duotone overprints: their order in the colour mode data (1+2, 1+3, 2+3, 1+2+3, ...)
+  is inferred, not checked against files saved by Photoshop.
+- Grey profiles kept are tested on a profile made by moxcms only.
+- AVIF PQ/HLG as a PNG with `cICP`: viewers that ignore the chunk show it wrong.
+- The forks in `third_party/` need upkeep; see its README.
+
 ## Order and dependencies
 
 ```

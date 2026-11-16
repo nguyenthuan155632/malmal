@@ -2,5 +2,5 @@
 
 module Malmal
   # The version of the gem, which is also the version of the library it loads.
-  VERSION = "0.4.2"
+  VERSION = "0.5.0"
 end

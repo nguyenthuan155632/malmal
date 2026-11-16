@@ -5,6 +5,17 @@ upstream. Each is published under the name `malmal-<crate>`, its version and
 licence unchanged, and is used under its own name in the code (`package =` in
 the manifest). Drop a copy once upstream releases its fixes.
 
+Upkeep:
+
+- `cargo audit` and RustSec advisories name the upstream crates, not these
+  copies: watch the releases of jxl-oxide and filmcraft-av1 by hand, and bring
+  a security fix over.
+- A copy whose code changes needs a new version (`0.2.1-malmal.2`), in its
+  manifest and in the dependency on it, and is published before `malmal`.
+- jxl-oxide: #508, #510 and #511 have pull requests upstream; #507 and #512 are
+  issues with no pull request yet. filmcraft-av1 has no public repository, so
+  its change stays here until its author adds a way to stop decoding.
+
 ## jxl-oxide 0.12.6, jxl-jbr 0.2.1, jxl-render 0.12.4
 
 From <https://github.com/tirr-c/jxl-oxide> (MIT OR Apache-2.0, by Wonwoo Choi

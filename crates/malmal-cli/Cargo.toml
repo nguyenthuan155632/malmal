@@ -20,7 +20,7 @@ name = "malmald"
 path = "src/bin/malmald.rs"
 
 [dependencies]
-malmal = { path = "../malmal", version = "0.4.2" }
+malmal = { path = "../malmal", version = "0.5.0" }
 memchr = "2.8.3"
 memmap2 = "0.9"
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"], optional = true }
