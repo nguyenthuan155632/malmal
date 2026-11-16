@@ -8,15 +8,20 @@ the manifest). Drop a copy once upstream releases its fixes.
 Upkeep:
 
 - `cargo audit` and RustSec advisories name the upstream crates, not these
-  copies: watch the releases of jxl-oxide and filmcraft-av1 by hand, and bring
-  a security fix over.
-- A copy whose code changes needs a new version (`0.2.1-malmal.2`), in its
-  manifest and in the dependency on it, and is published before `malmal`.
+  copies. The `Forks` workflow (weekly, and on changes here) checks the
+  upstream crates at the versions copied for advisories, and fails once
+  upstream releases a newer version: then see whether a copy can go, or bring
+  the release's fixes over. `python3 scripts/forks.py` does the release check
+  locally and writes the manifest the advisory check reads.
+- A copy whose code changes after it is published needs a new version: raise
+  the patch number (`0.2.1` to `0.2.2`; not `0.2.1-malmal.2`, which semver puts
+  below `0.2.1`), write the release it came from in
+  `[package.metadata.malmal] upstream`, and publish it before `malmal`.
 - jxl-oxide: #508, #510 and #511 have pull requests upstream; #507 and #512 are
   issues with no pull request yet. filmcraft-av1 has no public repository, so
   its change stays here until its author adds a way to stop decoding.
 
-## jxl-oxide 0.12.6, jxl-jbr 0.2.1, jxl-render 0.12.4
+## jxl-oxide 0.12.6, jxl-jbr 0.2.1 (published as 0.2.2), jxl-render 0.12.4
 
 From <https://github.com/tirr-c/jxl-oxide> (MIT OR Apache-2.0, by Wonwoo Choi
 and contributors). JPEG reconstruction (`jxl-jbr`) and rendering
@@ -31,6 +36,9 @@ and contributors). JPEG reconstruction (`jxl-jbr`) and rendering
   subsampled (colour from luma), in reconstruction and rendering.
 - tirr-c/jxl-oxide#512, and the same in DQT, APPn, COM, ICC and the data
   between markers: data that runs short is an error, not a panic.
+- A scan whose component index, spectral selection or successive
+  approximation is out of range is an error, not a panic (found by mutating
+  the `jbrd` box, see `cdr::jxl` tests).
 
 `jxl-oxide` itself is unchanged but for depending on the two above.
 

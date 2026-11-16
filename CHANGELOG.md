@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A JPEG XL whose JPEG reconstruction data names a component that is not there, or a
+  scan with an impossible spectral selection or approximation, is rebuilt from its
+  pixels; the decoder used to panic on it (`malmal-jxl-jbr` 0.2.2).
+
+### Added
+
+- A weekly `Forks` workflow checks the crates copied into `third_party/` for RustSec
+  advisories under their upstream names, and warns once upstream releases a newer
+  version.
+
 ## 0.5.0
 
 ### Changed

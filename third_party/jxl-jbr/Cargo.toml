@@ -2,7 +2,7 @@
 [package]
 edition = "2024"
 name = "malmal-jxl-jbr"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Wonwoo Choi <chwo9843@gmail.com>"]
 build = false
 autolib = false
@@ -57,3 +57,7 @@ version = "0.11.0"
 version = "0.1.40"
 features = ["std"]
 default-features = false
+
+[package.metadata.malmal]
+# The release of jxl-jbr this is a copy of.
+upstream = "0.2.1"
